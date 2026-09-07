@@ -36,7 +36,7 @@ android {
     }
 
     signingConfigs {
-        def ks = Properties()
+        val ks = Properties()
         val ksf = rootProject.file("keystore.properties")
         if (ksf.exists()) {
             ksf.inputStream().use { ks.load(it) }
