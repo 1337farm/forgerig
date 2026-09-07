@@ -35,6 +35,20 @@ android {
         buildConfig = true
     }
 
+    signingConfigs {
+        def ks = Properties()
+        val ksf = rootProject.file("keystore.properties")
+        if (ksf.exists()) {
+            ksf.inputStream().use { ks.load(it) }
+            farm {
+                storeFile = file(ks.getProperty("storeFile"))
+                storePassword = ks.getProperty("storePassword")
+                keyAlias = ks.getProperty("keyAlias")
+                keyPassword = ks.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -42,6 +56,10 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            signingConfig = signingConfigs.farm
+        }
+        debug {
+            signingConfig = signingConfigs.farm
         }
     }
     compileOptions {
