@@ -80,46 +80,151 @@ class MainActivity : AppCompatActivity() {
                         <meta name="viewport" content="width=device-width, initial-scale=1">
                         <style>
                             body { font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background-color: #f0f0f0; }
-                            .message { text-align: center; padding: 20px; background: white; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+                            .message { text-align: center; padding: 20px; background: white; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); width: 84%; max-width: 420px; }
                             .spinner { margin: 20px auto; width: 40px; height: 40px; border: 4px solid #f3f3f3; border-top: 4px solid #3498db; border-radius: 50%; animation: spin 1s linear infinite; }
                             @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
                             .btn { background-color: #3498db; border: none; color: white; padding: 15px 32px; text-align: center; text-decoration: none; display: inline-block; font-size: 16px; margin: 4px 2px; cursor: pointer; border-radius: 8px; }
+                            .btn:disabled { background-color: #9bb8d0; cursor: default; }
+                            .progress-track { margin: 20px 0 8px; height: 12px; background-color: #e0e0e0; border-radius: 6px; overflow: hidden; display: none; }
+                            .progress-fill { height: 100%; width: 0; background-color: #3498db; border-radius: 6px; transition: width 0.2s ease; }
+                            .stage { margin: 4px 0; font-size: 14px; color: #555; display: none; }
+                            .detail { margin: 4px 0 8px; font-size: 12px; color: #999; display: none; }
+                            .error { margin: 12px 0; padding: 10px; border-radius: 6px; background-color: #fdecea; color: #c0392b; font-size: 14px; display: none; }
+                            .options { margin-top: 12px; font-size: 13px; color: #666; text-align: left; }
                         </style>
                         <script>
-                            function checkStatus() {
-                                if (window.NativeHost && window.NativeHost.isInstalled()) {
-                                    window.NativeHost.startContainer();
-                                    document.getElementById('install-btn').style.display = 'none';
-                                    document.getElementById('connecting').style.display = 'block';
-                                    setTimeout(function() { window.location.reload(); }, 3000);
-                                } else {
-                                    document.getElementById('install-btn').style.display = 'inline-block';
-                                    document.getElementById('connecting').style.display = 'none';
+                            var installState = null;
+
+                            function storeEnabled() {
+                                try {
+                                    window.localStorage.setItem('verbose', '0');
+                                    window.localStorage.removeItem('verbose');
+                                    return true;
+                                } catch (e) {
+                                    return false;
                                 }
+                            }
+                            var canStore = storeEnabled();
+                            var verboseFallback = false;
+
+                            function getVerbose() {
+                                if (canStore) {
+                                    return window.localStorage.getItem('verbose') === '1';
+                                }
+                                return verboseFallback;
+                            }
+
+                            function setVerbose(v) {
+                                if (canStore) {
+                                    window.localStorage.setItem('verbose', v ? '1' : '0');
+                                } else {
+                                    verboseFallback = v;
+                                }
+                            }
+
+                            function pollInstall() {
+                                if (window.NativeHost) {
+                                    var raw = window.NativeHost.getInstallState();
+                                    if (raw) {
+                                        try { installState = JSON.parse(raw); } catch (e) {}
+                                    }
+                                }
+                                renderInstall();
+                            }
+
+                            function renderInstall() {
+                                if (!installState) { setTimeout(pollInstall, 300); return; }
+
+                                var phase = installState.phase;
+                                var bar = document.getElementById('progress-fill');
+                                var track = document.getElementById('progress-track');
+                                var stage = document.getElementById('stage-text');
+                                var detail = document.getElementById('detail-text');
+                                var err = document.getElementById('error-text');
+                                var connect = document.getElementById('connecting');
+                                var installBtn = document.getElementById('install-btn');
+                                var spinner = document.getElementById('spinner');
+
+                                if (phase === 'installing') {
+                                    installBtn.style.display = 'none';
+                                    installBtn.disabled = true;
+                                    track.style.display = 'block';
+                                    stage.style.display = 'block';
+                                    detail.style.display = getVerbose() ? 'block' : 'none';
+                                    connect.style.display = 'block';
+                                    spinner.style.display = 'block';
+                                    err.style.display = 'none';
+                                    bar.style.width = installState.percent + '%';
+                                    stage.innerText = installState.stage + ' ' + installState.percent + '%';
+                                    detail.innerText = installState.detail;
+                                } else if (phase === 'starting' || phase === 'ready') {
+                                    installBtn.style.display = 'none';
+                                    installBtn.disabled = true;
+                                    track.style.display = 'block';
+                                    stage.style.display = 'block';
+                                    detail.style.display = 'none';
+                                    connect.style.display = 'block';
+                                    spinner.style.display = 'block';
+                                    bar.style.width = '100%';
+                                    stage.innerText = phase === 'ready' ? 'Environment ready, connecting…' : 'Environment starting…';
+                                    setTimeout(function() { window.location.reload(); }, 3000);
+                                } else if (phase === 'failed') {
+                                    installBtn.style.display = 'inline-block';
+                                    installBtn.disabled = false;
+                                    track.style.display = 'none';
+                                    stage.style.display = 'none';
+                                    detail.style.display = 'none';
+                                    connect.style.display = 'none';
+                                    spinner.style.display = 'none';
+                                    err.style.display = 'block';
+                                    if (getVerbose() && installState.errorDetail) {
+                                        err.innerText = installState.error + '\n\n' + installState.errorDetail;
+                                    } else {
+                                        err.innerText = installState.error;
+                                    }
+                                } else {
+                                    installBtn.style.display = 'inline-block';
+                                    installBtn.disabled = false;
+                                    track.style.display = 'none';
+                                    stage.style.display = 'none';
+                                    detail.style.display = 'none';
+                                    spinner.style.display = 'none';
+                                    connect.style.display = 'none';
+                                }
+                            }
+
+                            function onVerboseChanged() {
+                                setVerbose(document.getElementById('verbose').checked);
+                                renderInstall();
                             }
 
                             function install() {
                                 if (window.NativeHost) {
-                                    document.getElementById('install-btn').style.display = 'none';
-                                    document.getElementById('connecting').style.display = 'block';
-                                    document.getElementById('status-text').innerText = 'Installing and starting environment...';
-
-                                    setTimeout(function() {
-                                        window.NativeHost.installNow();
-                                        setTimeout(function() { window.location.reload(); }, 3000);
-                                    }, 100);
+                                    document.getElementById('install-btn').disabled = true;
+                                    window.NativeHost.installNow();
                                 }
                             }
-                            window.onload = checkStatus;
+
+                            window.onload = function() {
+                                document.getElementById('verbose').checked = getVerbose();
+                                pollInstall();
+                            };
                         </script>
                     </head>
                     <body>
                         <div class="message">
-                            <button id="install-btn" class="btn" style="display:none;" onclick="install()">Install Environment</button>
+                            <h2 id="title">ForgeRig</h2>
                             <div id="connecting" style="display:none;">
-                                <h2>Connecting to Container...</h2>
-                                <div class="spinner"></div>
-                                <p id="status-text">Please wait while the environment starts.</p>
+                                <h3>Connecting to Container...</h3>
+                                <div class="spinner" id="spinner"></div>
+                            </div>
+                            <div class="progress-track" id="progress-track"><div class="progress-fill" id="progress-fill"></div></div>
+                            <p class="stage" id="stage-text"></p>
+                            <p class="detail" id="detail-text"></p>
+                            <div class="error" id="error-text"></div>
+                            <button id="install-btn" class="btn" style="display:none;" onclick="install()">Install Environment</button>
+                            <div class="options">
+                                <label><input type="checkbox" id="verbose" onchange="onVerboseChanged()"> Show detailed progress</label>
                             </div>
                         </div>
                     </body>
@@ -133,12 +238,64 @@ class MainActivity : AppCompatActivity() {
     }
 
     inner class WebAppInterface(private val context: MainActivity) {
+
+        @Volatile
+        private var phase: String = "idle"
+        @Volatile
+        private var percent: Int = 0
+        @Volatile
+        private var stage: String = ""
+        @Volatile
+        private var detail: String = ""
+        @Volatile
+        private var error: String = ""
+        @Volatile
+        private var errorDetail: String = ""
+
+        @JavascriptInterface
+        fun getInstallState(): String {
+            return JSONObject()
+                .put("phase", phase)
+                .put("percent", percent)
+                .put("stage", stage)
+                .put("detail", detail)
+                .put("error", error)
+                .put("errorDetail", errorDetail)
+                .toString()
+        }
+
         @JavascriptInterface
         fun installNow() {
-            // Extract assets
-            val extractor = AssetExtractor(context)
-            extractor.extractAssets()
-            startContainer()
+            if (phase == "installing") {
+                return
+            }
+            phase = "installing"
+            percent = 0
+            stage = "Preparing…"
+            detail = ""
+            error = ""
+            errorDetail = ""
+
+            AssetExtractor(context)
+                .setProgressListener(object : InstallProgress {
+                    override fun onProgress(p: Int, s: String, d: String) {
+                        percent = p
+                        stage = s
+                        detail = d
+                    }
+
+                    override fun onError(message: String, detailText: String) {
+                        phase = "failed"
+                        error = message
+                        errorDetail = detailText
+                    }
+
+                    override fun onDone() {
+                        phase = "ready"
+                        startContainer()
+                    }
+                })
+                .extractAssets()
         }
 
         @JavascriptInterface
