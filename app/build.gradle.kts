@@ -40,7 +40,7 @@ android {
         val ksf = rootProject.file("keystore.properties")
         if (ksf.exists()) {
             ksf.inputStream().use { ks.load(it) }
-            farm {
+            create("farm") {
                 storeFile = file(ks.getProperty("storeFile"))
                 storePassword = ks.getProperty("storePassword")
                 keyAlias = ks.getProperty("keyAlias")
@@ -56,10 +56,10 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            signingConfig = signingConfigs.farm
+            signingConfig = signingConfigs.getByName("farm")
         }
         debug {
-            signingConfig = signingConfigs.farm
+            signingConfig = signingConfigs.getByName("farm")
         }
     }
     compileOptions {
