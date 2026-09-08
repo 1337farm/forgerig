@@ -9,6 +9,18 @@ import kotlin.concurrent.thread
 
 class AssetExtractor(private val context: Context) {
 
+    interface ProgressListener {
+        fun onProgress(message: String, percentage: Int)
+        fun onComplete()
+        fun onError(error: String)
+    }
+
+    private var listener: ProgressListener? = null
+
+    fun setProgressListener(listener: ProgressListener) {
+        this.listener = listener
+    }
+
     fun extractAssets() {
         thread {
             val assetManager = context.assets
@@ -19,7 +31,8 @@ class AssetExtractor(private val context: Context) {
             }
 
             try {
-                // Extract proot binary
+                listener?.onProgress("Extracting proot binary...", 10)
+
                 assetManager.open("proot").use { inputStream ->
                     val prootFile = File(targetDir, "proot")
                     FileOutputStream(prootFile).use { output ->
@@ -28,41 +41,66 @@ class AssetExtractor(private val context: Context) {
                     prootFile.setExecutable(true, false)
                 }
 
-                // Extract ubuntu rootfs
+                listener?.onProgress("Proot extracted successfully", 30)
+                listener?.onProgress("Extracting Ubuntu rootfs...", 40)
+
                 assetManager.open("ubuntu-rootfs.tar.gz").use { inputStream ->
                     GZIPInputStream(inputStream).use { gzipStream ->
                         TarArchiveInputStream(gzipStream).use { tarStream ->
                             var entry = tarStream.nextTarEntry
-                            while (entry != null) {
-                                // Mitigate Zip Slip vulnerability
-                                val targetPath = targetDir.canonicalPath
-                                val outputFile = File(targetDir, entry.name)
-                                val outputPath = outputFile.canonicalPath
-                                if (!outputPath.startsWith(targetPath + File.separator)) {
-                                    throw SecurityException("Path traversal attack detected: \${entry.name}")
-                                }
+                            var count = 0
+                            val totalEntries = countTarEntries(tarStream)
+                            tarStream.close()
+                            assetManager.open("ubuntu-rootfs.tar.gz").use { inputStream2 ->
+                                GZIPInputStream(inputStream2).use { gzipStream2 ->
+                                    TarArchiveInputStream(gzipStream2).use { tarStream2 ->
+                                        while (entry != null) {
+                                            val targetPath = targetDir.canonicalPath
+                                            val outputFile = File(targetDir, entry.name)
+                                            val outputPath = outputFile.canonicalPath
+                                            if (!outputPath.startsWith(targetPath + File.separator)) {
+                                                throw SecurityException("Path traversal attack detected: \${entry.name}")
+                                            }
 
-                                if (entry.isDirectory) {
-                                    outputFile.mkdirs()
-                                } else {
-                                    outputFile.parentFile?.mkdirs()
-                                    FileOutputStream(outputFile).use { output ->
-                                        tarStream.copyTo(output)
-                                    }
-
-                                    // Set executable permissions for container binaries based on tar entry mode
-                                    if ((entry.mode and 0b001_001_001) != 0) { // Check for execute bit (owner, group, or other)
-                                        outputFile.setExecutable(true, false)
+                                            if (entry.isDirectory) {
+                                                outputFile.mkdirs()
+                                            } else {
+                                                outputFile.parentFile?.mkdirs()
+                                                FileOutputStream(outputFile).use { output ->
+                                                    tarStream2.copyTo(output)
+                                                }
+                                                if ((entry.mode and 0b001_001_001) != 0) {
+                                                    outputFile.setExecutable(true, false)
+                                                }
+                                            }
+                                            count++
+                                            val progress = 40 + (count * 50 / totalEntries.coerceAtLeast(1))
+                                            listener?.onProgress("Extracting: ${entry.name}", progress.coerceAtMost(95))
+                                            entry = tarStream2.nextTarEntry
+                                        }
                                     }
                                 }
-                                entry = tarStream.nextTarEntry
                             }
                         }
                     }
                 }
+
+                listener?.onProgress("Finalizing installation...", 95)
+                listener?.onComplete()
             } catch (e: Exception) {
+                listener?.onError("Extraction failed: ${e.message}")
                 e.printStackTrace()
             }
         }
+    }
+
+    private fun countTarEntries(tarStream: TarArchiveInputStream): Int {
+        var count = 0
+        var entry = tarStream.nextTarEntry
+        while (entry != null) {
+            count++
+            entry = tarStream.nextTarEntry
+        }
+        return count
     }
 }

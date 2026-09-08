@@ -132,33 +132,99 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    inner class WebAppInterface(private val context: MainActivity) {
-        @JavascriptInterface
-        fun installNow() {
-            // Extract assets
-            val extractor = AssetExtractor(context)
-            extractor.extractAssets()
-            startContainer()
-        }
+inner class WebAppInterface(private val context: MainActivity) {
+            @JavascriptInterface
+            fun installNow() {
+                val extractor = AssetExtractor(context)
+                extractor.setProgressListener(object : AssetExtractor.ProgressListener {
+                    override fun onProgress(message: String, percentage: Int) {
+                        context.runOnUiThread {
+                            val js = if (percentage < 100) {
+                                """
+                                    document.getElementById('install-btn').style.display = 'none';
+                                    document.getElementById('connecting').style.display = 'block';
+                                    document.getElementById('status-text').innerText = '$message $percentage%';
+                                """.trimIndent()
+                            } else {
+                                """
+                                    document.getElementById('connecting').style.display = 'none';
+                                    document.getElementById('status-text').innerText = 'Container starting...';
+                                """.trimIndent()
+                            }
+                            context.webView.evaluateJavascript(js, null)
+                        }
+                    }
 
-        @JavascriptInterface
-        fun startContainer() {
-            // Start foreground service
-            val serviceIntent = Intent(context, ContainerService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(serviceIntent)
-            } else {
-                context.startService(serviceIntent)
+                    override fun onComplete() {
+                        context.runOnUiThread {
+                            val js = """
+                                document.getElementById('connecting').style.display = 'none';
+                            """.trimIndent()
+                            context.webView.evaluateJavascript(js, null)
+                        }
+                        thread {
+                    val serviceIntent = Intent(context, ContainerService::class.java)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        context.startForegroundService(serviceIntent)
+                    } else {
+                        context.startService(serviceIntent)
+                    }
+                }
+                    }
+
+                    override fun onError(error: String) {
+                        context.runOnUiThread {
+                            val js = """
+                                document.getElementById('status-text').innerText = 'Installation failed: $error';
+                            """.trimIndent()
+                            context.webView.evaluateJavascript(js, null)
+                        }
+                    }
+                })
+                extractor.extractAssets()
+            }
+
+            @JavascriptInterface
+            fun startContainer() {
+                val targetDir = File(context.filesDir, "ubuntu_rootfs")
+                val prootFile = File(targetDir, "proot")
+                if (!prootFile.exists()) {
+                    context.runOnUiThread {
+                        val js = """
+                            document.getElementById('status-text').innerText = 'Assets not found. Please run install again.';
+                        """.trimIndent()
+                        context.webView.evaluateJavascript(js, null)
+                    }
+                    return
+                }
+
+                // Start foreground service
+                val serviceIntent = Intent(context, ContainerService::class.java)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(serviceIntent)
+                } else {
+                    context.startService(serviceIntent)
+                }
+
+                // Show connecting state
+                context.runOnUiThread {
+                    val js = """
+                        document.getElementById('connecting').style.display = 'block';
+                        document.getElementById('status-text').innerText = 'Starting container...';
+                    """.trimIndent()
+                    context.webView.evaluateJavascript(js, null)
+                }
+
+                context.startContainer()
+            }
+
+            @JavascriptInterface
+            fun isInstalled(): Boolean {
+                val targetDir = File(context.filesDir, "ubuntu_rootfs")
+                val prootFile = File(targetDir, "proot")
+                return prootFile.exists()
             }
         }
-
-        @JavascriptInterface
-        fun isInstalled(): Boolean {
-            val targetDir = File(context.filesDir, "ubuntu_rootfs")
-            val prootFile = File(targetDir, "proot")
-            return prootFile.exists()
-        }
-    }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
