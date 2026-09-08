@@ -90,5 +90,10 @@ val checkContainerAssets by tasks.registering(Exec::class) {
         "test -s app/src/main/assets/ubuntu-rootfs.tar.gz")
 }
 // Only packaging needs the assets; unit tests must stay runnable without them.
-tasks.matching { it.name.startsWith("packageDebug") || it.name.startsWith("packageRelease") }
+// `testDebugUnitTest` happens to pull the whole assemble<bool> graph (including
+// packageFoo), so the test job opts out explicitly with -PskipContainerAssetsCheck.
+tasks.matching { it.name == "packageDebug" || it.name == "packageRelease" }
     .configureEach { dependsOn(checkContainerAssets) }
+if (providers.gradleProperty("skipContainerAssetsCheck").isPresent) {
+    tasks.named("checkContainerAssets").configure { enabled = false }
+}
