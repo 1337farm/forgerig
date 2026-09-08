@@ -52,9 +52,9 @@ jobs:
       - name: Prepare container assets (proot + rootfs + daemon)
         run: |
           set -e
-          export RUSTUP_HOME="$RUNNER_TEMP/rustup"
-          export CARGO_HOME="$RUNNER_TEMP/cargo"
           if ! command -v rustup >/dev/null 2>&1; then
+            export RUSTUP_HOME="$RUNNER_TEMP/rustup"
+            export CARGO_HOME="$RUNNER_TEMP/cargo"
             curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
             . "$CARGO_HOME/env"
           fi
