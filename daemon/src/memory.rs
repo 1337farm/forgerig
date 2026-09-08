@@ -204,23 +204,4 @@ impl<M: CompletionModel> HeuristicEvaluator<M> {
 
         Ok(())
     }
-
-    pub async fn evaluate_trace(_trace: &str) -> String {
-        // Stub for local llama.cpp invocation
-        let output = Command::new("llama-cli")
-            .arg("--version")
-            .output()
-            .await;
-
-        match output {
-            Ok(_) => {
-                // Return a mocked success for now if it exists, normally we'd run the model
-                "Evaluated: Milestone not reached (llama-cli exists)".to_string()
-            }
-            Err(_) => {
-                // Fallback response if llama-cli isn't installed
-                "Evaluated fallback: llama-cli missing, milestone evaluation skipped.".to_string()
-            }
-        }
-    }
 }

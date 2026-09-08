@@ -9,8 +9,6 @@ use serde_json::json;
 pub enum BashExecutorError {
     #[error("Failed to execute command: {0}")]
     Io(#[from] std::io::Error),
-    #[error("Command failed with stderr: {0}")]
-    Execution(String),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
