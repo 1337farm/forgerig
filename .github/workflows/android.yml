@@ -90,7 +90,9 @@ jobs:
 
           rustc --version && cargo --version
           aarch64-linux-musl-gcc --version | head -1
-          FORGERIG_CARGO_TARGET=aarch64-unknown-linux-musl bash scripts/prepare-assets.sh
+          FORGERIG_CARGO_TARGET=aarch64-unknown-linux-musl \
+          FORGERIG_CARGO_FEATURES=vendored-openssl \
+          bash scripts/prepare-assets.sh
 
       - name: Assemble release APK
         run: ./gradlew assembleRelease --stacktrace

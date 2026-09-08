@@ -12,6 +12,8 @@
 # host toolchain. Cross-build with:
 #   export FORGERIG_CARGO_TARGET=aarch64-unknown-linux-musl
 # (as the GitHub runner does, so the binary runs inside the musl rootfs).
+# Pass extra cargo features with FORGERIG_CARGO_FEATURES (space-separated);
+# the CI musl build sets it to "vendored-openssl".
 #
 # Overrides for offline/pinned use:
 #   FORGERIG_PROOT_DEB_URL   direct URL to a proot_*_aarch64.deb
@@ -27,13 +29,18 @@ echo ">> Preparing container assets"
 
 # --- 1. Build the daemon -----------------------------------------------------
 DAEMON_TARGET="${FORGERIG_CARGO_TARGET:-}"
+CARGO_FEATURES="${FORGERIG_CARGO_FEATURES:-}"
+CARGO_ARGS=""
+if [ -n "$CARGO_FEATURES" ]; then
+  CARGO_ARGS="--features $CARGO_FEATURES"
+fi
 if [ -n "$DAEMON_TARGET" ]; then
   echo ">> Building daemon for $DAEMON_TARGET"
-  ( cd "$ROOT/daemon" && cargo build --release --target "$DAEMON_TARGET" )
+  ( cd "$ROOT/daemon" && cargo build --release --target "$DAEMON_TARGET" $CARGO_ARGS )
   DAEMON_BIN="$ROOT/daemon/target/$DAEMON_TARGET/release/daemon"
 else
   echo ">> Building daemon for the host target"
-  ( cd "$ROOT/daemon" && cargo build --release )
+  ( cd "$ROOT/daemon" && cargo build --release $CARGO_ARGS )
   DAEMON_BIN="$ROOT/daemon/target/release/daemon"
 fi
 [ -x "$DAEMON_BIN" ] || { echo "ERROR: daemon binary missing: $DAEMON_BIN" >&2; exit 1; }
