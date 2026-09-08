@@ -16,7 +16,15 @@ wat = "1.0.83"
 base64 = "0.22.1"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 tokio-rusqlite = "0.6.0"
+openssl-sys = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = "0.4.45"
 schemars = "0.8.22"
+
+[features]
+# rig-core pulls reqwest with default TLS (native-tls -> openssl-sys). For the
+# static aarch64-musl CI build there is no system OpenSSL for that target, so we
+# vendor OpenSSL (built by the musl cross gcc) via this opt-in feature. Local
+# host builds use the system OpenSSL and don't need it.
+vendored-openssl = ["openssl-sys/vendored"]

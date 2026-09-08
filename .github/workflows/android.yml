@@ -26,7 +26,7 @@ jobs:
         run: chmod +x gradlew
 
       - name: Run Android unit tests
-        run: ./gradlew :app:testDebugUnitTest --stacktrace
+        run: ./gradlew :app:testDebugUnitTest -PskipContainerAssetsCheck --stacktrace
 
   package-apk:
     name: apk
@@ -47,7 +47,52 @@ jobs:
           cache: gradle
 
       - name: Grant execute permission
-        run: chmod +x gradlew
+        run: chmod +x gradlew scripts/prepare-assets.sh
+
+      - name: Prepare container assets (proot + rootfs + daemon)
+        run: |
+          set -e
+          if ! command -v rustup >/dev/null 2>&1; then
+            export RUSTUP_HOME="$RUNNER_TEMP/rustup"
+            export CARGO_HOME="$RUNNER_TEMP/cargo"
+            curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+            . "$CARGO_HOME/env"
+          fi
+          rustup target add aarch64-unknown-linux-musl
+
+          # Full aarch64 musl cross toolchain: rusqlite bundles libsqlite3 and is
+          # compiled with the `cc` crate, which needs a real cross compiler.
+          # musl.cc is a single-host mirror that GH runners sometimes cannot reach
+          # (TCP connect times out); fall back to copies hosted on GitHub's CDN.
+          TOOLCHAIN_BIN=""
+          for URL in \
+            "https://musl.cc/aarch64-linux-musl-cross.tgz" \
+            "https://github.com/libviprs/libviprs-dep/releases/download/musl-cross-mirror/aarch64-linux-musl-cross.tgz" \
+            "https://github.com/arceos-org/setup-musl/releases/download/prebuilt/aarch64-linux-musl-cross.tgz"; do
+            if curl -fL --retry 6 --retry-delay 10 --retry-all-errors --connect-timeout 30 \
+                -o "$RUNNER_TEMP/musl.tgz" "$URL"; then
+              tar xzf "$RUNNER_TEMP/musl.tgz" -C "$RUNNER_TEMP"
+              TOOLCHAIN_GCC="$(find "$RUNNER_TEMP" -maxdepth 3 -type f -name aarch64-linux-musl-gcc | head -1)"
+              if [ -n "$TOOLCHAIN_GCC" ]; then
+                TOOLCHAIN_BIN="$(dirname "$TOOLCHAIN_GCC")"
+                break
+              fi
+              rm -rf "$RUNNER_TEMP/musl.tgz" "$RUNNER_TEMP/aarch64-linux-musl*"
+            fi
+          done
+          if [ -z "$TOOLCHAIN_BIN" ]; then
+            echo "ERROR: could not download any aarch64 musl toolchain" >&2
+            exit 1
+          fi
+          export PATH="$TOOLCHAIN_BIN:$PATH"
+          export CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc
+          export AR_aarch64_unknown_linux_musl=aarch64-linux-musl-ar
+
+          rustc --version && cargo --version
+          aarch64-linux-musl-gcc --version | head -1
+          FORGERIG_CARGO_TARGET=aarch64-unknown-linux-musl \
+          FORGERIG_CARGO_FEATURES=vendored-openssl \
+          bash scripts/prepare-assets.sh
 
       - name: Assemble release APK
         run: ./gradlew assembleRelease --stacktrace

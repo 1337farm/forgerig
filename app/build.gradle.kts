@@ -81,3 +81,19 @@ dependencies {
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
 }
+
+// Reject APKs built with placeholder container assets (see scripts/prepare-assets.sh).
+val checkContainerAssets by tasks.registering(Exec::class) {
+    workingDir = rootProject.projectDir
+    commandLine("sh", "-c",
+        "test -s app/src/main/assets/proot && test -s app/src/main/assets/proot-loader && " +
+        "test -s app/src/main/assets/ubuntu-rootfs.tar.gz")
+}
+// Only packaging needs the assets; unit tests must stay runnable without them.
+// `testDebugUnitTest` happens to pull the whole assemble<bool> graph (including
+// packageFoo), so the test job opts out explicitly with -PskipContainerAssetsCheck.
+tasks.matching { it.name == "packageDebug" || it.name == "packageRelease" }
+    .configureEach { dependsOn(checkContainerAssets) }
+if (providers.gradleProperty("skipContainerAssetsCheck").isPresent) {
+    tasks.named("checkContainerAssets").configure { enabled = false }
+}

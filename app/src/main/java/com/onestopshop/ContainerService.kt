@@ -90,8 +90,9 @@ class ContainerService : Service() {
     private fun startContainerProcess() {
         val rootFsDir = File(filesDir, "ubuntu_rootfs")
         val prootBin = File(rootFsDir, "proot")
+        val entrypoint = File(rootFsDir, "root/start.sh")
 
-        if (!prootBin.exists()) return
+        if (!prootBin.exists() || !entrypoint.exists()) return
 
         thread {
             try {
@@ -100,8 +101,10 @@ class ContainerService : Service() {
                     "-r", rootFsDir.absolutePath,
                     "-0",
                     "-w", "/root",
-                    "/bin/sh"
+                    "/root/start.sh"
                 )
+                // The entrypoint launches forgerig-daemon which binds
+                // 127.0.0.1:$PORT; the WebView connects to that same port.
                 pb.environment()["PORT"] = MainActivity.allocatedPort.toString()
                 pb.redirectErrorStream(true)
                 pb.directory(rootFsDir)

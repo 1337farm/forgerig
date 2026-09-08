@@ -36,7 +36,7 @@ class AssetExtractor(private val context: Context) {
                     targetDir.mkdirs()
                 }
 
-                // Stage 1: proot binary
+                // Stage 1: proot binary + its loader companion
                 progress.onProgress(2, "Preparing runtime…", "Copying proot")
                 val prootFile = File(targetDir, "proot")
                 context.assets.open("proot").use { inputStream ->
@@ -50,6 +50,21 @@ class AssetExtractor(private val context: Context) {
                     throw IOException("Bundled proot binary is empty")
                 } else if (prootSize < 4 || !isElf(prootFile)) {
                     throw IOException("Bundled proot is not a valid ELF binary")
+                }
+
+                // Termux proot locates its loader relative to the binary
+                // ($PREFIX/libexec/proot/loader), so it must be extracted as a
+                // sibling in the same layout or the container cannot start.
+                val loaderFile = File(targetDir, "libexec/proot/loader")
+                loaderFile.parentFile?.mkdirs()
+                context.assets.open("proot-loader").use { inputStream ->
+                    FileOutputStream(loaderFile).use { output ->
+                        inputStream.copyTo(output)
+                    }
+                }
+                loaderFile.setExecutable(true, false)
+                if (loaderFile.length() == 0L || !isElf(loaderFile)) {
+                    throw IOException("Bundled proot loader is empty or not an ELF binary")
                 }
 
                 // Stage 2: ubuntu rootfs (two-pass so we can show accurate progress)
