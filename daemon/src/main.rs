@@ -1,6 +1,8 @@
 use std::env;
 use std::sync::Arc;
-use tokio::net::TcpListener;
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::accept_async;
 use futures_util::{StreamExt, SinkExt};
 use serde::{Deserialize, Serialize};
@@ -74,7 +76,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let evaluator = Arc::clone(&evaluator);
 
         tokio::spawn(async move {
-            let ws_stream = accept_async(stream).await.expect("Error during the websocket handshake occurred");
+            // Peek (without consuming) to decide whether this is a WebSocket
+            // upgrade or a plain HTTP GET, so a browser/WebView pointed at
+            // `http://127.0.0.1:$PORT` gets a working page and can then open
+            // the WebSocket on the same port.
+            let mut probe = [0u8; 4096];
+            let probe_len = match tokio::time::timeout(
+                Duration::from_secs(5),
+                stream.peek(&mut probe),
+            ).await {
+                Ok(Ok(n)) => n,
+                _ => 0,
+            };
+            let head = String::from_utf8_lossy(&probe[..probe_len]).to_ascii_lowercase();
+
+            if !head.contains("upgrade: websocket") && !head.contains("sec-websocket-key:") {
+                serve_http(stream).await;
+                return;
+            }
+
+            let ws_stream = match tokio::time::timeout(Duration::from_secs(10), accept_async(stream)).await {
+                Ok(Ok(ws)) => ws,
+                Ok(Err(e)) => { eprintln!("WebSocket handshake failed: {}", e); return; }
+                Err(_) => { eprintln!("WebSocket handshake timed out"); return; }
+            };
             println!("New WebSocket connection");
 
             let (mut ws_sender, mut ws_receiver) = ws_stream.split();
@@ -203,4 +228,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// Serve a small landing page so `http://127.0.0.1:$PORT` in the app's WebView
+/// renders the orchestrator UI instead of a connection error. The page then
+/// opens the WebSocket on the same port for JSON-RPC `chat`.
+async fn serve_http(mut stream: TcpStream) {
+    let body = r#"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ForgeRig</title>
+<style>
+  body { font-family: sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; background: #0f1115; color: #e6e6e6; }
+  h1 { font-size: 1.4rem; }
+  #status { color: #7cf787; }
+  input, pre { width: 100%; box-sizing: border-box; }
+  input { padding: .6rem; margin: .5rem 0; font-size: 1rem; }
+  pre { background: #1b1f27; border-radius: 6px; padding: .8rem; white-space: pre-wrap; word-break: break-word; min-height: 4rem; }
+</style>
+</head>
+<body>
+<h1>ForgeRig</h1>
+<p id="status">Connecting…</p>
+<input id="prompt" placeholder="Ask the orchestrator daemon…" autofocus>
+<pre id="out">Ready.</pre>
+<script>
+  var ws=null, label=document.getElementById('status'), out=document.getElementById('out');
+  function connect(){
+    label.textContent='Connecting…';
+    ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/');
+    ws.onopen=function(){ label.textContent='Connected to ForgeRig daemon'; };
+    ws.onclose=function(){ label.textContent='Disconnected — retrying…'; setTimeout(connect,1000); };
+    ws.onmessage=function(e){
+      var d;
+      try { d=JSON.parse(e.data); } catch(_) { return; }
+      if (d.result) out.textContent=JSON.stringify(d.result,null,2);
+      else if (d.error) out.textContent='Error: '+d.error.message;
+    };
+  }
+  document.getElementById('prompt').addEventListener('keydown',function(e){
+    if (e.key==='Enter') send();
+  });
+  function send(){
+    var p=document.getElementById('prompt').value;
+    if (!p) return;
+    if (!ws || ws.readyState!==1) { out.textContent='Not connected to daemon yet.'; return; }
+    ws.send(JSON.stringify({jsonrpc:'2.0',method:'chat',params:{prompt:p},id:1}));
+    out.textContent='Thinking…';
+  }
+  connect();
+</script>
+</body>
+</html>"#;
+
+    let status_line = "HTTP/1.1 200 OK\r\n";
+    let headers = "Content-Type: text/html; charset=utf-8\r\nConnection: close\r\n";
+    let response = format!(
+        "{}\r\n{}\r\nContent-Length: {}\r\n\r\n{}",
+        status_line, headers, body.as_bytes().len(), body
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
 }

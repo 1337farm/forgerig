@@ -81,3 +81,14 @@ dependencies {
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
 }
+
+// Reject APKs built with placeholder container assets (see scripts/prepare-assets.sh).
+val checkContainerAssets by tasks.registering(Exec::class) {
+    workingDir = rootProject.projectDir
+    commandLine("sh", "-c",
+        "test -s app/src/main/assets/proot && test -s app/src/main/assets/proot-loader && " +
+        "test -s app/src/main/assets/ubuntu-rootfs.tar.gz")
+}
+// Only packaging needs the assets; unit tests must stay runnable without them.
+tasks.matching { it.name.startsWith("packageDebug") || it.name.startsWith("packageRelease") }
+    .configureEach { dependsOn(checkContainerAssets) }

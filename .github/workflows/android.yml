@@ -47,7 +47,34 @@ jobs:
           cache: gradle
 
       - name: Grant execute permission
-        run: chmod +x gradlew
+        run: chmod +x gradlew scripts/prepare-assets.sh
+
+      - name: Prepare container assets (proot + rootfs + daemon)
+        run: |
+          set -e
+          export RUSTUP_HOME="$RUNNER_TEMP/rustup"
+          export CARGO_HOME="$RUNNER_TEMP/cargo"
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+            . "$CARGO_HOME/env"
+          fi
+          rustup target add aarch64-unknown-linux-musl
+
+          # Full aarch64 musl cross toolchain: rusqlite bundles libsqlite3 and is
+          # compiled with the `cc` crate, which needs a real cross compiler.
+          TOOLCHAIN_DIR="$RUNNER_TEMP/aarch64-linux-musl-cross"
+          if [ ! -x "$TOOLCHAIN_DIR/bin/aarch64-linux-musl-gcc" ]; then
+            curl -fsSL -o "$RUNNER_TEMP/musl.tgz" \
+              https://musl.cc/aarch64-linux-musl-cross.tgz
+            tar xzf "$RUNNER_TEMP/musl.tgz" -C "$RUNNER_TEMP"
+          fi
+          export PATH="$TOOLCHAIN_DIR/bin:$PATH"
+          export CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc
+          export AR_aarch64_unknown_linux_musl=aarch64-linux-musl-ar
+
+          rustc --version && cargo --version
+          aarch64-linux-musl-gcc --version | head -1
+          FORGERIG_CARGO_TARGET=aarch64-unknown-linux-musl bash scripts/prepare-assets.sh
 
       - name: Assemble release APK
         run: ./gradlew assembleRelease --stacktrace

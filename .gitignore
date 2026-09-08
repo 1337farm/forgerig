@@ -4,3 +4,9 @@
 app/build/
 .gradle/
 daemon/target/
+daemon/oss_memory.db
+
+# Generated container assets (scripts/prepare-assets.sh)
+app/src/main/assets/proot
+app/src/main/assets/proot-loader
+app/src/main/assets/ubuntu-rootfs.tar.gz
