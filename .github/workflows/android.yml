@@ -5,6 +5,12 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  # Merges landed by the automerge job are pushed with GITHUB_TOKEN, and
+  # GitHub does not raise `push` workflow events for such pushes (documented
+  # behavior). workflow_dispatch is the sanctioned exception, so the automerge
+  # job uses it to rebuild and republish the rolling `latest` release from the
+  # canonical main HEAD. Maintainers can also use "Run workflow" to republish.
+  workflow_dispatch: {}
 
 jobs:
   test:
@@ -106,7 +112,7 @@ jobs:
           retention-days: 7
 
       - name: Publish APK release
-        if: github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+        if: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -135,9 +141,18 @@ jobs:
     permissions:
       pull-requests: write
       contents: write
+      actions: write
     steps:
       - name: Merge PR
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh pr merge ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --squash --delete-branch
+
+      - name: Rebuild and republish latest from main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # GITHUB_TOKEN-created merges do not trigger `push` events, so dispatch
+          # the pipeline on the (now updated) main branch instead.
+          gh workflow run android.yml --repo "${{ github.repository }}" --ref main
