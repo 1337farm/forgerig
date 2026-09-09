@@ -415,7 +415,22 @@ class MainActivity : AppCompatActivity() {
                 val maxAttempts = 30
                 var attempt = 0
                 var ready = false
+                val statusFile = File(context.filesDir, "ubuntu_rootfs/.forgerig-status")
                 while (attempt < maxAttempts && phase == "installing") {
+                    try {
+                        if (statusFile.exists()) {
+                            val status = statusFile.readText().trim()
+                            if (status.startsWith("exit:") || status.startsWith("missing:")) {
+                                AssetExtractor.logShared(context, "ERROR: Container status: $status")
+                                phase = "failed"
+                                error = "Container exited early"
+                                errorDetail = "Container status: $status. See Downloads/${AssetExtractor.sharedLogFileName()} for details."
+                                break
+                            }
+                        }
+                    } catch (e: Exception) {
+                        // Status unreadable; keep probing HTTP.
+                    }
                     attempt++
                     detail = "Probing daemon on 127.0.0.1:${MainActivity.allocatedPort} (attempt $attempt/$maxAttempts)…"
                     try {

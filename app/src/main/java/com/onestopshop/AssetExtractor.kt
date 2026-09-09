@@ -111,7 +111,6 @@ class AssetExtractor(private val context: Context) {
             @Volatile
             var uri: android.net.Uri? = null
         }
-    }
 
     private var progress: InstallProgress = object : InstallProgress {
         override fun onProgress(percent: Int, stage: String, detail: String) {}
@@ -157,14 +156,6 @@ class AssetExtractor(private val context: Context) {
                 "Bundled assets: [${listBundledAssets()}]. " +
                 "Last error: ${lastError?.message}"
         )
-    }
-
-    private fun tarStreamFor(rootfs: RootfsStream): TarArchiveInputStream {
-        return if (rootfs.gzipped) {
-            TarArchiveInputStream(GZIPInputStream(rootfs.stream))
-        } else {
-            TarArchiveInputStream(rootfs.stream)
-        }
     }
 
     fun extractAssets() {
@@ -215,18 +206,22 @@ class AssetExtractor(private val context: Context) {
                 }
 
                 progress.onStep(1)
-                progress.onProgress(8, "Unpacking container files…", "Reading archive")
-                log("PROGRESS [8%] Unpacking container files… - Reading archive")
-                val counted = countEntries()
-                val totalEntries = counted.total
-                log("Rootfs asset: ${counted.assetName} (entries=$totalEntries)")
-                if (totalEntries == 0) {
-                    throw IOException("Bundled rootfs archive is empty")
-                }
+                progress.onProgress(8, "Unpacking container files…", "Starting extraction")
+                log("PROGRESS [8%] Unpacking container files… - Starting extraction")
 
                 var done = 0
                 openRootfs().use { rootfs ->
-                    tarStreamFor(rootfs).use { tarStream ->
+                    // Single pass: byte-based progress from the compressed size,
+                    // so the archive is gunzipped/parsed exactly once.
+                    val totalBytes = assetLength(rootfs.assetName)
+                    log("Rootfs asset: ${rootfs.assetName} (${if (totalBytes > 0) "$totalBytes bytes" else "size unknown"})")
+                    val counting = CountingInputStream(rootfs.stream)
+                    val tarStream = if (rootfs.gzipped) {
+                        TarArchiveInputStream(GZIPInputStream(counting))
+                    } else {
+                        TarArchiveInputStream(counting)
+                    }
+                    tarStream.use {
                         var entry = tarStream.nextTarEntry
                         val canonicalTarget = targetDir.canonicalPath
                         while (entry != null) {
@@ -259,15 +254,22 @@ class AssetExtractor(private val context: Context) {
                             }
 
                             done++
-                            val percent = Math.min(98, 8 + (done * 90) / totalEntries)
-                            val detail = String.format("%d / %d files (%s)", done, totalEntries, entry.name)
+                            val percent = if (totalBytes > 0) {
+                                Math.min(98, (8 + 90 * counting.bytesRead / totalBytes).toInt())
+                            } else {
+                                8
+                            }
+                            val detail = String.format("%d files (%s)", done, entry.name)
                             progress.onProgress(percent, "Unpacking container files…", detail)
-                            if (done % 500 == 0 || done == totalEntries) {
+                            if (done % 500 == 0) {
                                 log("PROGRESS [$percent%] Unpacking container files… - $detail")
                             }
                             entry = tarStream.nextTarEntry
                         }
                     }
+                }
+                if (done == 0) {
+                    throw IOException("Bundled rootfs archive is empty")
                 }
 
                 progress.onStep(2)
@@ -282,19 +284,29 @@ class AssetExtractor(private val context: Context) {
         }
     }
 
-    private data class CountResult(val total: Int, val assetName: String)
+    private class CountingInputStream(wrapped: InputStream) : java.io.FilterInputStream(wrapped) {
+        @Volatile
+        var bytesRead: Long = 0
+            private set
 
-    private fun countEntries(): CountResult {
-        openRootfs().use { rootfs ->
-            tarStreamFor(rootfs).use { tarStream ->
-                var count = 0
-                var entry = tarStream.nextTarEntry
-                while (entry != null) {
-                    count++
-                    entry = tarStream.nextTarEntry
-                }
-                return CountResult(count, rootfs.assetName)
-            }
+        override fun read(): Int {
+            val b = super.read()
+            if (b >= 0) bytesRead++
+            return b
+        }
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            val n = super.read(b, off, len)
+            if (n > 0) bytesRead += n
+            return n
+        }
+    }
+
+    private fun assetLength(name: String): Long {
+        return try {
+            context.assets.openFd(name).use { it.length }
+        } catch (e: Exception) {
+            -1L
         }
     }
 
