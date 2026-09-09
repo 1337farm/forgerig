@@ -29,6 +29,21 @@ android {
 
         buildConfigField("String", "GITHUB_CLIENT_ID", "\"${localProperties.getProperty("GITHUB_CLIENT_ID", "")}\"")
         buildConfigField("String", "GITHUB_CLIENT_SECRET", "\"${localProperties.getProperty("GITHUB_CLIENT_SECRET", "")}\"")
+        val gitSha = try {
+            val proc = ProcessBuilder("git", "rev-parse", "--short=10", "HEAD")
+                .directory(rootProject.projectDir)
+                .redirectErrorStream(true)
+                .start()
+            proc.inputStream.bufferedReader().readText().trim().ifEmpty { "dev" }
+        } catch (e: Exception) {
+            "dev"
+        }
+        buildConfigField("String", "GIT_SHA", "\"$gitSha\"")
+    }
+
+    androidResources {
+        // Keep the gzipped rootfs blob stored as-is instead of recompressing it.
+        noCompress += "bin"
     }
 
     buildFeatures {
@@ -87,7 +102,7 @@ val checkContainerAssets by tasks.registering(Exec::class) {
     workingDir = rootProject.projectDir
     commandLine("sh", "-c",
         "test -s app/src/main/assets/proot && test -s app/src/main/assets/proot-loader && " +
-        "test -s app/src/main/assets/ubuntu-rootfs.tar.gz")
+        "(test -s app/src/main/assets/ubuntu-rootfs.bin || test -s app/src/main/assets/ubuntu-rootfs.tar.gz)")
 }
 // Only packaging needs the assets; unit tests must stay runnable without them.
 // `testDebugUnitTest` happens to pull the whole assemble<bool> graph (including
