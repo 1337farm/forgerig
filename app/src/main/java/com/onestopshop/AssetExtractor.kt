@@ -111,6 +111,7 @@ class AssetExtractor(private val context: Context) {
             @Volatile
             var uri: android.net.Uri? = null
         }
+    }
 
     private var progress: InstallProgress = object : InstallProgress {
         override fun onProgress(percent: Int, stage: String, detail: String) {}
