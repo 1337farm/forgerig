@@ -173,6 +173,9 @@ class MainActivity : AppCompatActivity() {
                                     installBtn.style.display = 'inline-block';
                                     installBtn.disabled = false;
                                     document.getElementById('copy-btn').style.display = 'inline-block';
+                                    var logPath = document.getElementById('log-path');
+                                    logPath.style.display = 'block';
+                                    logPath.innerText = 'Full log: Downloads/' + (installState.logFile || 'forgerig-install-*.log');
                                     track.style.display = 'none';
                                     stage.style.display = 'none';
                                     detail.style.display = 'none';
@@ -198,15 +201,34 @@ class MainActivity : AppCompatActivity() {
                             function copyLogs() {
                                 var text = "";
                                 if (installState) {
-                                    text = "Phase: " + installState.phase + "\nStage: " + installState.stage + "\nDetail: " + installState.detail + "\nError: " + installState.error + "\nErrorDetail: " + installState.errorDetail;
+                                    text = "Phase: " + installState.phase + "\nStage: " + installState.stage + "\nDetail: " + installState.detail + "\nError: " + installState.error + "\nErrorDetail: " + installState.errorDetail + "\nLogFile: " + installState.logFile;
                                 } else {
                                     text = document.getElementById('error-text').innerText || document.getElementById('stage-text').innerText;
                                 }
-                                navigator.clipboard.writeText(text).then(function() {
-                                    alert("Logs copied to clipboard!");
-                                }, function(err) {
-                                    alert("Failed to copy logs: " + err);
-                                });
+                                function legacyCopy(t) {
+                                    var ta = document.createElement('textarea');
+                                    ta.value = t;
+                                    ta.style.position = 'fixed';
+                                    ta.style.opacity = '0';
+                                    document.body.appendChild(ta);
+                                    ta.select();
+                                    try {
+                                        document.execCommand('copy');
+                                        alert("Logs copied to clipboard!");
+                                    } catch (e) {
+                                        alert("Copy failed. Log file: " + (installState && installState.logFile ? installState.logFile : "Downloads/forgerig-install-*.log"));
+                                    }
+                                    document.body.removeChild(ta);
+                                }
+                                if (navigator.clipboard && navigator.clipboard.writeText) {
+                                    navigator.clipboard.writeText(text).then(function() {
+                                        alert("Logs copied to clipboard!");
+                                    }, function(err) {
+                                        legacyCopy(text);
+                                    });
+                                } else {
+                                    legacyCopy(text);
+                                }
                             }
 
                             function install() {
@@ -238,6 +260,7 @@ class MainActivity : AppCompatActivity() {
                             <p class="stage" id="stage-text"></p>
                             <p class="detail" id="detail-text"></p>
                             <div class="error" id="error-text"></div>
+                            <p class="stage" id="log-path" style="display:none; font-size: 12px;"></p>
                             <button id="install-btn" class="btn" style="display:none;" onclick="install()">Install Environment</button>
                             <br><button id="copy-btn" class="btn" style="background-color: #7f8c8d; margin-top: 8px; font-size: 14px; padding: 10px 20px; display: none;" onclick="copyLogs()">Copy Logs</button>
                             <div class="options">
@@ -278,7 +301,13 @@ class MainActivity : AppCompatActivity() {
                 .put("detail", detail)
                 .put("error", error)
                 .put("errorDetail", errorDetail)
+                .put("logFile", AssetExtractor.sharedLogFileName())
                 .toString()
+        }
+
+        @JavascriptInterface
+        fun getLogFilePath(): String {
+            return "Downloads/${AssetExtractor.sharedLogFileName()}"
         }
 
         @JavascriptInterface

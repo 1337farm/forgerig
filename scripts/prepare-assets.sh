@@ -4,9 +4,14 @@
 # Produces, under $FORGERIG_ASSETS_DIR (default: app/src/main/assets):
 #   proot                aarch64 proot (from the Termux package repo)
 #   proot-loader         the proot loader companion, next to the binary
-#   ubuntu-rootfs.tar.gz a real aarch64 Linux rootfs (Alpine minirootfs) with
-#                        the ForgeRig daemon baked in at usr/bin/forgerig-daemon
-#                        and an entrypoint at root/start.sh
+#   ubuntu-rootfs.bin    a real aarch64 Linux rootfs (Alpine minirootfs, gzipped
+#                        tar) with the ForgeRig daemon baked in at
+#                        usr/bin/forgerig-daemon and an entrypoint at
+#                        root/start.sh
+# NOTE: the rootfs uses a `.bin` extension (not `.tar.gz`) because the
+# Android Gradle Plugin automatically gunzips `.gz` assets during the merge
+# step, which renames `ubuntu-rootfs.tar.gz` to `ubuntu-rootfs.tar` inside
+# the APK and breaks AssetManager.open("ubuntu-rootfs.tar.gz").
 #
 # The daemon is built with `cargo build --release`. By default it uses the
 # host toolchain. Cross-build with:
@@ -97,12 +102,13 @@ chmod 755 "$ROOTFS_STAGING/root/start.sh"
 
 # --- 5. Emit the assets ------------------------------------------------------
 mkdir -p "$ASSETS"
-echo ">> Writing $ASSETS/ubuntu-rootfs.tar.gz"
-tar czf "$ASSETS/ubuntu-rootfs.tar.gz" -C "$ROOTFS_STAGING" .
+echo ">> Writing $ASSETS/ubuntu-rootfs.bin (gzipped tar, .bin extension avoids AGP gunzipping)"
+tar czf "$ASSETS/ubuntu-rootfs.bin" -C "$ROOTFS_STAGING" .
+rm -f "$ASSETS/ubuntu-rootfs.tar.gz"
 echo ">> Writing $ASSETS/proot and $ASSETS/proot-loader"
 cp "$PROOT_BIN" "$ASSETS/proot"
 cp "$PROOT_LOADER" "$ASSETS/proot-loader"
 chmod 755 "$ASSETS/proot" "$ASSETS/proot-loader"
 
 echo ">> Done. Assets:"
-ls -l "$ASSETS/proot" "$ASSETS/proot-loader" "$ASSETS/ubuntu-rootfs.tar.gz"
+ls -l "$ASSETS/proot" "$ASSETS/proot-loader" "$ASSETS/ubuntu-rootfs.bin"
