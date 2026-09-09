@@ -35,14 +35,21 @@ class AssetExtractor(private val context: Context) {
         )
 
         fun sharedLogFileName(): String {
+            return "forgerig-install.log"
+        }
+
+        fun buildId(): String {
             val sha = try {
                 BuildConfig.GIT_SHA.ifEmpty { "dev" }
             } catch (e: Exception) {
                 "dev"
             }
-            return "forgerig-install-${BuildConfig.BUILD_TYPE}-$sha.log"
+            return "${BuildConfig.BUILD_TYPE}-$sha"
         }
     }
+
+    @Volatile
+    private var cachedLogUri: android.net.Uri? = null
 
     private var progress: InstallProgress = object : InstallProgress {
         override fun onProgress(percent: Int, stage: String, detail: String) {}
@@ -60,34 +67,52 @@ class AssetExtractor(private val context: Context) {
         writeSharedLog(message)
     }
 
+    private fun resolveLogUri(fileName: String): android.net.Uri? {
+        val resolver = context.contentResolver
+        val existing = resolver.query(
+            MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+            arrayOf(MediaStore.Downloads._ID),
+            "${MediaStore.Downloads.DISPLAY_NAME}=?",
+            arrayOf(fileName),
+            null
+        )
+        return if (existing != null && existing.moveToFirst()) {
+            val id = existing.getLong(0)
+            existing.close()
+            android.net.Uri.withAppendedPath(MediaStore.Downloads.EXTERNAL_CONTENT_URI, id.toString())
+        } else {
+            existing?.close()
+            val values = ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                put(MediaStore.Downloads.MIME_TYPE, "text/plain")
+                put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+            }
+            resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+        }
+    }
+
+    private fun appendToUri(uri: android.net.Uri, bytes: ByteArray) {
+        context.contentResolver.openOutputStream(uri, "wa")?.use { it.write(bytes) }
+    }
+
     private fun writeSharedLog(message: String) {
         try {
             val stamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
             val line = "[$stamp] $message\n"
             val fileName = sharedLogFileName()
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val values = ContentValues().apply {
-                    put(MediaStore.Downloads.DISPLAY_NAME, fileName)
-                    put(MediaStore.Downloads.MIME_TYPE, "text/plain")
-                    put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                var uri = cachedLogUri ?: resolveLogUri(fileName)?.also { cachedLogUri = it }
+                try {
+                    if (uri != null) {
+                        appendToUri(uri, line.toByteArray())
+                    }
+                } catch (e: Exception) {
+                    cachedLogUri = null
+                    uri = resolveLogUri(fileName)?.also { cachedLogUri = it }
+                    if (uri != null) {
+                        appendToUri(uri, line.toByteArray())
+                    }
                 }
-                val resolver = context.contentResolver
-                val existing = resolver.query(
-                    MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-                    arrayOf(MediaStore.Downloads._ID),
-                    "${MediaStore.Downloads.DISPLAY_NAME}=?",
-                    arrayOf(fileName),
-                    null
-                )
-                val uri = if (existing != null && existing.moveToFirst()) {
-                    val id = existing.getLong(0)
-                    existing.close()
-                    android.net.Uri.withAppendedPath(MediaStore.Downloads.EXTERNAL_CONTENT_URI, id.toString())
-                } else {
-                    existing?.close()
-                    resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                } ?: return
-                resolver.openOutputStream(uri, "wa")?.use { it.write(line.toByteArray()) }
             } else {
                 @Suppress("DEPRECATION")
                 val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
@@ -143,7 +168,7 @@ class AssetExtractor(private val context: Context) {
     fun extractAssets() {
         thread {
             try {
-                log("Install started (log=${sharedLogFileName()})")
+                log("===== Install started (build=${buildId()}, log=${sharedLogFileName()}) =====")
                 val targetDir = File(context.filesDir, "ubuntu_rootfs")
                 if (!targetDir.exists()) {
                     targetDir.mkdirs()
@@ -199,11 +224,21 @@ class AssetExtractor(private val context: Context) {
                 openRootfs().use { rootfs ->
                     tarStreamFor(rootfs).use { tarStream ->
                         var entry = tarStream.nextTarEntry
+                        val canonicalTarget = targetDir.canonicalPath
                         while (entry != null) {
                             val outputFile = File(targetDir, entry.name)
+                            val outputPath = outputFile.canonicalPath
 
-                            if (!outputFile.canonicalPath.startsWith(targetDir.canonicalPath + File.separator)) {
+                            if (outputPath != canonicalTarget &&
+                                !outputPath.startsWith(canonicalTarget + File.separator)) {
                                 throw SecurityException("Path traversal attack detected: ${entry.name}")
+                            }
+
+                            if (outputPath == canonicalTarget) {
+                                targetDir.mkdirs()
+                                done++
+                                entry = tarStream.nextTarEntry
+                                continue
                             }
 
                             if (entry.isDirectory) {
