@@ -172,6 +172,7 @@ class MainActivity : AppCompatActivity() {
                                 } else if (phase === 'failed') {
                                     installBtn.style.display = 'inline-block';
                                     installBtn.disabled = false;
+                                    document.getElementById('copy-btn').style.display = 'inline-block';
                                     track.style.display = 'none';
                                     stage.style.display = 'none';
                                     detail.style.display = 'none';
@@ -194,9 +195,18 @@ class MainActivity : AppCompatActivity() {
                                 }
                             }
 
-                            function onVerboseChanged() {
-                                setVerbose(document.getElementById('verbose').checked);
-                                renderInstall();
+                            function copyLogs() {
+                                var text = "";
+                                if (installState) {
+                                    text = "Phase: " + installState.phase + "\nStage: " + installState.stage + "\nDetail: " + installState.detail + "\nError: " + installState.error + "\nErrorDetail: " + installState.errorDetail;
+                                } else {
+                                    text = document.getElementById('error-text').innerText || document.getElementById('stage-text').innerText;
+                                }
+                                navigator.clipboard.writeText(text).then(function() {
+                                    alert("Logs copied to clipboard!");
+                                }, function(err) {
+                                    alert("Failed to copy logs: " + err);
+                                });
                             }
 
                             function install() {
@@ -229,6 +239,7 @@ class MainActivity : AppCompatActivity() {
                             <p class="detail" id="detail-text"></p>
                             <div class="error" id="error-text"></div>
                             <button id="install-btn" class="btn" style="display:none;" onclick="install()">Install Environment</button>
+                            <br><button id="copy-btn" class="btn" style="background-color: #7f8c8d; margin-top: 8px; font-size: 14px; padding: 10px 20px; display: none;" onclick="copyLogs()">Copy Logs</button>
                             <div class="options">
                                 <label><input type="checkbox" id="verbose" onchange="onVerboseChanged()"> Show detailed progress</label>
                             </div>

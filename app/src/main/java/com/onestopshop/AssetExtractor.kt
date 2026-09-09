@@ -1,5 +1,8 @@
 package com.onestopshop
 
+import android.os.Environment
+import java.io.FileWriter
+import java.io.PrintWriter
 import android.content.Context
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 import java.io.File
@@ -17,10 +20,31 @@ interface InstallProgress {
 
 class AssetExtractor(private val context: Context) {
 
+    private fun writeLog(message: String) {
+        try {
+            val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            if (!downloadsDir.exists()) {
+                downloadsDir.mkdirs()
+            }
+            val logFile = File(downloadsDir, "forgerig-install-${BuildConfig.BUILD_TYPE}-2b4076fcdc.log")
+            FileWriter(logFile, true).use { writer ->
+                writer.append("$message\n")
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
     private var progress: InstallProgress = object : InstallProgress {
-        override fun onProgress(percent: Int, stage: String, detail: String) {}
-        override fun onError(message: String, detail: String) {}
-        override fun onDone() {}
+        override fun onProgress(percent: Int, stage: String, detail: String) {
+            writeLog("PROGRESS [$percent%] $stage - $detail")
+        }
+        override fun onError(message: String, detail: String) {
+            writeLog("ERROR: $message | $detail")
+        }
+        override fun onDone() {
+            writeLog("DONE: Environment ready")
+        }
     }
 
     fun setProgressListener(listener: InstallProgress): AssetExtractor {
