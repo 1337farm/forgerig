@@ -475,9 +475,8 @@ class MainActivity : AppCompatActivity() {
 
         @JavascriptInterface
         fun isInstalled(): Boolean {
-            val targetDir = File(context.filesDir, "ubuntu_rootfs")
-            val prootFile = File(targetDir, "proot")
-            return prootFile.exists()
+            val entrypoint = File(context.filesDir, "ubuntu_rootfs/root/start.sh")
+            return entrypoint.exists()
         }
     }
 
