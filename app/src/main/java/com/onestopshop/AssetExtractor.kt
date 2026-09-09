@@ -51,6 +51,44 @@ class AssetExtractor(private val context: Context) {
             return "${BuildConfig.BUILD_TYPE}-${gitSha()}"
         }
 
+        fun deviceInfo(): String {
+            return "Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})"
+        }
+
+        fun describeFile(file: File): String {
+            return try {
+                "${file.absolutePath} exists=${file.exists()} size=${if (file.exists()) file.length() else -1} " +
+                    "readable=${file.canRead()} executable=${file.canExecute()} " +
+                    "parentWritable=${file.parentFile?.canWrite()}"
+            } catch (e: Exception) {
+                "${file.absolutePath} stat failed: ${e.message}"
+            }
+        }
+
+        fun ensureExecutable(file: File): String? {
+            val setOk = try {
+                file.setExecutable(true, false)
+            } catch (e: Exception) {
+                false
+            }
+            if (file.canExecute()) {
+                return null
+            }
+            val chmodResult = try {
+                android.system.Os.chmod(file.absolutePath, 493)
+                "ok"
+            } catch (e: android.system.ErrnoException) {
+                "errno=${e.errno} ${e.message}"
+            } catch (e: Exception) {
+                e.message ?: e.toString()
+            }
+            return if (file.canExecute()) {
+                null
+            } else {
+                "not executable (setExecutable=$setOk, chmod=$chmodResult) [${describeFile(file)}] [${deviceInfo()}]"
+            }
+        }
+
         fun logShared(context: Context, message: String) {
             Log.i(TAG, message)
             try {
@@ -181,14 +219,16 @@ class AssetExtractor(private val context: Context) {
                 } catch (e: IOException) {
                     throw IOException("Bundled proot binary is missing. Bundled assets: [${listBundledAssets()}]. ${e.message}")
                 }
-                prootFile.setExecutable(true, false)
                 val prootSize = prootFile.length()
                 if (prootSize == 0L) {
                     throw IOException("Bundled proot binary is empty")
                 } else if (prootSize < 4 || !isElf(prootFile)) {
                     throw IOException("Bundled proot is not a valid ELF binary")
                 }
-                log("Proot extracted ($prootSize bytes)")
+                ensureExecutable(prootFile)?.let {
+                    throw IOException("Bundled proot is $it")
+                }
+                log("Proot extracted ($prootSize bytes, executable)")
 
                 val loaderFile = File(targetDir, "libexec/proot/loader")
                 loaderFile.parentFile?.mkdirs()
@@ -201,10 +241,13 @@ class AssetExtractor(private val context: Context) {
                 } catch (e: IOException) {
                     throw IOException("Bundled proot loader is missing. Bundled assets: [${listBundledAssets()}]. ${e.message}")
                 }
-                loaderFile.setExecutable(true, false)
                 if (loaderFile.length() == 0L || !isElf(loaderFile)) {
                     throw IOException("Bundled proot loader is empty or not an ELF binary")
                 }
+                ensureExecutable(loaderFile)?.let {
+                    throw IOException("Bundled proot loader is $it")
+                }
+                log("Proot loader extracted (${loaderFile.length()} bytes, executable)")
 
                 progress.onStep(1)
                 progress.onProgress(8, "Unpacking container files…", "Starting extraction")
