@@ -8,6 +8,7 @@ import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.appcompat.app.AppCompatActivity
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.OutputStreamWriter
@@ -81,13 +82,18 @@ class MainActivity : AppCompatActivity() {
                         <style>
                             body { font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background-color: #f0f0f0; }
                             .message { text-align: center; padding: 20px; background: white; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); width: 84%; max-width: 420px; }
-                            .spinner { margin: 20px auto; width: 40px; height: 40px; border: 4px solid #f3f3f3; border-top: 4px solid #3498db; border-radius: 50%; animation: spin 1s linear infinite; }
-                            @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
                             .btn { background-color: #3498db; border: none; color: white; padding: 15px 32px; text-align: center; text-decoration: none; display: inline-block; font-size: 16px; margin: 4px 2px; cursor: pointer; border-radius: 8px; }
                             .btn:disabled { background-color: #9bb8d0; cursor: default; }
-                            .progress-track { margin: 20px 0 8px; height: 12px; background-color: #e0e0e0; border-radius: 6px; overflow: hidden; display: none; }
+                            .progress-track { margin: 12px 0 8px; height: 12px; background-color: #e0e0e0; border-radius: 6px; overflow: hidden; display: none; }
                             .progress-fill { height: 100%; width: 0; background-color: #3498db; border-radius: 6px; transition: width 0.2s ease; }
-                            .stage { margin: 4px 0; font-size: 14px; color: #555; display: none; }
+                            .step-count { margin: 8px 0 4px; font-size: 14px; font-weight: bold; color: #333; display: none; }
+                            .steps { list-style: none; margin: 8px 0; padding: 0; text-align: left; display: none; }
+                            .steps li { margin: 6px 0; font-size: 14px; color: #bbb; }
+                            .steps li.done { color: #27ae60; text-decoration: line-through; }
+                            .steps li.active { color: #111; font-weight: bold; }
+                            .steps li.failed { color: #c0392b; font-weight: bold; }
+                            .steps .dot { display: inline-block; width: 10px; height: 10px; margin-right: 6px; border-radius: 50%; background-color: #3498db; animation: pulse 1s infinite; }
+                            @keyframes pulse { 50% { opacity: 0.25; } }
                             .detail { margin: 4px 0 8px; font-size: 12px; color: #999; display: none; word-break: break-all; text-align: left; background: #fafafa; padding: 6px; border-radius: 4px; max-height: 100px; overflow-y: auto; }
                             .error { margin: 12px 0; padding: 10px; border-radius: 6px; background-color: #fdecea; color: #c0392b; font-size: 14px; display: none; word-break: break-all; text-align: left; }
                             .options { margin-top: 12px; font-size: 13px; color: #666; text-align: left; }
@@ -122,6 +128,20 @@ class MainActivity : AppCompatActivity() {
                                 }
                             }
 
+                            var reloading = false;
+                            var FALLBACK_LABELS = ['Prepare runtime', 'Unpack container files', 'Finalize environment', 'Start container service', 'Connect to daemon'];
+
+                            function stepLabels() {
+                                if (installState && installState.stepLabels && installState.stepLabels.length) {
+                                    return installState.stepLabels;
+                                }
+                                return FALLBACK_LABELS;
+                            }
+
+                            function stepsTotal() {
+                                return (installState && installState.stepsTotal) || FALLBACK_LABELS.length;
+                            }
+
                             function pollInstall() {
                                 if (window.NativeHost) {
                                     var raw = window.NativeHost.getInstallState();
@@ -133,54 +153,98 @@ class MainActivity : AppCompatActivity() {
                                 setTimeout(pollInstall, 300);
                             }
 
+                            function renderSteps(failedStep) {
+                                var labels = stepLabels();
+                                var total = stepsTotal();
+                                var cur = installState.step;
+                                var html = '';
+                                var doneCount = 0;
+                                for (var i = 0; i < total; i++) {
+                                    var label = labels[i] || ('Step ' + (i + 1));
+                                    var cls, mark;
+                                    if (installState.phase === 'ready' || i < cur) {
+                                        cls = 'done'; mark = '&#10003; '; doneCount++;
+                                    } else if (failedStep && i === cur) {
+                                        cls = 'failed'; mark = '&#10007; ';
+                                    } else if (i === cur) {
+                                        cls = 'active'; mark = '<span class="dot"></span>';
+                                    } else {
+                                        cls = 'pending'; mark = '';
+                                    }
+                                    html += '<li class="' + cls + '">' + mark + (i + 1) + '. ' + label + '</li>';
+                                }
+                                document.getElementById('steps').innerHTML = html;
+                                return doneCount;
+                            }
+
                             function renderInstall() {
-                                if (!installState) { setTimeout(pollInstall, 300); return; }
+                                if (!installState) { return; }
 
                                 var phase = installState.phase;
                                 var bar = document.getElementById('progress-fill');
                                 var track = document.getElementById('progress-track');
-                                var stage = document.getElementById('stage-text');
+                                var count = document.getElementById('step-count');
+                                var steps = document.getElementById('steps');
                                 var detail = document.getElementById('detail-text');
                                 var err = document.getElementById('error-text');
-                                var connect = document.getElementById('connecting');
                                 var installBtn = document.getElementById('install-btn');
-                                var spinner = document.getElementById('spinner');
+                                var retryBtn = document.getElementById('retry-btn');
+                                var copyBtn = document.getElementById('copy-btn');
+                                var options = document.getElementById('options-row');
 
                                 if (phase === 'installing') {
                                     installBtn.style.display = 'none';
-                                    installBtn.disabled = true;
-                                    track.style.display = 'block';
-                                    stage.style.display = 'block';
-                                    detail.style.display = getVerbose() ? 'block' : 'none';
-                                    connect.style.display = 'block';
-                                    spinner.style.display = 'block';
+                                    retryBtn.style.display = 'none';
+                                    copyBtn.style.display = 'none';
+                                    options.style.display = 'none';
                                     err.style.display = 'none';
-                                    bar.style.width = installState.percent + '%';
-                                    stage.innerText = installState.stage + ' ' + installState.percent + '%';
+                                    var total = stepsTotal();
+                                    var cur = Math.max(0, installState.step);
+                                    var doneCount = renderSteps(false);
+                                    steps.style.display = 'block';
+                                    count.style.display = 'block';
+                                    count.innerText = 'Step ' + Math.min(cur + 1, total) + ' of ' + total + ' — ' + (stepLabels()[cur] || '');
+                                    var extracting = cur <= 2;
+                                    track.style.display = extracting ? 'block' : 'none';
+                                    if (extracting) { bar.style.width = installState.percent + '%'; }
+                                    var showDetail = getVerbose() || cur >= 3;
+                                    detail.style.display = (showDetail && installState.detail) ? 'block' : 'none';
                                     detail.innerText = installState.detail;
-                                } else if (phase === 'starting' || phase === 'ready') {
+                                } else if (phase === 'ready') {
                                     installBtn.style.display = 'none';
-                                    installBtn.disabled = true;
-                                    track.style.display = 'block';
-                                    stage.style.display = 'block';
+                                    options.style.display = 'none';
+                                    copyBtn.style.display = 'none';
+                                    err.style.display = 'none';
+                                    track.style.display = 'none';
+                                    renderSteps(false);
+                                    steps.style.display = 'block';
+                                    count.style.display = 'block';
+                                    count.innerText = stepsTotal() + ' of ' + stepsTotal() + ' steps complete — opening workspace…';
                                     detail.style.display = 'none';
-                                    connect.style.display = 'block';
-                                    spinner.style.display = 'block';
-                                    bar.style.width = '100%';
-                                    stage.innerText = phase === 'ready' ? 'Environment ready, connecting…' : 'Environment starting…';
-                                    setTimeout(function() { window.location.reload(); }, 3000);
+                                    var reloads = 0;
+                                    try { reloads = parseInt(sessionStorage.getItem('readyReloads') || '0', 10); } catch (e) {}
+                                    if (reloads < 3 && !reloading) {
+                                        reloading = true;
+                                        try { sessionStorage.setItem('readyReloads', String(reloads + 1)); } catch (e) {}
+                                        setTimeout(function() { window.location.reload(); }, 1500);
+                                    } else if (reloads >= 3) {
+                                        retryBtn.style.display = 'inline-block';
+                                    }
                                 } else if (phase === 'failed') {
                                     installBtn.style.display = 'inline-block';
                                     installBtn.disabled = false;
-                                    document.getElementById('copy-btn').style.display = 'inline-block';
+                                    installBtn.innerText = 'Retry Install';
+                                    copyBtn.style.display = 'inline-block';
+                                    options.style.display = 'block';
                                     var logPath = document.getElementById('log-path');
                                     logPath.style.display = 'block';
-                                    logPath.innerText = 'Full log: Downloads/' + (installState.logFile || 'forgerig-install-*.log');
+                                    logPath.innerText = 'Full log: Downloads/' + (installState.logFile || 'forgerig-install.log');
                                     track.style.display = 'none';
-                                    stage.style.display = 'none';
+                                    renderSteps(true);
+                                    steps.style.display = 'block';
+                                    count.style.display = 'block';
+                                    count.innerText = 'Failed at step ' + (installState.step + 1) + ' of ' + stepsTotal();
                                     detail.style.display = 'none';
-                                    connect.style.display = 'none';
-                                    spinner.style.display = 'none';
                                     err.style.display = 'block';
                                     if (getVerbose() && installState.errorDetail) {
                                         err.innerText = installState.error + '\n\n' + installState.errorDetail;
@@ -190,20 +254,25 @@ class MainActivity : AppCompatActivity() {
                                 } else {
                                     installBtn.style.display = 'inline-block';
                                     installBtn.disabled = false;
+                                    installBtn.innerText = 'Install Environment';
+                                    retryBtn.style.display = 'none';
+                                    copyBtn.style.display = 'none';
+                                    options.style.display = 'block';
                                     track.style.display = 'none';
-                                    stage.style.display = 'none';
+                                    count.style.display = 'none';
+                                    steps.style.display = 'none';
                                     detail.style.display = 'none';
-                                    spinner.style.display = 'none';
-                                    connect.style.display = 'none';
+                                    err.style.display = 'none';
+                                    document.getElementById('log-path').style.display = 'none';
                                 }
                             }
 
                             function copyLogs() {
                                 var text = "";
                                 if (installState) {
-                                    text = "Phase: " + installState.phase + "\nStage: " + installState.stage + "\nDetail: " + installState.detail + "\nError: " + installState.error + "\nErrorDetail: " + installState.errorDetail + "\nLogFile: " + installState.logFile;
+                                    text = "Phase: " + installState.phase + "\nStep: " + installState.step + "/" + installState.stepsTotal + "\nStage: " + installState.stage + "\nDetail: " + installState.detail + "\nError: " + installState.error + "\nErrorDetail: " + installState.errorDetail + "\nLogFile: " + installState.logFile;
                                 } else {
-                                    text = document.getElementById('error-text').innerText || document.getElementById('stage-text').innerText;
+                                    text = document.getElementById('error-text').innerText || document.getElementById('step-count').innerText;
                                 }
                                 function legacyCopy(t) {
                                     var ta = document.createElement('textarea');
@@ -233,12 +302,9 @@ class MainActivity : AppCompatActivity() {
 
                             function install() {
                                 if (window.NativeHost) {
-                                    document.getElementById('install-btn').disabled = true;
-                                    document.getElementById('connecting').style.display = 'block';
-                                    document.getElementById('spinner').style.display = 'block';
-                                    document.getElementById('progress-track').style.display = 'block';
-                                    document.getElementById('stage-text').style.display = 'block';
-                                    document.getElementById('stage-text').innerText = 'Starting installation…';
+                                    try { sessionStorage.setItem('readyReloads', '0'); } catch (e) {}
+                                    installState = {phase: 'installing', step: 0, stepsTotal: 5, stepLabels: stepLabels(), percent: 0, stage: 'Starting…', detail: '', error: '', errorDetail: '', logFile: (installState && installState.logFile) || 'forgerig-install.log'};
+                                    renderInstall();
                                     window.NativeHost.installNow();
                                 }
                             }
@@ -252,18 +318,16 @@ class MainActivity : AppCompatActivity() {
                     <body>
                         <div class="message">
                             <h2 id="title">ForgeRig</h2>
-                            <div id="connecting" style="display:none;">
-                                <h3>Connecting to Container...</h3>
-                                <div class="spinner" id="spinner"></div>
-                            </div>
+                            <p class="step-count" id="step-count"></p>
+                            <ol class="steps" id="steps"></ol>
                             <div class="progress-track" id="progress-track"><div class="progress-fill" id="progress-fill"></div></div>
-                            <p class="stage" id="stage-text"></p>
                             <p class="detail" id="detail-text"></p>
                             <div class="error" id="error-text"></div>
-                            <p class="stage" id="log-path" style="display:none; font-size: 12px;"></p>
+                            <p class="detail" id="log-path" style="display:none;"></p>
                             <button id="install-btn" class="btn" style="display:none;" onclick="install()">Install Environment</button>
+                            <br><button id="retry-btn" class="btn" style="display:none;" onclick="window.location.reload()">Retry Connection</button>
                             <br><button id="copy-btn" class="btn" style="background-color: #7f8c8d; margin-top: 8px; font-size: 14px; padding: 10px 20px; display: none;" onclick="copyLogs()">Copy Logs</button>
-                            <div class="options">
+                            <div class="options" id="options-row">
                                 <label><input type="checkbox" id="verbose" onchange="onVerboseChanged()"> Show detailed progress</label>
                             </div>
                         </div>
@@ -291,6 +355,16 @@ class MainActivity : AppCompatActivity() {
         private var error: String = ""
         @Volatile
         private var errorDetail: String = ""
+        @Volatile
+        private var step: Int = -1
+
+        private val stepLabels = listOf(
+            "Prepare runtime",
+            "Unpack container files",
+            "Finalize environment",
+            "Start container service",
+            "Connect to daemon"
+        )
 
         @JavascriptInterface
         fun getInstallState(): String {
@@ -302,6 +376,9 @@ class MainActivity : AppCompatActivity() {
                 .put("error", error)
                 .put("errorDetail", errorDetail)
                 .put("logFile", AssetExtractor.sharedLogFileName())
+                .put("step", step)
+                .put("stepsTotal", stepLabels.size)
+                .put("stepLabels", JSONArray(stepLabels))
                 .toString()
         }
 
@@ -317,6 +394,7 @@ class MainActivity : AppCompatActivity() {
             }
             phase = "installing"
             percent = 0
+            step = 0
             stage = "Preparing…"
             detail = ""
             error = ""
@@ -330,6 +408,10 @@ class MainActivity : AppCompatActivity() {
                         detail = d
                     }
 
+                    override fun onStep(s: Int) {
+                        step = s
+                    }
+
                     override fun onError(message: String, detailText: String) {
                         phase = "failed"
                         error = message
@@ -337,22 +419,76 @@ class MainActivity : AppCompatActivity() {
                     }
 
                     override fun onDone() {
-                        phase = "ready"
-                        startContainer()
+                        launchContainerAndWait()
                     }
                 })
                 .extractAssets()
         }
 
-        @JavascriptInterface
-        fun startContainer() {
-            // Start foreground service
+        private fun startContainerInternal() {
             val serviceIntent = Intent(context, ContainerService::class.java)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(serviceIntent)
             } else {
                 context.startService(serviceIntent)
             }
+        }
+
+        private fun launchContainerAndWait() {
+            step = 3
+            stage = "Starting container service…"
+            detail = ""
+            thread {
+                try {
+                    startContainerInternal()
+                } catch (e: Exception) {
+                    phase = "failed"
+                    error = "Could not start container service"
+                    errorDetail = e.toString()
+                    return@thread
+                }
+                step = 4
+                stage = "Connecting to daemon…"
+                val maxAttempts = 30
+                var attempt = 0
+                var ready = false
+                while (attempt < maxAttempts && phase == "installing") {
+                    attempt++
+                    detail = "Probing daemon on 127.0.0.1:${MainActivity.allocatedPort} (attempt $attempt/$maxAttempts)…"
+                    try {
+                        val url = URL("http://127.0.0.1:${MainActivity.allocatedPort}/")
+                        val conn = url.openConnection() as HttpURLConnection
+                        conn.connectTimeout = 1500
+                        conn.readTimeout = 1500
+                        conn.requestMethod = "GET"
+                        conn.connect()
+                        val code = conn.responseCode
+                        conn.disconnect()
+                        if (code in 200..499) {
+                            ready = true
+                            break
+                        }
+                    } catch (e: Exception) {
+                        // Daemon not up yet; keep probing.
+                    }
+                    Thread.sleep(2000)
+                }
+                if (ready) {
+                    percent = 100
+                    phase = "ready"
+                } else if (phase == "installing") {
+                    phase = "failed"
+                    error = "Container did not respond in 60s"
+                    errorDetail = "Timed out after $maxAttempts attempts probing " +
+                        "http://127.0.0.1:${MainActivity.allocatedPort}/. The service started but " +
+                        "nothing serves HTTP. See Downloads/${AssetExtractor.sharedLogFileName()} for details."
+                }
+            }
+        }
+
+        @JavascriptInterface
+        fun startContainer() {
+            startContainerInternal()
         }
 
         @JavascriptInterface
