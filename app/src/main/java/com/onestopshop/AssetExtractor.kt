@@ -51,6 +51,12 @@ class AssetExtractor(private val context: Context) {
             return "${BuildConfig.BUILD_TYPE}-${gitSha()}"
         }
 
+        fun resolveProotFile(context: Context): File =
+            File(context.applicationInfo.nativeLibraryDir, "libproot.so")
+
+        fun resolveLoaderFile(context: Context): File =
+            File(context.applicationInfo.nativeLibraryDir, "libproot_loader.so")
+
         fun deviceInfo(): String {
             return "Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})"
         }
@@ -207,47 +213,23 @@ class AssetExtractor(private val context: Context) {
                 }
 
                 progress.onStep(0)
-                progress.onProgress(2, "Preparing runtime…", "Copying proot")
-                log("PROGRESS [2%] Preparing runtime… - Copying proot")
-                val prootFile = File(targetDir, "proot")
-                try {
-                    context.assets.open("proot").use { inputStream ->
-                        FileOutputStream(prootFile).use { output ->
-                            inputStream.copyTo(output)
-                        }
-                    }
-                } catch (e: IOException) {
-                    throw IOException("Bundled proot binary is missing. Bundled assets: [${listBundledAssets()}]. ${e.message}")
-                }
-                val prootSize = prootFile.length()
-                if (prootSize == 0L) {
-                    throw IOException("Bundled proot binary is empty")
-                } else if (prootSize < 4 || !isElf(prootFile)) {
-                    throw IOException("Bundled proot is not a valid ELF binary")
+                progress.onProgress(2, "Preparing runtime…", "Verifying proot")
+                log("PROGRESS [2%] Preparing runtime… - Verifying proot")
+                val prootFile = resolveProotFile(context)
+                if (!prootFile.exists() || prootFile.length() == 0L || !isElf(prootFile)) {
+                    throw IOException("proot native library is missing or invalid: ${describeFile(prootFile)} (broken APK build?)")
                 }
                 ensureExecutable(prootFile)?.let {
-                    throw IOException("Bundled proot is $it")
+                    throw IOException("proot native library is $it")
                 }
-                log("Proot extracted ($prootSize bytes, executable)")
-
-                val loaderFile = File(targetDir, "libexec/proot/loader")
-                loaderFile.parentFile?.mkdirs()
-                try {
-                    context.assets.open("proot-loader").use { inputStream ->
-                        FileOutputStream(loaderFile).use { output ->
-                            inputStream.copyTo(output)
-                        }
-                    }
-                } catch (e: IOException) {
-                    throw IOException("Bundled proot loader is missing. Bundled assets: [${listBundledAssets()}]. ${e.message}")
-                }
-                if (loaderFile.length() == 0L || !isElf(loaderFile)) {
-                    throw IOException("Bundled proot loader is empty or not an ELF binary")
+                val loaderFile = resolveLoaderFile(context)
+                if (!loaderFile.exists() || loaderFile.length() == 0L || !isElf(loaderFile)) {
+                    throw IOException("proot loader native library is missing or invalid: ${describeFile(loaderFile)} (broken APK build?)")
                 }
                 ensureExecutable(loaderFile)?.let {
-                    throw IOException("Bundled proot loader is $it")
+                    throw IOException("proot loader native library is $it")
                 }
-                log("Proot loader extracted (${loaderFile.length()} bytes, executable)")
+                log("Proot verified (${prootFile.absolutePath}, ${prootFile.length()} bytes, executable)")
 
                 progress.onStep(1)
                 progress.onProgress(8, "Unpacking container files…", "Starting extraction")

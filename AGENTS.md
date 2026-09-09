@@ -22,13 +22,20 @@ A branch cut from an old `main` will be CONFLICTING by the time you push.
 - Full APK packaging requires generated container assets first:
   `export HOME="/data/data/com.termux/files/home" && bash scripts/prepare-assets.sh`
   then `./gradlew assembleDebug` (fails loudly via `checkContainerAssets`
-  if `app/src/main/assets/{proot,proot-loader,ubuntu-rootfs.bin}` are missing).
+  if `app/src/main/assets/ubuntu-rootfs.bin` or
+  `app/src/main/jniLibs/arm64-v8a/libproot{,_loader}.so` are missing).
 
 ## Asset pipeline gotchas (must-know)
 - `scripts/prepare-assets.sh` emits `ubuntu-rootfs.bin` (gzipped tar with a
   `.bin` extension) — NOT `.tar.gz`. AGP auto-gunzips `.gz` assets at merge
   time, which renames the entry to `ubuntu-rootfs.tar` inside the APK and
   breaks `AssetManager.open("ubuntu-rootfs.tar.gz")` with FileNotFoundException.
+- proot + loader ship as `app/src/main/jniLibs/arm64-v8a/libproot{,_loader}.so`
+  (NOT assets): some devices refuse execve() on app-chmodded filesDir payloads
+  (error=13) with the +x bit correctly set — only PackageManager-extracted
+  native libs run everywhere. Manifest pins `extractNativeLibs="true"`.
+  `AssetExtractor.resolveProotFile/resolveLoaderFile` are the single source
+  of truth for their runtime paths.
 - `AssetExtractor` opens `ubuntu-rootfs.bin` first, then falls back to
   `.tar.gz` / plain `.tar` for older APKs. Keep all three in sync across
   `prepare-assets.sh`, `checkContainerAssets` (app/build.gradle.kts),

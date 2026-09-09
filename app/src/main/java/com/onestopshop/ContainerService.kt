@@ -139,13 +139,13 @@ class ContainerService : Service() {
 
     private fun startContainerProcess() {
         val rootFsDir = File(filesDir, "ubuntu_rootfs")
-        val prootBin = File(rootFsDir, "proot")
-        val loaderBin = File(rootFsDir, "libexec/proot/loader")
+        val prootBin = AssetExtractor.resolveProotFile(this)
+        val loaderBin = AssetExtractor.resolveLoaderFile(this)
         val entrypoint = File(rootFsDir, "root/start.sh")
 
         val missing = mutableListOf<String>()
-        if (!prootBin.exists()) missing.add("proot")
-        if (!loaderBin.exists()) missing.add("proot-loader")
+        if (!prootBin.exists()) missing.add("libproot.so (native lib)")
+        if (!loaderBin.exists()) missing.add("libproot_loader.so (native lib)")
         if (!entrypoint.exists()) missing.add("root/start.sh")
         if (missing.isNotEmpty()) {
             val message = "Container files missing: ${missing.joinToString(", ")}. Please run install first."

@@ -104,10 +104,13 @@ dependencies {
 }
 
 // Reject APKs built with placeholder container assets (see scripts/prepare-assets.sh).
+// proot ships as native libs (PackageManager extracts them executable);
+// only the rootfs blob lives in assets.
 val checkContainerAssets by tasks.registering(Exec::class) {
     workingDir = rootProject.projectDir
     commandLine("sh", "-c",
-        "test -s app/src/main/assets/proot && test -s app/src/main/assets/proot-loader && " +
+        "test -s app/src/main/jniLibs/arm64-v8a/libproot.so && " +
+        "test -s app/src/main/jniLibs/arm64-v8a/libproot_loader.so && " +
         "(test -s app/src/main/assets/ubuntu-rootfs.bin || test -s app/src/main/assets/ubuntu-rootfs.tar.gz)")
 }
 // Only packaging needs the assets; unit tests must stay runnable without them.

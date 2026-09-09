@@ -101,14 +101,19 @@ SH
 chmod 755 "$ROOTFS_STAGING/root/start.sh"
 
 # --- 5. Emit the assets ------------------------------------------------------
-mkdir -p "$ASSETS"
+# NOTE: proot + loader ship as native libs (lib/*.so), NOT as assets.
+# The package manager extracts jniLibs with the executable bit on a
+# system-blessed path; some devices refuse execve() on files the app
+# chmods itself under filesDir (error=13), which no chmod fallback can fix.
+JNILIBS="$ROOT/app/src/main/jniLibs/arm64-v8a"
+mkdir -p "$ASSETS" "$JNILIBS"
 echo ">> Writing $ASSETS/ubuntu-rootfs.bin (gzipped tar, .bin extension avoids AGP gunzipping)"
 tar czf "$ASSETS/ubuntu-rootfs.bin" -C "$ROOTFS_STAGING" .
-rm -f "$ASSETS/ubuntu-rootfs.tar.gz"
-echo ">> Writing $ASSETS/proot and $ASSETS/proot-loader"
-cp "$PROOT_BIN" "$ASSETS/proot"
-cp "$PROOT_LOADER" "$ASSETS/proot-loader"
-chmod 755 "$ASSETS/proot" "$ASSETS/proot-loader"
+rm -f "$ASSETS/ubuntu-rootfs.tar.gz" "$ASSETS/proot" "$ASSETS/proot-loader"
+echo ">> Writing $JNILIBS/libproot.so and libproot_loader.so"
+cp "$PROOT_BIN" "$JNILIBS/libproot.so"
+cp "$PROOT_LOADER" "$JNILIBS/libproot_loader.so"
+chmod 755 "$JNILIBS/libproot.so" "$JNILIBS/libproot_loader.so"
 
 echo ">> Done. Assets:"
-ls -l "$ASSETS/proot" "$ASSETS/proot-loader" "$ASSETS/ubuntu-rootfs.bin"
+ls -l "$ASSETS/ubuntu-rootfs.bin" "$JNILIBS/libproot.so" "$JNILIBS/libproot_loader.so"
