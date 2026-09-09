@@ -146,7 +146,7 @@ jobs:
         if: always()
         with:
           name: ForgeRig-Release-APK
-          path: app/build/outputs/apk/release/*.apk
+          path: app/build/outputs/apk/release/forgerig-*.apk
           retention-days: 7
 
       - name: Publish APK release
@@ -157,8 +157,8 @@ jobs:
           set -e
           OUT="$RUNNER_TEMP/apk-release"
           mkdir -p "$OUT"
-          APK="$(find app/build/outputs/apk/release -name '*.apk' | head -1)"
-          if [ -z "$APK" ]; then echo "ERROR: no APK to publish"; return 1; fi
+          APK="$(find app/build/outputs/apk/release -name 'forgerig-*.apk' | head -1)"
+          if [ -z "$APK" ]; then echo "ERROR: no forgerig-*.apk to publish (hash rename missing?)"; return 1; fi
           cp "$APK" "$OUT/"
           APK_NAME="$(basename "$APK")"
           SHA="$(git rev-parse --short=10 HEAD)"

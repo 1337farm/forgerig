@@ -1,4 +1,5 @@
 import java.util.Properties
+import java.io.File
 import java.io.FileInputStream
 import java.io.FileNotFoundException
 
@@ -12,6 +13,20 @@ try {
     localProperties.load(FileInputStream(rootProject.file("local.properties")))
 } catch (e: FileNotFoundException) {
     // Ignore if not present
+}
+
+// Short commit hash baked into the APK filename (farm-style:
+// forgerig-<buildtype>-<sha>.apk) and BuildConfig.GIT_SHA.
+val gitCommitHash: String = try {
+    val proc = ProcessBuilder("git", "rev-parse", "--short=10", "HEAD")
+        .directory(rootProject.projectDir)
+        .redirectErrorStream(true)
+        .start()
+    val sha = proc.inputStream.bufferedReader().readText().trim()
+    proc.waitFor()
+    if (sha.matches(Regex("[0-9a-f]{10}"))) sha else "dev"
+} catch (e: Exception) {
+    "dev"
 }
 
 android {
@@ -29,16 +44,7 @@ android {
 
         buildConfigField("String", "GITHUB_CLIENT_ID", "\"${localProperties.getProperty("GITHUB_CLIENT_ID", "")}\"")
         buildConfigField("String", "GITHUB_CLIENT_SECRET", "\"${localProperties.getProperty("GITHUB_CLIENT_SECRET", "")}\"")
-        val gitSha = try {
-            val proc = ProcessBuilder("git", "rev-parse", "--short=10", "HEAD")
-                .directory(rootProject.projectDir)
-                .redirectErrorStream(true)
-                .start()
-            proc.inputStream.bufferedReader().readText().trim().ifEmpty { "dev" }
-        } catch (e: Exception) {
-            "dev"
-        }
-        buildConfigField("String", "GIT_SHA", "\"$gitSha\"")
+        buildConfigField("String", "GIT_SHA", "\"$gitCommitHash\"")
     }
 
     androidResources {
@@ -112,3 +118,39 @@ tasks.matching { it.name == "packageDebug" || it.name == "packageRelease" }
 if (providers.gradleProperty("skipContainerAssetsCheck").isPresent) {
     tasks.named("checkContainerAssets").configure { enabled = false }
 }
+
+// Rename assembled APKs to forgerig-<buildtype>-<sha>.apk (farm-style), so
+// every build artifact carries its commit hash. Plain task + finalizedBy
+// (no applicationVariants DSL) to stay compatible with newer AGP versions.
+val renameApkWithHash by tasks.registering {
+    doLast {
+        val outDirs = listOf("debug", "release").map { type ->
+            layout.buildDirectory.dir("outputs/apk/$type").get().asFile
+        }
+        outDirs.forEach { outDir ->
+            outDir.listFiles { f -> f.isFile && f.name.startsWith("app-") && f.name.endsWith(".apk") }
+                ?.forEach { apk ->
+                    val type = outDir.name
+                    val target = File(outDir, "forgerig-$type-$gitCommitHash.apk")
+                    if (apk.canonicalPath != target.canonicalPath) {
+                        if (!apk.renameTo(target)) {
+                            throw GradleException("Failed to rename ${apk.name} to ${target.name}")
+                        }
+                        logger.lifecycle("Renamed ${apk.name} -> ${target.name}")
+                    }
+                }
+        }
+        val hashed = outDirs.flatMap { dir ->
+            dir.listFiles { f -> f.isFile && f.name.startsWith("forgerig-") && f.name.endsWith(".apk") }
+                ?.toList() ?: emptyList()
+        }
+        if (hashed.isEmpty()) {
+            // Warn only: finalizedBy also runs when assemble itself failed,
+            // and must not mask the real error. CI globs forgerig-*.apk and
+            // fails loudly if the rename never happened on a green build.
+            logger.warn("No forgerig-*.apk found after assemble task")
+        }
+    }
+}
+tasks.matching { it.name == "assembleDebug" || it.name == "assembleRelease" || it.name == "assemble" }
+    .configureEach { finalizedBy(renameApkWithHash) }
