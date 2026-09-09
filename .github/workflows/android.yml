@@ -55,28 +55,19 @@ jobs:
       - name: Grant execute permission
         run: chmod +x gradlew scripts/prepare-assets.sh
 
-      # Distributed Rust compiler cache (GHA backend). Warms cold builds;
-      # per-branch incremental state comes from the cargo target cache below.
+      # Shared Rust/musl caching (1337farm/actions). Pinned to the actions
+      # PR head SHA until the new actions ride the @v1 tag, then switch.
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
+        uses: 1337farm/actions/setup-sccache@10a290b94979cd004b703fc1fd73c5f05c808616
 
-      # Caches ~/.cargo/registry and daemon/target. The shared-key pins the
-      # cross target + feature set: bump it if either changes, otherwise a
-      # stale cache would silently rebuild with the wrong flags.
       - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
+        uses: 1337farm/actions/cache-cargo@10a290b94979cd004b703fc1fd73c5f05c808616
         with:
           workspaces: daemon
           shared-key: aarch64-unknown-linux-musl_vendored-openssl
 
-      # The musl.cc mirror frequently times out (see retry loop below);
-      # caching the extracted toolchain skips the download entirely on hits.
-      - name: Cache musl cross toolchain
-        id: cache-musl
-        uses: actions/cache@v4
-        with:
-          path: ~/musl-cross
-          key: musl-cross-aarch64-v1
+      - name: Provide musl cross toolchain
+        uses: 1337farm/actions/cache-musl-toolchain@10a290b94979cd004b703fc1fd73c5f05c808616
 
       - name: Prepare container assets (proot + rootfs + daemon)
         env:
@@ -91,42 +82,6 @@ jobs:
             . "$CARGO_HOME/env"
           fi
           rustup target add aarch64-unknown-linux-musl
-
-          # Full aarch64 musl cross toolchain: rusqlite bundles libsqlite3 and is
-          # compiled with the `cc` crate, which needs a real cross compiler.
-          # musl.cc is a single-host mirror that GH runners sometimes cannot reach
-          # (TCP connect times out); fall back to copies hosted on GitHub's CDN.
-          # A cached toolchain from a previous run skips the download loop.
-          TOOLCHAIN_BIN=""
-          if [ -x "$HOME/musl-cross/bin/aarch64-linux-musl-gcc" ]; then
-            echo "Using cached musl toolchain"
-            TOOLCHAIN_BIN="$HOME/musl-cross/bin"
-          else
-            for URL in \
-              "https://musl.cc/aarch64-linux-musl-cross.tgz" \
-              "https://github.com/libviprs/libviprs-dep/releases/download/musl-cross-mirror/aarch64-linux-musl-cross.tgz" \
-              "https://github.com/arceos-org/setup-musl/releases/download/prebuilt/aarch64-linux-musl-cross.tgz"; do
-              if curl -fL --retry 6 --retry-delay 10 --retry-all-errors --connect-timeout 30 \
-                  -o "$RUNNER_TEMP/musl.tgz" "$URL"; then
-                tar xzf "$RUNNER_TEMP/musl.tgz" -C "$RUNNER_TEMP"
-                TOOLCHAIN_GCC="$(find "$RUNNER_TEMP" -maxdepth 3 -type f -name aarch64-linux-musl-gcc | head -1)"
-                if [ -n "$TOOLCHAIN_GCC" ]; then
-                  TOOLCHAIN_BIN="$(dirname "$TOOLCHAIN_GCC")"
-                  break
-                fi
-                rm -rf "$RUNNER_TEMP/musl.tgz" "$RUNNER_TEMP/aarch64-linux-musl*"
-              fi
-            done
-            if [ -z "$TOOLCHAIN_BIN" ]; then
-              echo "ERROR: could not download any aarch64 musl toolchain" >&2
-              exit 1
-            fi
-            rm -rf "$HOME/musl-cross"
-            cp -r "$(dirname "$TOOLCHAIN_BIN")" "$HOME/musl-cross"
-          fi
-          export PATH="$TOOLCHAIN_BIN:$PATH"
-          export CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc
-          export AR_aarch64_unknown_linux_musl=aarch64-linux-musl-ar
 
           rustc --version && cargo --version
           aarch64-linux-musl-gcc --version | head -1
