@@ -88,8 +88,8 @@ class MainActivity : AppCompatActivity() {
                             .progress-track { margin: 20px 0 8px; height: 12px; background-color: #e0e0e0; border-radius: 6px; overflow: hidden; display: none; }
                             .progress-fill { height: 100%; width: 0; background-color: #3498db; border-radius: 6px; transition: width 0.2s ease; }
                             .stage { margin: 4px 0; font-size: 14px; color: #555; display: none; }
-                            .detail { margin: 4px 0 8px; font-size: 12px; color: #999; display: none; }
-                            .error { margin: 12px 0; padding: 10px; border-radius: 6px; background-color: #fdecea; color: #c0392b; font-size: 14px; display: none; }
+                            .detail { margin: 4px 0 8px; font-size: 12px; color: #999; display: none; word-break: break-all; text-align: left; background: #fafafa; padding: 6px; border-radius: 4px; max-height: 100px; overflow-y: auto; }
+                            .error { margin: 12px 0; padding: 10px; border-radius: 6px; background-color: #fdecea; color: #c0392b; font-size: 14px; display: none; word-break: break-all; text-align: left; }
                             .options { margin-top: 12px; font-size: 13px; color: #666; text-align: left; }
                         </style>
                         <script>
@@ -130,6 +130,7 @@ class MainActivity : AppCompatActivity() {
                                     }
                                 }
                                 renderInstall();
+                                setTimeout(pollInstall, 300);
                             }
 
                             function renderInstall() {
@@ -201,6 +202,11 @@ class MainActivity : AppCompatActivity() {
                             function install() {
                                 if (window.NativeHost) {
                                     document.getElementById('install-btn').disabled = true;
+                                    document.getElementById('connecting').style.display = 'block';
+                                    document.getElementById('spinner').style.display = 'block';
+                                    document.getElementById('progress-track').style.display = 'block';
+                                    document.getElementById('stage-text').style.display = 'block';
+                                    document.getElementById('stage-text').innerText = 'Starting installation…';
                                     window.NativeHost.installNow();
                                 }
                             }
