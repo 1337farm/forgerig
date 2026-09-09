@@ -96,37 +96,9 @@ class MainActivity : AppCompatActivity() {
                             @keyframes pulse { 50% { opacity: 0.25; } }
                             .detail { margin: 4px 0 8px; font-size: 12px; color: #999; display: none; word-break: break-all; text-align: left; background: #fafafa; padding: 6px; border-radius: 4px; max-height: 100px; overflow-y: auto; }
                             .error { margin: 12px 0; padding: 10px; border-radius: 6px; background-color: #fdecea; color: #c0392b; font-size: 14px; display: none; word-break: break-all; text-align: left; }
-                            .options { margin-top: 12px; font-size: 13px; color: #666; text-align: left; }
                         </style>
                         <script>
                             var installState = null;
-
-                            function storeEnabled() {
-                                try {
-                                    window.localStorage.setItem('verbose', '0');
-                                    window.localStorage.removeItem('verbose');
-                                    return true;
-                                } catch (e) {
-                                    return false;
-                                }
-                            }
-                            var canStore = storeEnabled();
-                            var verboseFallback = false;
-
-                            function getVerbose() {
-                                if (canStore) {
-                                    return window.localStorage.getItem('verbose') === '1';
-                                }
-                                return verboseFallback;
-                            }
-
-                            function setVerbose(v) {
-                                if (canStore) {
-                                    window.localStorage.setItem('verbose', v ? '1' : '0');
-                                } else {
-                                    verboseFallback = v;
-                                }
-                            }
 
                             var reloading = false;
                             var FALLBACK_LABELS = ['Prepare runtime', 'Unpack container files', 'Finalize environment', 'Start container service', 'Connect to daemon'];
@@ -190,13 +162,11 @@ class MainActivity : AppCompatActivity() {
                                 var installBtn = document.getElementById('install-btn');
                                 var retryBtn = document.getElementById('retry-btn');
                                 var copyBtn = document.getElementById('copy-btn');
-                                var options = document.getElementById('options-row');
 
                                 if (phase === 'installing') {
                                     installBtn.style.display = 'none';
                                     retryBtn.style.display = 'none';
                                     copyBtn.style.display = 'none';
-                                    options.style.display = 'none';
                                     err.style.display = 'none';
                                     var total = stepsTotal();
                                     var cur = Math.max(0, installState.step);
@@ -207,12 +177,10 @@ class MainActivity : AppCompatActivity() {
                                     var extracting = cur <= 2;
                                     track.style.display = extracting ? 'block' : 'none';
                                     if (extracting) { bar.style.width = installState.percent + '%'; }
-                                    var showDetail = getVerbose() || cur >= 3;
-                                    detail.style.display = (showDetail && installState.detail) ? 'block' : 'none';
+                                    detail.style.display = installState.detail ? 'block' : 'none';
                                     detail.innerText = installState.detail;
                                 } else if (phase === 'ready') {
                                     installBtn.style.display = 'none';
-                                    options.style.display = 'none';
                                     copyBtn.style.display = 'none';
                                     err.style.display = 'none';
                                     track.style.display = 'none';
@@ -235,29 +203,26 @@ class MainActivity : AppCompatActivity() {
                                     installBtn.disabled = false;
                                     installBtn.innerText = 'Retry Install';
                                     copyBtn.style.display = 'inline-block';
-                                    options.style.display = 'block';
                                     var logPath = document.getElementById('log-path');
                                     logPath.style.display = 'block';
-                                    logPath.innerText = 'Full log: Downloads/' + (installState.logFile || 'forgerig-install.log');
+                                    logPath.innerText = 'Full log: Downloads/' + (installState.logFile || 'forgerig-install-*.log');
                                     track.style.display = 'none';
                                     renderSteps(true);
                                     steps.style.display = 'block';
                                     count.style.display = 'block';
                                     count.innerText = 'Failed at step ' + (installState.step + 1) + ' of ' + stepsTotal();
-                                    detail.style.display = 'none';
+                                    detail.style.display = installState.detail ? 'block' : 'none';
+                                    detail.innerText = installState.detail || '';
                                     err.style.display = 'block';
-                                    if (getVerbose() && installState.errorDetail) {
-                                        err.innerText = installState.error + '\n\n' + installState.errorDetail;
-                                    } else {
-                                        err.innerText = installState.error;
-                                    }
+                                    err.innerText = installState.errorDetail ?
+                                        installState.error + '\n\n' + installState.errorDetail :
+                                        installState.error;
                                 } else {
                                     installBtn.style.display = 'inline-block';
                                     installBtn.disabled = false;
                                     installBtn.innerText = 'Install Environment';
                                     retryBtn.style.display = 'none';
                                     copyBtn.style.display = 'none';
-                                    options.style.display = 'block';
                                     track.style.display = 'none';
                                     count.style.display = 'none';
                                     steps.style.display = 'none';
@@ -310,7 +275,6 @@ class MainActivity : AppCompatActivity() {
                             }
 
                             window.onload = function() {
-                                document.getElementById('verbose').checked = getVerbose();
                                 pollInstall();
                             };
                         </script>
@@ -327,9 +291,6 @@ class MainActivity : AppCompatActivity() {
                             <button id="install-btn" class="btn" style="display:none;" onclick="install()">Install Environment</button>
                             <br><button id="retry-btn" class="btn" style="display:none;" onclick="window.location.reload()">Retry Connection</button>
                             <br><button id="copy-btn" class="btn" style="background-color: #7f8c8d; margin-top: 8px; font-size: 14px; padding: 10px 20px; display: none;" onclick="copyLogs()">Copy Logs</button>
-                            <div class="options" id="options-row">
-                                <label><input type="checkbox" id="verbose" onchange="onVerboseChanged()"> Show detailed progress</label>
-                            </div>
                         </div>
                     </body>
                     </html>
@@ -439,9 +400,11 @@ class MainActivity : AppCompatActivity() {
             stage = "Starting container service…"
             detail = ""
             thread {
+                AssetExtractor.logShared(context, "Starting container service (build=${AssetExtractor.buildId()})")
                 try {
                     startContainerInternal()
                 } catch (e: Exception) {
+                    AssetExtractor.logShared(context, "ERROR: Could not start container service | $e")
                     phase = "failed"
                     error = "Could not start container service"
                     errorDetail = e.toString()
@@ -465,18 +428,22 @@ class MainActivity : AppCompatActivity() {
                         val code = conn.responseCode
                         conn.disconnect()
                         if (code in 200..499) {
+                            AssetExtractor.logShared(context, "Daemon responded with HTTP $code on attempt $attempt")
                             ready = true
                             break
                         }
+                        AssetExtractor.logShared(context, "Probe attempt $attempt/$maxAttempts: HTTP $code")
                     } catch (e: Exception) {
-                        // Daemon not up yet; keep probing.
+                        AssetExtractor.logShared(context, "Probe attempt $attempt/$maxAttempts failed: ${e.message}")
                     }
                     Thread.sleep(2000)
                 }
                 if (ready) {
+                    AssetExtractor.logShared(context, "DONE: Container ready, opening workspace")
                     percent = 100
                     phase = "ready"
                 } else if (phase == "installing") {
+                    AssetExtractor.logShared(context, "ERROR: Container did not respond in 60s after $maxAttempts attempts")
                     phase = "failed"
                     error = "Container did not respond in 60s"
                     errorDetail = "Timed out after $maxAttempts attempts probing " +
