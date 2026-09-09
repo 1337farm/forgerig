@@ -156,6 +156,19 @@ class ContainerService : Service() {
             return
         }
 
+        AssetExtractor.logShared(this, "Pre-launch: ${AssetExtractor.describeFile(prootBin)}")
+        AssetExtractor.logShared(this, "Pre-launch: ${AssetExtractor.describeFile(loaderBin)}")
+        val execProblem = AssetExtractor.ensureExecutable(prootBin)
+            ?: AssetExtractor.ensureExecutable(loaderBin)
+        if (execProblem != null) {
+            val message = "Container binary is $execProblem"
+            AssetExtractor.logShared(this, "ERROR: $message")
+            writeStatus("exec-denied:$execProblem")
+            notifyMessage("ForgeRig", "Container cannot start: permission denied. See Downloads log.", 2)
+            stopSelf()
+            return
+        }
+
         writeStatus("running")
         updateNotification("Container starting…")
         thread {

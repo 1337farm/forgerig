@@ -420,7 +420,7 @@ class MainActivity : AppCompatActivity() {
                     try {
                         if (statusFile.exists()) {
                             val status = statusFile.readText().trim()
-                            if (status.startsWith("exit:") || status.startsWith("missing:")) {
+                            if (status.startsWith("exit:") || status.startsWith("missing:") || status.startsWith("exec-denied:")) {
                                 AssetExtractor.logShared(context, "ERROR: Container status: $status")
                                 phase = "failed"
                                 error = "Container exited early"
