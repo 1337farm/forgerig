@@ -20,6 +20,7 @@ import kotlin.concurrent.thread
 
 interface InstallProgress {
     fun onProgress(percent: Int, stage: String, detail: String)
+    fun onStep(step: Int)
     fun onError(message: String, detail: String)
     fun onDone()
 }
@@ -53,6 +54,7 @@ class AssetExtractor(private val context: Context) {
 
     private var progress: InstallProgress = object : InstallProgress {
         override fun onProgress(percent: Int, stage: String, detail: String) {}
+        override fun onStep(step: Int) {}
         override fun onError(message: String, detail: String) {}
         override fun onDone() {}
     }
@@ -174,6 +176,7 @@ class AssetExtractor(private val context: Context) {
                     targetDir.mkdirs()
                 }
 
+                progress.onStep(0)
                 progress.onProgress(2, "Preparing runtime…", "Copying proot")
                 log("PROGRESS [2%] Preparing runtime… - Copying proot")
                 val prootFile = File(targetDir, "proot")
@@ -211,6 +214,7 @@ class AssetExtractor(private val context: Context) {
                     throw IOException("Bundled proot loader is empty or not an ELF binary")
                 }
 
+                progress.onStep(1)
                 progress.onProgress(8, "Unpacking container files…", "Reading archive")
                 log("PROGRESS [8%] Unpacking container files… - Reading archive")
                 val counted = countEntries()
@@ -266,6 +270,7 @@ class AssetExtractor(private val context: Context) {
                     }
                 }
 
+                progress.onStep(2)
                 progress.onProgress(100, "Environment ready", "")
                 log("DONE: Environment ready ($done files)")
                 progress.onDone()
