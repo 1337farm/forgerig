@@ -389,10 +389,14 @@ class MainActivity : AppCompatActivity() {
         try {
             val rootFsDir = File(filesDir, "ubuntu_rootfs")
             val rootHomeDir = File(rootFsDir, "root")
-            if (!rootHomeDir.exists()) {
-                rootHomeDir.mkdirs()
+            val homeDir = File(rootFsDir, "home")
+            val containerHome = File(homeDir, "forgerig")
+            val targetHome = if (containerHome.exists()) containerHome else if (rootHomeDir.exists()) rootHomeDir else rootFsDir
+            
+            if (!targetHome.exists()) {
+                targetHome.mkdirs()
             }
-            val gitConfigFile = File(rootHomeDir, ".gitconfig")
+            val gitConfigFile = File(targetHome, ".gitconfig")
 
             val gitConfigContent = """
                 [url "https://$token@github.com/"]
