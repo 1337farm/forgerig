@@ -138,6 +138,10 @@ class ContainerService : Service() {
     }
 
     private fun startContainerProcess() {
+        // Mark the current run first: MainActivity deletes the stale file
+        // before starting us, but the probe may read in between, so claim it
+        // here too. Only exit:/missing:/exec-denied: fail the probe.
+        writeStatus("starting")
         val rootFsDir = File(filesDir, "ubuntu_rootfs")
         val prootBin = AssetExtractor.resolveProotFile(this)
         val loaderBin = AssetExtractor.resolveLoaderFile(this)

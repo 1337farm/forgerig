@@ -90,7 +90,7 @@ class AssetExtractor(private val context: Context) {
                     } catch (e: Exception) {
                         null
                     }
-                    detail += " interp=$interp exists=${hostInterp.exists()} link->${linkTarget ?: "-"}"
+                    detail += " interp=$interp link->${linkTarget ?: "<not a symlink>"}"
                 }
                 detail
             } catch (e: Exception) {

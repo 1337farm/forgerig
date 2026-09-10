@@ -402,6 +402,13 @@ class MainActivity : AppCompatActivity() {
             thread {
                 AssetExtractor.logShared(context, "Starting container service (build=${AssetExtractor.buildId()})")
                 try {
+                    // Drop the previous run's verdict first: the probe fails fast
+                    // on exit:/missing:/exec-denied:, and without this reset it
+                    // would read the stale file before the service overwrites it.
+                    val stale = File(context.filesDir, "ubuntu_rootfs/.forgerig-status")
+                    if (stale.exists() && !stale.delete()) {
+                        AssetExtractor.logShared(context, "WARNING: could not delete stale status file")
+                    }
                     startContainerInternal()
                 } catch (e: Exception) {
                     AssetExtractor.logShared(context, "ERROR: Could not start container service | $e")
