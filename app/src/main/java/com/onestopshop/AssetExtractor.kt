@@ -72,6 +72,32 @@ class AssetExtractor(private val context: Context) {
             return "$libs:$deps"
         }
 
+        // One-line diagnosis of the container entrypoint: shebang plus whether
+        // the guest interpreter resolves (following one symlink level). Logged
+        // before every launch; an unresolvable interpreter means proot will die
+        // with ENOEXEC on /root/start.sh.
+        fun describeEntrypoint(rootFsDir: File): String {
+            return try {
+                val start = File(rootFsDir, "root/start.sh")
+                if (!start.exists()) return "root/start.sh missing"
+                val first = start.bufferedReader().readLine() ?: "<empty>"
+                var detail = "shebang=[$first] size=${start.length()}"
+                if (first.startsWith("#!")) {
+                    val interp = first.substring(2).trim().split("\\s+".toRegex())[0]
+                    val hostInterp = File(rootFsDir, interp.trimStart('/'))
+                    val linkTarget = try {
+                        android.system.Os.readlink(hostInterp.absolutePath)
+                    } catch (e: Exception) {
+                        null
+                    }
+                    detail += " interp=$interp exists=${hostInterp.exists()} link->${linkTarget ?: "-"}"
+                }
+                detail
+            } catch (e: Exception) {
+                "entrypoint inspect failed: ${e.message}"
+            }
+        }
+
         fun deviceInfo(): String {
             return "Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})"
         }
@@ -266,6 +292,7 @@ class AssetExtractor(private val context: Context) {
                 log("PROGRESS [8%] Unpacking container files… - Starting extraction")
 
                 var done = 0
+                var symlinks = 0
                 openRootfs().use { rootfs ->
                     // Single pass: byte-based progress from the compressed size,
                     // so the archive is gunzipped/parsed exactly once.
@@ -298,6 +325,21 @@ class AssetExtractor(private val context: Context) {
 
                             if (entry.isDirectory) {
                                 outputFile.mkdirs()
+                            } else if (entry.isSymbolicLink) {
+                                // Recreate symlinks verbatim; guest-absolute and
+                                // relative targets resolve inside the proot guest
+                                // at runtime. Writing them as regular files (the
+                                // old behavior) leaves empty files behind, so the
+                                // script interpreter (/bin/sh -> /bin/busybox)
+                                // cannot run and proot dies with ENOEXEC.
+                                outputFile.parentFile?.mkdirs()
+                                outputFile.delete()
+                                try {
+                                    android.system.Os.symlink(entry.linkName, outputFile.absolutePath)
+                                    symlinks++
+                                } catch (e: Exception) {
+                                    throw IOException("Cannot create symlink ${entry.name} -> ${entry.linkName}: $e")
+                                }
                             } else {
                                 outputFile.parentFile?.mkdirs()
                                 FileOutputStream(outputFile).use { output ->
@@ -330,7 +372,7 @@ class AssetExtractor(private val context: Context) {
 
                 progress.onStep(2)
                 progress.onProgress(100, "Environment ready", "")
-                log("DONE: Environment ready ($done files)")
+                log("DONE: Environment ready ($done files, $symlinks symlinks)")
                 progress.onDone()
             } catch (e: Exception) {
                 Log.e(TAG, "Installation failed", e)
