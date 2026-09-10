@@ -141,11 +141,13 @@ class ContainerService : Service() {
         val rootFsDir = File(filesDir, "ubuntu_rootfs")
         val prootBin = AssetExtractor.resolveProotFile(this)
         val loaderBin = AssetExtractor.resolveLoaderFile(this)
+        val tallocBin = AssetExtractor.resolveTallocFile(this)
         val entrypoint = File(rootFsDir, "root/start.sh")
 
         val missing = mutableListOf<String>()
         if (!prootBin.exists()) missing.add("libproot.so (native lib)")
         if (!loaderBin.exists()) missing.add("libproot_loader.so (native lib)")
+        if (!tallocBin.exists()) missing.add("libtalloc.so.2 (asset dep)")
         if (!entrypoint.exists()) missing.add("root/start.sh")
         if (missing.isNotEmpty()) {
             val message = "Container files missing: ${missing.joinToString(", ")}. Please run install first."
@@ -187,10 +189,16 @@ class ContainerService : Service() {
                 // which does not exist on devices without Termux installed.
                 pb.environment()["PORT"] = MainActivity.allocatedPort.toString()
                 pb.environment()["PROOT_LOADER"] = loaderBin.absolutePath
+                // proot is dynamically linked against libtalloc.so.2 +
+                // libandroid-shmem.so (shipped in the same native lib dir) and
+                // its RUNPATH points at /data/data/com.termux/... which the app
+                // UID cannot read. LD_LIBRARY_PATH steers the linker to our own
+                // lib dir so those bundled DT_NEEDED deps resolve.
+                pb.environment()["LD_LIBRARY_PATH"] = AssetExtractor.loaderSearchPath(this)
                 pb.redirectErrorStream(true)
                 pb.directory(rootFsDir)
 
-                AssetExtractor.logShared(this, "Launching proot (loader=${loaderBin.absolutePath}, port=${MainActivity.allocatedPort})")
+                AssetExtractor.logShared(this, "Launching proot (loader=${loaderBin.absolutePath}, port=${MainActivity.allocatedPort}, ld=${AssetExtractor.loaderSearchPath(this)})")
                 val process = pb.start()
                 containerProcess = process
                 updateNotification("Container running")

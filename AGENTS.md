@@ -23,7 +23,9 @@ A branch cut from an old `main` will be CONFLICTING by the time you push.
   `export HOME="/data/data/com.termux/files/home" && bash scripts/prepare-assets.sh`
   then `./gradlew assembleDebug` (fails loudly via `checkContainerAssets`
   if `app/src/main/assets/ubuntu-rootfs.bin` or
-  `app/src/main/jniLibs/arm64-v8a/libproot{,_loader}.so` are missing).
+  `app/src/main/jniLibs/arm64-v8a/libproot{,_loader}.so` or its DT_NEEDED
+  libs (`app/src/main/assets/libtalloc.so.2`,
+  `app/src/main/jniLibs/arm64-v8a/libandroid-shmem.so`) are missing).
 
 ## Asset pipeline gotchas (must-know)
 - `scripts/prepare-assets.sh` emits `ubuntu-rootfs.bin` (gzipped tar with a
@@ -36,6 +38,14 @@ A branch cut from an old `main` will be CONFLICTING by the time you push.
   native libs run everywhere. Manifest pins `extractNativeLibs="true"`.
   `AssetExtractor.resolveProotFile/resolveLoaderFile` are the single source
   of truth for their runtime paths.
+- Termux-built proot is dynamically linked (`DT_NEEDED libtalloc.so.2`,
+  `libandroid-shmem.so`) with RUNPATH `/data/data/com.termux/...`. That dir is
+  unreadable to the app UID, so `prepare-assets.sh` ships `libandroid-shmem.so`
+  as a jniLib. `libtalloc.so.2` has no `.so` extension — AGP drops non-`.so`
+  names from merged jniLibs — so it ships as `assets/libtalloc.so.2` and
+  `AssetExtractor` extracts it to `filesDir/native_deps/`. `ContainerService`
+  sets `LD_LIBRARY_PATH=nativeLibraryDir:filesDir/native_deps` before exec.
+  Both must ride along with any proot upgrade.
 - `AssetExtractor` opens `ubuntu-rootfs.bin` first, then falls back to
   `.tar.gz` / plain `.tar` for older APKs. Keep all three in sync across
   `prepare-assets.sh`, `checkContainerAssets` (app/build.gradle.kts),

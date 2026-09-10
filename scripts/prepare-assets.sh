@@ -50,23 +50,53 @@ else
 fi
 [ -x "$DAEMON_BIN" ] || { echo "ERROR: daemon binary missing: $DAEMON_BIN" >&2; exit 1; }
 
-# --- 2. Fetch proot (Termux aarch64 package) ---------------------------------
+# --- 2. Fetch proot + runtime deps (Termux aarch64 packages) ----------------
+# proot is dynamically linked against libtalloc.so.2 and libandroid-shmem.so
+# (DT_NEEDED), and its RUNPATH points at /data/data/com.termux/... which the
+# app UID cannot read. We therefore ship the two .so alongside proot and have
+# the launcher point LD_LIBRARY_PATH at the app's native lib dir. Keep every
+# DT_NEEDED soname present exactly under that name.
+fetch_termux_deb() {
+  local OUT="$1" POOL="$2" NAME_PATTERN="$3"
+  local DEB
+  DEB="$(curl -fsSL "$POOL" | grep -o "$NAME_PATTERN" | sort -V | tail -1)"
+  [ -n "$DEB" ] || { echo "ERROR: could not find a matching .deb in $POOL" >&2; return 1; }
+  echo ">> Fetching $POOL$DEB"
+  curl -fsSL -o "$OUT" "$POOL$DEB"
+}
+
 mkdir -p "$WORK/proot/deb"
 if [ -n "${FORGERIG_PROOT_DEB_URL:-}" ]; then
-  DEB_URL="$FORGERIG_PROOT_DEB_URL"
+  echo ">> Fetching proot from $FORGERIG_PROOT_DEB_URL"
+  curl -fsSL -o "$WORK/proot.deb" "$FORGERIG_PROOT_DEB_URL"
 else
-  POOL="https://packages.termux.dev/apt/termux-main/pool/main/p/proot/"
-  DEB="$(curl -fsSL "$POOL" | grep -o 'proot_[0-9][^"]*_aarch64\.deb' | sort -V | tail -1)"
-  [ -n "$DEB" ] || { echo "ERROR: could not find a proot aarch64 .deb in $POOL" >&2; exit 1; }
-  DEB_URL="$POOL$DEB"
+  fetch_termux_deb "$WORK/proot.deb" \
+    "https://packages.termux.dev/apt/termux-main/pool/main/p/proot/" \
+    'proot_[0-9][^"]*_aarch64\.deb'
 fi
-echo ">> Fetching proot from $DEB_URL"
-curl -fsSL -o "$WORK/proot.deb" "$DEB_URL"
 ( cd "$WORK/proot/deb" && ar x "$WORK/proot.deb" data.tar.xz && tar xf data.tar.xz )
 PROOT_BIN="$(find "$WORK/proot/deb" -path '*usr/bin/proot' | head -1)"
 PROOT_LOADER="$(find "$WORK/proot/deb" -path '*libexec/proot/loader' | head -1)"
 [ -n "$PROOT_BIN" ] && [ -n "$PROOT_LOADER" ] \
   || { echo "ERROR: proot binary or loader missing from .deb" >&2; exit 1; }
+
+mkdir -p "$WORK/talloc/deb"
+fetch_termux_deb "$WORK/talloc.deb" \
+  "https://packages.termux.dev/apt/termux-main/pool/main/libt/libtalloc/" \
+  'libtalloc_[0-9][^"]*_aarch64\.deb'
+( cd "$WORK/talloc/deb" && ar x "$WORK/talloc.deb" data.tar.xz && tar xf data.tar.xz )
+LIBTALLOC="$(find "$WORK/talloc/deb" -name 'libtalloc.so.2.*' | head -1)"
+[ -n "$LIBTALLOC" ] \
+  || { echo "ERROR: libtalloc.so.2.* missing from .deb" >&2; exit 1; }
+
+mkdir -p "$WORK/shmem/deb"
+fetch_termux_deb "$WORK/shmem.deb" \
+  "https://packages.termux.dev/apt/termux-main/pool/main/liba/libandroid-shmem/" \
+  'libandroid-shmem_[0-9][^"]*_aarch64\.deb'
+( cd "$WORK/shmem/deb" && ar x "$WORK/shmem.deb" data.tar.xz && tar xf data.tar.xz )
+LIBSHMEM="$(find "$WORK/shmem/deb" -name 'libandroid-shmem.so*' | head -1)"
+[ -n "$LIBSHMEM" ] \
+  || { echo "ERROR: libandroid-shmem.so missing from .deb" >&2; exit 1; }
 
 # --- 3. Fetch a real aarch64 rootfs (Alpine minirootfs) ----------------------
 if [ -n "${FORGERIG_ALPINE_URL:-}" ]; then
@@ -101,19 +131,27 @@ SH
 chmod 755 "$ROOTFS_STAGING/root/start.sh"
 
 # --- 5. Emit the assets ------------------------------------------------------
-# NOTE: proot + loader ship as native libs (lib/*.so), NOT as assets.
-# The package manager extracts jniLibs with the executable bit on a
-# system-blessed path; some devices refuse execve() on files the app
-# chmods itself under filesDir (error=13), which no chmod fallback can fix.
+# NOTE: proot + loader + libandroid-shmem ship as native libs (lib/*.so), NOT
+# as assets. The package manager extracts jniLibs with the executable bit on a
+# system-blessed path; some devices refuse execve() on files the app chmods
+# itself under filesDir (error=13), which no chmod fallback can fix.
+# libtalloc.so.2 has no `.so` extension, so AGP silently drops it from
+# jniLibs; it ships as a plain asset and is extracted at install time.
 JNILIBS="$ROOT/app/src/main/jniLibs/arm64-v8a"
 mkdir -p "$ASSETS" "$JNILIBS"
 echo ">> Writing $ASSETS/ubuntu-rootfs.bin (gzipped tar, .bin extension avoids AGP gunzipping)"
 tar czf "$ASSETS/ubuntu-rootfs.bin" -C "$ROOTFS_STAGING" .
 rm -f "$ASSETS/ubuntu-rootfs.tar.gz" "$ASSETS/proot" "$ASSETS/proot-loader"
-echo ">> Writing $JNILIBS/libproot.so and libproot_loader.so"
+echo ">> Writing $JNILIBS/libproot.so, libproot_loader.so, libandroid-shmem.so + $ASSETS/libtalloc.so.2"
 cp "$PROOT_BIN" "$JNILIBS/libproot.so"
 cp "$PROOT_LOADER" "$JNILIBS/libproot_loader.so"
-chmod 755 "$JNILIBS/libproot.so" "$JNILIBS/libproot_loader.so"
+cp "$LIBSHMEM" "$JNILIBS/libandroid-shmem.so"
+cp "$LIBTALLOC" "$ASSETS/libtalloc.so.2"
+chmod 755 "$JNILIBS"/libproot.so "$JNILIBS"/libproot_loader.so \
+  "$JNILIBS"/libandroid-shmem.so "$ASSETS"/libtalloc.so.2
+[ "$(readelf -d "$JNILIBS/libproot.so" | grep -c 'NEEDED.*libtalloc.so.2\|NEEDED.*libandroid-shmem.so')" -eq 2 ] \
+  || echo "WARNING: expected proot to need libtalloc.so.2 + libandroid-shmem.so" >&2
 
 echo ">> Done. Assets:"
-ls -l "$ASSETS/ubuntu-rootfs.bin" "$JNILIBS/libproot.so" "$JNILIBS/libproot_loader.so"
+ls -l "$ASSETS/ubuntu-rootfs.bin" "$ASSETS/libtalloc.so.2" \
+  "$JNILIBS"/libproot.so "$JNILIBS"/libproot_loader.so "$JNILIBS"/libandroid-shmem.so
