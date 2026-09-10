@@ -35,7 +35,9 @@ A branch cut from an old `main` will be CONFLICTING by the time you push.
 - proot + loader ship as `app/src/main/jniLibs/arm64-v8a/libproot{,_loader}.so`
   (NOT assets): some devices refuse execve() on app-chmodded filesDir payloads
   (error=13) with the +x bit correctly set — only PackageManager-extracted
-  native libs run everywhere. Manifest pins `extractNativeLibs="true"`.
+  native libs run everywhere. `packaging { jniLibs { useLegacyPackaging = true } }`
+  in app/build.gradle.kts pins extraction at install (the manifest attribute
+  is deprecated).
   `AssetExtractor.resolveProotFile/resolveLoaderFile` are the single source
   of truth for their runtime paths.
 - Termux-built proot is dynamically linked (`DT_NEEDED libtalloc.so.2`,

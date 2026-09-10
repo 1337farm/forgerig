@@ -1,7 +1,6 @@
 use tokio_rusqlite::Connection;
 use std::sync::Arc;
 use serde_json::Value;
-use tokio::process::Command;
 
 #[derive(Clone)]
 pub struct MemoryEngine {

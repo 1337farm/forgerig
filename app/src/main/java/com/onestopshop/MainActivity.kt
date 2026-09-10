@@ -363,20 +363,20 @@ class MainActivity : AppCompatActivity() {
 
             AssetExtractor(context)
                 .setProgressListener(object : InstallProgress {
-                    override fun onProgress(p: Int, s: String, d: String) {
-                        percent = p
-                        stage = s
-                        detail = d
+                    override fun onProgress(percent: Int, stage: String, detail: String) {
+                        this@WebAppInterface.percent = percent
+                        this@WebAppInterface.stage = stage
+                        this@WebAppInterface.detail = detail
                     }
 
-                    override fun onStep(s: Int) {
-                        step = s
+                    override fun onStep(step: Int) {
+                        this@WebAppInterface.step = step
                     }
 
-                    override fun onError(message: String, detailText: String) {
+                    override fun onError(message: String, detail: String) {
                         phase = "failed"
                         error = message
-                        errorDetail = detailText
+                        errorDetail = detail
                     }
 
                     override fun onDone() {

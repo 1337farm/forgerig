@@ -50,7 +50,15 @@ class ContainerService : Service() {
             }
 
             val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "ForgeRig::ContainerWifiLock").apply {
+            // WIFI_MODE_FULL_HIGH_PERF is deprecated since API 33; LOW_LATENCY
+            // exists since API 29, so guard by runtime version.
+            val wifiMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+            } else {
+                @Suppress("DEPRECATION")
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            }
+            wifiLock = wifiManager.createWifiLock(wifiMode, "ForgeRig::ContainerWifiLock").apply {
                 acquire()
             }
         } catch (e: Exception) {
