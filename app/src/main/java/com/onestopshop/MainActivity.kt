@@ -274,6 +274,10 @@ class MainActivity : AppCompatActivity() {
                                 }
                             }
 
+                            function openSettings() {
+                                if (window.NativeHost) { try { window.NativeHost.openSettings(); } catch (e) {} }
+                            }
+
                             window.onload = function() {
                                 pollInstall();
                             };
@@ -291,6 +295,7 @@ class MainActivity : AppCompatActivity() {
                             <button id="install-btn" class="btn" style="display:none;" onclick="install()">Install Environment</button>
                             <br><button id="retry-btn" class="btn" style="display:none;" onclick="window.location.reload()">Retry Connection</button>
                             <br><button id="copy-btn" class="btn" style="background-color: #7f8c8d; margin-top: 8px; font-size: 14px; padding: 10px 20px; display: none;" onclick="copyLogs()">Copy Logs</button>
+                            <br><button id="settings-btn" class="btn" style="background-color: #555; margin-top: 8px; font-size: 14px; padding: 10px 20px;" onclick="openSettings()">⚙ Settings</button>
                         </div>
                     </body>
                     </html>
@@ -341,6 +346,15 @@ class MainActivity : AppCompatActivity() {
                 .put("stepsTotal", stepLabels.size)
                 .put("stepLabels", JSONArray(stepLabels))
                 .toString()
+        }
+
+        @JavascriptInterface
+        fun openSettings() {
+            try {
+                context.startActivity(Intent(context, SettingsActivity::class.java))
+            } catch (e: Exception) {
+                AssetExtractor.logShared(context, "ERROR: openSettings failed | $e")
+            }
         }
 
         @JavascriptInterface

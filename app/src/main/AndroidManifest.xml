@@ -35,6 +35,12 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:label="ForgeRig Settings"
+            android:theme="@style/Theme.AppCompat.Light.Dialog.Alert" />
+
         <service
             android:name=".ContainerService"
             android:enabled="true"
