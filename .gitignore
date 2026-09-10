@@ -11,3 +11,5 @@ app/src/main/assets/ubuntu-rootfs.bin
 app/src/main/assets/ubuntu-rootfs.tar.gz
 app/src/main/jniLibs/arm64-v8a/libproot.so
 app/src/main/jniLibs/arm64-v8a/libproot_loader.so
+app/src/main/jniLibs/arm64-v8a/libandroid-shmem.so
+app/src/main/assets/libtalloc.so.2

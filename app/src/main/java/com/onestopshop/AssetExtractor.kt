@@ -57,6 +57,21 @@ class AssetExtractor(private val context: Context) {
         fun resolveLoaderFile(context: Context): File =
             File(context.applicationInfo.nativeLibraryDir, "libproot_loader.so")
 
+        // libtalloc.so.2 is a proot DT_NEEDED dep. AGP only merges jniLibs
+        // files ending in `.so` (it silently drops `libtalloc.so.2`), so it
+        // ships as an asset and is extracted here. Keep in sync with
+        // prepare-assets.sh, checkContainerAssets, and .gitignore.
+        const val TALLOC_ASSET = "libtalloc.so.2"
+
+        fun resolveTallocFile(context: Context): File =
+            File(context.filesDir, "native_deps/libtalloc.so.2")
+
+        fun loaderSearchPath(context: Context): String {
+            val libs = context.applicationInfo.nativeLibraryDir
+            val deps = File(context.filesDir, "native_deps").absolutePath
+            return "$libs:$deps"
+        }
+
         fun deviceInfo(): String {
             return "Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})"
         }
@@ -230,6 +245,21 @@ class AssetExtractor(private val context: Context) {
                     throw IOException("proot loader native library is $it")
                 }
                 log("Proot verified (${prootFile.absolutePath}, ${prootFile.length()} bytes, executable)")
+
+                // proot links against libtalloc.so.2 at runtime; ship it out of
+                // assets into a filesDir dir the app UID can read (the DT_NEEDED
+                // RUNPATH points at /data/data/com.termux/... which is not).
+                val tallocFile = resolveTallocFile(context)
+                if (!tallocFile.exists() || tallocFile.length() == 0L) {
+                    tallocFile.parentFile?.mkdirs()
+                    context.assets.open(TALLOC_ASSET).use { input ->
+                        tallocFile.outputStream().use { it.write(input.readBytes()) }
+                    }
+                    tallocFile.setReadable(true, false)
+                    log("Extracted ${TALLOC_ASSET} to ${tallocFile.absolutePath} (${tallocFile.length()} bytes)")
+                } else {
+                    log("${TALLOC_ASSET} already present at ${tallocFile.absolutePath} (${tallocFile.length()} bytes)")
+                }
 
                 progress.onStep(1)
                 progress.onProgress(8, "Unpacking container files…", "Starting extraction")
