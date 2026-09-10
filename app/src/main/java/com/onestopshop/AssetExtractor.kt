@@ -327,17 +327,27 @@ class AssetExtractor(private val context: Context) {
                     }
                     tarStream.use {
                         var entry = tarStream.nextTarEntry
-                        val canonicalTarget = targetDir.canonicalPath
                         while (entry != null) {
                             val outputFile = File(targetDir, entry.name)
-                            val outputPath = outputFile.canonicalPath
 
-                            if (outputPath != canonicalTarget &&
-                                !outputPath.startsWith(canonicalTarget + File.separator)) {
+                            // Lexical path-traversal guard. Do NOT use
+                            // canonicalPath: the Ubuntu rootfs ships symlinks
+                            // like /dev/stderr -> fd/2 and /dev/fd -> /proc/self/fd
+                            // that canonicalize onto the HOST /proc, which would
+                            // false-positive as an escape. normalize() collapses
+                            // "." / ".." without resolving symlinks.
+                            val norm = try {
+                                java.nio.file.Paths.get(entry.name).normalize()
+                            } catch (e: Exception) {
+                                throw SecurityException("Invalid path in archive: ${entry.name}")
+                            }
+                            if (norm.isAbsolute ||
+                                (norm.nameCount > 0 && norm.getName(0).toString() == "..")
+                            ) {
                                 throw SecurityException("Path traversal attack detected: ${entry.name}")
                             }
 
-                            if (outputPath == canonicalTarget) {
+                            if (norm.nameCount == 0) {
                                 targetDir.mkdirs()
                                 done++
                                 entry = tarStream.nextTarEntry

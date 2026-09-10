@@ -118,8 +118,8 @@ elif command -v debootstrap >/dev/null 2>&1 || (command -v sudo >/dev/null 2>&1 
   if command -v debootstrap >/dev/null 2>&1; then
     S update-binfmts --enable qemu-aarch64 2>/dev/null || true
     echo ">> debootstrap $UBU_CODENAME (arm64) from $UBU_MIRROR"
-    S debootstrap --arch=arm64 --variant=minbase \
-      --include="bash,ca-certificates,git,curl,python3" \
+    S debootstrap --arch=arm64 --variant=minbase --no-check-gpg \
+      --include="bash,ca-certificates,git,curl" \
       "$UBU_CODENAME" "$ROOTFS_STAGING" "$UBU_MIRROR"
   fi
 fi
