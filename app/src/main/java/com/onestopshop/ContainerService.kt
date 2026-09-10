@@ -187,6 +187,14 @@ class ContainerService : Service() {
                     "-w", "/root",
                     "/root/start.sh"
                 )
+                // Guest DNS: the minirootfs has no /etc/resolv.conf, so without
+                // this bind every guest lookup fails (the daemon's API calls
+                // die with DNS errors). Non-fatal if generation fails.
+                AssetExtractor.writeResolvConf(this)?.let { resolv ->
+                    val args = pb.command()
+                    args.add(args.size - 1, "-b")
+                    args.add(args.size - 1, "${resolv.absolutePath}:/etc/resolv.conf")
+                }
                 // The entrypoint launches forgerig-daemon which binds
                 // 127.0.0.1:$PORT; the WebView connects to that same port.
                 // PROOT_LOADER is mandatory: the Termux-built proot binary
