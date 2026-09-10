@@ -7,6 +7,7 @@ import android.os.Environment
 import android.provider.MediaStore
 import android.util.Log
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
+import java.io.BufferedInputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -239,9 +240,26 @@ class AssetExtractor(private val context: Context) {
         }
     }
 
+    private enum class Compression { NONE, GZIP, ZSTD }
+
+    private fun compressionOf(stream: InputStream): Pair<InputStream, Compression> {
+        val bis = if (stream is BufferedInputStream) stream else BufferedInputStream(stream)
+        bis.mark(4)
+        val magic = ByteArray(4)
+        val n = bis.read(magic)
+        bis.reset()
+        val comp = when {
+            n >= 4 && magic[0] == 0x28.toByte() && magic[1] == 0xB5.toByte() &&
+                magic[2] == 0x2F.toByte() && magic[3] == 0xFD.toByte() -> Compression.ZSTD
+            n >= 2 && magic[0] == 0x1F.toByte() && magic[1] == 0x8B.toByte() -> Compression.GZIP
+            else -> Compression.NONE
+        }
+        return bis to comp
+    }
+
     private data class RootfsStream(
         val stream: InputStream,
-        val gzipped: Boolean,
+        val compression: Compression,
         val assetName: String,
         val totalBytes: Long,
     ) : java.io.Closeable {
@@ -254,16 +272,16 @@ class AssetExtractor(private val context: Context) {
         try {
             val file = ContainerAssets.ensure(context, ROOTFS_ASSET, ContainerAssets.fetchManifest())
             log("Rootfs from container download: ${file.absolutePath} (${file.length()} bytes)")
-            return RootfsStream(FileInputStream(file), gzipped = true, assetName = file.absolutePath, totalBytes = file.length())
+            val (stream, comp) = compressionOf(FileInputStream(file))
+            return RootfsStream(stream, comp, file.absolutePath, file.length())
         } catch (e: Exception) {
             log("Container download unavailable (${e.message}); falling back to bundled rootfs")
         }
         var lastError: Exception? = null
         for (name in ROOTFS_CANDIDATES) {
             try {
-                val stream = context.assets.open(name)
-                val gzipped = name.endsWith(".gz") || name.endsWith(".bin")
-                return RootfsStream(stream, gzipped, name, assetLength(name))
+                val (stream, comp) = compressionOf(context.assets.open(name))
+                return RootfsStream(stream, comp, name, assetLength(name))
             } catch (e: IOException) {
                 lastError = e
             }
@@ -337,11 +355,12 @@ class AssetExtractor(private val context: Context) {
                     val totalBytes = rootfs.totalBytes
                     log("Rootfs: ${rootfs.assetName} (${if (totalBytes > 0) "$totalBytes bytes" else "size unknown"})")
                     val counting = CountingInputStream(rootfs.stream)
-                    val tarStream = if (rootfs.gzipped) {
-                        TarArchiveInputStream(GZIPInputStream(counting))
-                    } else {
-                        TarArchiveInputStream(counting)
+                    val decompressed: InputStream = when (rootfs.compression) {
+                        Compression.ZSTD -> org.apache.commons.compress.compressors.zstandard.ZstdCompressorInputStream(counting)
+                        Compression.GZIP -> GZIPInputStream(counting)
+                        Compression.NONE -> counting
                     }
+                    val tarStream = TarArchiveInputStream(decompressed)
                     tarStream.use {
                         var entry = tarStream.nextTarEntry
                         while (entry != null) {

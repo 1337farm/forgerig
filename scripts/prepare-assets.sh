@@ -2,7 +2,7 @@
 # Prepare the Android container assets that the app extracts at install time.
 #
 # Produces:
-#   app/src/main/assets/ubuntu-rootfs.bin   Ubuntu (glibc) aarch64 rootfs, gzipped tar
+#   app/src/main/assets/ubuntu-rootfs.bin   Ubuntu (glibc) aarch64 rootfs, zstd tar
 #   app/src/main/assets/libtalloc.so.2      proot DT_NEEDED dep (asset; name has no .so)
 #   app/src/main/jniLibs/arm64-v8a/         proot + loader + deps + the daemon
 #     libproot.so, libproot_loader.so, libandroid-shmem.so, libforgerig_daemon.so
@@ -113,8 +113,8 @@ elif command -v debootstrap >/dev/null 2>&1 || (command -v sudo >/dev/null 2>&1 
   UBU_CODENAME="${FORGERIG_UBUNTU_CODENAME:-noble}"
   UBU_MIRROR="${FORGERIG_UBUNTU_MIRROR:-http://ports.ubuntu.com/ubuntu-ports}"
   S apt-get update -y -qq || true
-  S apt-get install -y -qq debootstrap qemu-user-static ca-certificates \
-    || { echo "WARNING: could not install debootstrap/qemu-user-static; falling back to raw ubuntu-base" >&2; }
+  S apt-get install -y -qq debootstrap qemu-user-static ca-certificates zstd \
+    || { echo "WARNING: could not install debootstrap/qemu-user-static/zstd; falling back to raw ubuntu-base" >&2; }
   if command -v debootstrap >/dev/null 2>&1; then
     S update-binfmts --enable qemu-aarch64 2>/dev/null || true
     echo ">> debootstrap $UBU_CODENAME (arm64) from $UBU_MIRROR"
@@ -154,8 +154,14 @@ fi
 # jniLibs), so it ships as an asset extracted to filesDir/native_deps at install.
 JNILIBS="$ROOT/app/src/main/jniLibs/arm64-v8a"
 mkdir -p "$ASSETS" "$JNILIBS"
-echo ">> Writing $ASSETS/ubuntu-rootfs.bin (gzipped tar, .bin extension avoids AGP gunzipping)"
-tar czf "$ASSETS/ubuntu-rootfs.bin" -C "$ROOTFS_STAGING" .
+echo ">> Writing $ASSETS/ubuntu-rootfs.bin (zstd tar, .bin extension avoids AGP gunzipping)"
+# zstd for ~25-30% smaller payload than gzip; -T0 spreads across cores. Use GNU
+# tar's --zstd if available, else pipe through zstd(1).
+if tar --zstd -cf "$ASSETS/ubuntu-rootfs.bin" -C "$ROOTFS_STAGING" . 2>/dev/null; then
+  :
+else
+  tar cf - -C "$ROOTFS_STAGING" . | zstd -T0 -c > "$ASSETS/ubuntu-rootfs.bin"
+fi
 rm -f "$ASSETS/ubuntu-rootfs.tar.gz" "$ASSETS/proot" "$ASSETS/proot-loader" \
   "$ASSETS/forgerig-daemon"
 echo ">> Writing jniLibs: libproot.so libproot_loader.so libandroid-shmem.so libforgerig_daemon.so"

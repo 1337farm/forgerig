@@ -106,6 +106,7 @@ dependencies {
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
     implementation("androidx.security:security-crypto:1.0.0")
     implementation("org.apache.commons:commons-compress:1.24.0")
+    implementation("com.github.luben:zstd-jni:1.5.6-7")
 }
 
 // Reject APKs built with placeholder container assets (see scripts/prepare-assets.sh).
