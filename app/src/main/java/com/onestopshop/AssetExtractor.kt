@@ -57,6 +57,11 @@ class AssetExtractor(private val context: Context) {
         fun resolveLoaderFile(context: Context): File =
             File(context.applicationInfo.nativeLibraryDir, "libproot_loader.so")
 
+        // The host-side orchestrator daemon (static musl) exec'd directly by the
+        // app; it drives the work guest through proot via CONTAINER_* env.
+        fun resolveDaemonFile(context: Context): File =
+            File(context.applicationInfo.nativeLibraryDir, "libforgerig_daemon.so")
+
         // libtalloc.so.2 is a proot DT_NEEDED dep. AGP only merges jniLibs
         // files ending in `.so` (it silently drops `libtalloc.so.2`), so it
         // ships as an asset and is extracted here. Keep in sync with
@@ -104,32 +109,6 @@ class AssetExtractor(private val context: Context) {
             } catch (e: Exception) {
                 Log.w(TAG, "writeResolvConf failed: $e")
                 null
-            }
-        }
-
-        // One-line diagnosis of the container entrypoint: shebang plus whether
-        // the guest interpreter resolves (following one symlink level). Logged
-        // before every launch; an unresolvable interpreter means proot will die
-        // with ENOEXEC on /root/start.sh.
-        fun describeEntrypoint(rootFsDir: File): String {
-            return try {
-                val start = File(rootFsDir, "root/start.sh")
-                if (!start.exists()) return "root/start.sh missing"
-                val first = start.bufferedReader().readLine() ?: "<empty>"
-                var detail = "shebang=[$first] size=${start.length()}"
-                if (first.startsWith("#!")) {
-                    val interp = first.substring(2).trim().split("\\s+".toRegex())[0]
-                    val hostInterp = File(rootFsDir, interp.trimStart('/'))
-                    val linkTarget = try {
-                        android.system.Os.readlink(hostInterp.absolutePath)
-                    } catch (e: Exception) {
-                        null
-                    }
-                    detail += " interp=$interp link->${linkTarget ?: "<not a symlink>"}"
-                }
-                detail
-            } catch (e: Exception) {
-                "entrypoint inspect failed: ${e.message}"
             }
         }
 
@@ -305,6 +284,13 @@ class AssetExtractor(private val context: Context) {
                 ensureExecutable(loaderFile)?.let {
                     throw IOException("proot loader native library is $it")
                 }
+                val daemonFile = resolveDaemonFile(context)
+                if (!daemonFile.exists() || daemonFile.length() == 0L || !isElf(daemonFile)) {
+                    throw IOException("orchestrator daemon native library is missing or invalid: ${describeFile(daemonFile)} (broken APK build?)")
+                }
+                ensureExecutable(daemonFile)?.let {
+                    throw IOException("orchestrator daemon native library is $it")
+                }
                 log("Proot verified (${prootFile.absolutePath}, ${prootFile.length()} bytes, executable)")
 
                 // proot links against libtalloc.so.2 at runtime; ship it out of
@@ -374,6 +360,26 @@ class AssetExtractor(private val context: Context) {
                                     symlinks++
                                 } catch (e: Exception) {
                                     throw IOException("Cannot create symlink ${entry.name} -> ${entry.linkName}: $e")
+                                }
+                            } else if (entry.isLink) {
+                                // Hardlink (Ubuntu rootfs uses these, e.g. usr/bin/perl).
+                                // Reference the earlier member by hardlink, or copy its
+                                // content as a fallback if createLink is unavailable.
+                                outputFile.parentFile?.mkdirs()
+                                outputFile.delete()
+                                try {
+                                    java.nio.file.Files.createLink(
+                                        outputFile.toPath(),
+                                        File(targetDir, entry.linkName).toPath(),
+                                    )
+                                    symlinks++
+                                } catch (e: Exception) {
+                                    val src = File(targetDir, entry.linkName)
+                                    if (src.exists()) {
+                                        src.copyTo(outputFile, overwrite = true)
+                                    } else {
+                                        throw IOException("Hardlink target missing: ${entry.linkName}")
+                                    }
                                 }
                             } else {
                                 outputFile.parentFile?.mkdirs()

@@ -151,16 +151,17 @@ class ContainerService : Service() {
         // here too. Only exit:/missing:/exec-denied: fail the probe.
         writeStatus("starting")
         val rootFsDir = File(filesDir, "ubuntu_rootfs")
+        val daemonBin = AssetExtractor.resolveDaemonFile(this)
         val prootBin = AssetExtractor.resolveProotFile(this)
         val loaderBin = AssetExtractor.resolveLoaderFile(this)
         val tallocBin = AssetExtractor.resolveTallocFile(this)
-        val entrypoint = File(rootFsDir, "root/start.sh")
 
         val missing = mutableListOf<String>()
+        if (!daemonBin.exists()) missing.add("libforgerig_daemon.so (native lib)")
         if (!prootBin.exists()) missing.add("libproot.so (native lib)")
         if (!loaderBin.exists()) missing.add("libproot_loader.so (native lib)")
         if (!tallocBin.exists()) missing.add("libtalloc.so.2 (asset dep)")
-        if (!entrypoint.exists()) missing.add("root/start.sh")
+        if (!rootFsDir.exists()) missing.add("ubuntu_rootfs (extract first)")
         if (missing.isNotEmpty()) {
             val message = "Container files missing: ${missing.joinToString(", ")}. Please run install first."
             AssetExtractor.logShared(this, "ERROR: $message")
@@ -170,10 +171,10 @@ class ContainerService : Service() {
             return
         }
 
-        AssetExtractor.logShared(this, "Pre-launch: ${AssetExtractor.describeFile(prootBin)}")
-        AssetExtractor.logShared(this, "Pre-launch: ${AssetExtractor.describeFile(loaderBin)}")
-        AssetExtractor.logShared(this, "Pre-launch entrypoint: ${AssetExtractor.describeEntrypoint(rootFsDir)}")
-        val execProblem = AssetExtractor.ensureExecutable(prootBin)
+        AssetExtractor.logShared(this, "Pre-launch daemon: ${AssetExtractor.describeFile(daemonBin)}")
+        AssetExtractor.logShared(this, "Pre-launch proot: ${AssetExtractor.describeFile(prootBin)}")
+        val execProblem = AssetExtractor.ensureExecutable(daemonBin)
+            ?: AssetExtractor.ensureExecutable(prootBin)
             ?: AssetExtractor.ensureExecutable(loaderBin)
         if (execProblem != null) {
             val message = "Container binary is $execProblem"
@@ -188,34 +189,21 @@ class ContainerService : Service() {
         updateNotification("Container starting…")
         thread {
             try {
-                val pb = ProcessBuilder(
-                    prootBin.absolutePath,
-                    "-r", rootFsDir.absolutePath,
-                    "-0",
-                    "-w", "/root",
-                    "/root/start.sh"
-                )
-                // Guest DNS: the minirootfs has no /etc/resolv.conf, so without
-                // this bind every guest lookup fails (the daemon's API calls
-                // die with DNS errors). Non-fatal if generation fails.
-                AssetExtractor.writeResolvConf(this)?.let { resolv ->
-                    val args = pb.command()
-                    args.add(args.size - 1, "-b")
-                    args.add(args.size - 1, "${resolv.absolutePath}:/etc/resolv.conf")
-                }
-                // The entrypoint launches forgerig-daemon which binds
-                // 127.0.0.1:$PORT; the WebView connects to that same port.
-                // PROOT_LOADER is mandatory: the Termux-built proot binary
-                // hardcodes /data/data/com.termux/... as its loader path,
-                // which does not exist on devices without Termux installed.
+                // The daemon runs host-side and drives the work guest through
+                // proot, so its env carries the container pointers + provider
+                // config. It binds 127.0.0.1:$PORT for the WebView.
+                val pb = ProcessBuilder(daemonBin.absolutePath)
                 pb.environment()["PORT"] = MainActivity.allocatedPort.toString()
+                pb.environment()["CONTAINER_PROOT"] = prootBin.absolutePath
+                pb.environment()["CONTAINER_ROOTFS"] = rootFsDir.absolutePath
                 pb.environment()["PROOT_LOADER"] = loaderBin.absolutePath
                 // proot is dynamically linked against libtalloc.so.2 +
-                // libandroid-shmem.so (shipped in the same native lib dir) and
-                // its RUNPATH points at /data/data/com.termux/... which the app
-                // UID cannot read. LD_LIBRARY_PATH steers the linker to our own
-                // lib dir so those bundled DT_NEEDED deps resolve.
+                // libandroid-shmem.so; the linker finds them via LD_LIBRARY_PATH.
                 pb.environment()["LD_LIBRARY_PATH"] = AssetExtractor.loaderSearchPath(this)
+                // Guest DNS: generated on the host, the daemon bind-mounts it.
+                AssetExtractor.writeResolvConf(this)?.let { resolv ->
+                    pb.environment()["CONTAINER_RESOLV_CONF"] = resolv.absolutePath
+                }
                 // Provider/model/key from the (encrypted) settings store. Only
                 // non-empty values are set so the daemon's defaults apply when
                 // nothing is configured. Secrets stay in env, never in files.
@@ -227,9 +215,9 @@ class ContainerService : Service() {
                     if (s.apiKey.isNotEmpty()) pb.environment()["FORGERIG_API_KEY"] = s.apiKey
                 }
                 pb.redirectErrorStream(true)
-                pb.directory(rootFsDir)
+                pb.directory(File(filesDir, "work").also { it.mkdirs() })
 
-                AssetExtractor.logShared(this, "Launching proot (loader=${loaderBin.absolutePath}, port=${MainActivity.allocatedPort}, ld=${AssetExtractor.loaderSearchPath(this)})")
+                AssetExtractor.logShared(this, "Launching daemon (port=${MainActivity.allocatedPort}, proot=${prootBin.absolutePath})")
                 val process = pb.start()
                 containerProcess = process
                 updateNotification("Container running")
@@ -237,12 +225,12 @@ class ContainerService : Service() {
                 process.inputStream.bufferedReader().use { reader ->
                     var line = reader.readLine()
                     while (line != null) {
-                        AssetExtractor.logShared(this, "proot: $line")
+                        AssetExtractor.logShared(this, "daemon: $line")
                         line = reader.readLine()
                     }
                 }
                 val code = process.waitFor()
-                AssetExtractor.logShared(this, "proot exited with code $code")
+                AssetExtractor.logShared(this, "daemon exited with code $code")
                 writeStatus("exit:$code")
                 updateNotification("Container stopped (exit $code)")
             } catch (e: Exception) {

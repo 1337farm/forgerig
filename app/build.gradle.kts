@@ -117,6 +117,7 @@ val checkContainerAssets by tasks.registering(Exec::class) {
         "test -s app/src/main/jniLibs/arm64-v8a/libproot.so && " +
         "test -s app/src/main/jniLibs/arm64-v8a/libproot_loader.so && " +
         "test -s app/src/main/jniLibs/arm64-v8a/libandroid-shmem.so && " +
+        "test -s app/src/main/jniLibs/arm64-v8a/libforgerig_daemon.so && " +
         "test -s app/src/main/assets/libtalloc.so.2 && " +
         "(test -s app/src/main/assets/ubuntu-rootfs.bin || test -s app/src/main/assets/ubuntu-rootfs.tar.gz)")
 }
