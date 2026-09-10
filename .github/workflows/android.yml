@@ -119,9 +119,13 @@ jobs:
           mkdir -p "$OUT"
           APK="$(find app/build/outputs/apk/release -name 'forgerig-*.apk' | head -1)"
           if [ -z "$APK" ]; then echo "ERROR: no forgerig-*.apk to publish (hash rename missing?)"; return 1; fi
-          cp "$APK" "$OUT/"
-          APK_NAME="$(basename "$APK")"
-          SHA="$(git rev-parse --short=10 HEAD)"
+          # PR runs check out the synthetic refs/pull/N/merge ref, so git HEAD at
+          # build time is a commit that exists in no branch. Name the artifact
+          # after the real PR head SHA instead so the hash is traceable.
+          SHA="${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+          SHA="$(printf '%s' "$SHA" | cut -c1-10)"
+          APK_NAME="forgerig-release-$SHA.apk"
+          cp "$APK" "$OUT/$APK_NAME"
           DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           SUM="$(sha256sum "$OUT/$APK_NAME" | cut -d' ' -f1)"
           printf '{"commit":"%s","built_at":"%s","abi":"arm64-v8a","files":{"%s":"%s"}}\n' \
