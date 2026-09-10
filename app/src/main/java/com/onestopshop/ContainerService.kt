@@ -160,6 +160,7 @@ class ContainerService : Service() {
 
         AssetExtractor.logShared(this, "Pre-launch: ${AssetExtractor.describeFile(prootBin)}")
         AssetExtractor.logShared(this, "Pre-launch: ${AssetExtractor.describeFile(loaderBin)}")
+        AssetExtractor.logShared(this, "Pre-launch entrypoint: ${AssetExtractor.describeEntrypoint(rootFsDir)}")
         val execProblem = AssetExtractor.ensureExecutable(prootBin)
             ?: AssetExtractor.ensureExecutable(loaderBin)
         if (execProblem != null) {
