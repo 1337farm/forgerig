@@ -21,6 +21,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = "0.4.45"
 schemars = "0.8.22"
+# Blocking HTTP for on-demand payload downloads (Lean bootstrap). ureq 2.x uses
+# rustls by default, so the static aarch64-musl build needs no extra C libs.
+ureq = "2.10"
+sha2 = "0.10"
 
 [features]
 # rig-core pulls reqwest with default TLS (native-tls -> openssl-sys). For the

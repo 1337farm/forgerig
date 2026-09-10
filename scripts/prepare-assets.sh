@@ -2,14 +2,18 @@
 # Prepare the Android container assets that the app extracts at install time.
 #
 # Produces:
-#   app/src/main/assets/ubuntu-rootfs.bin   Ubuntu (glibc) aarch64 rootfs, zstd tar
+#   dist/container/ubuntu-rootfs.bin        Ubuntu (glibc) aarch64 rootfs, zstd tar
+#                                           (NOT baked into the APK; the runner
+#                                           downloads it on install)
+#   dist/container/container-manifest.json  integrity manifest (rootfs + optional
+#                                           Lean toolchain entry with upstream URL)
 #   app/src/main/assets/libtalloc.so.2      proot DT_NEEDED dep (asset; name has no .so)
 #   app/src/main/jniLibs/arm64-v8a/         proot + loader + deps + the daemon
 #     libproot.so, libproot_loader.so, libandroid-shmem.so, libforgerig_daemon.so
 #
-# NOTE: the rootfs uses a `.bin` extension (not `.tar.gz`) because the Android
-# Gradle Plugin auto-gunzips `.gz` assets at merge time, renaming the entry to
-# `ubuntu-rootfs.tar` and breaking AssetManager.open("ubuntu-rootfs.tar.gz").
+# NOTE: the payload keeps a `.bin` extension (not `.tar.gz`) so AGP never
+# auto-gunzips it at merge time (which would rename the entry and break
+# AssetManager.open). The app's AssetExtractor sniffs zstd/gzip magic bytes.
 #
 # The daemon runs HOST-side (a static musl binary exec'd straight from the
 # app's native lib dir) and drives the work guest through proot, so it ships
@@ -119,7 +123,7 @@ elif command -v debootstrap >/dev/null 2>&1 || (command -v sudo >/dev/null 2>&1 
     S update-binfmts --enable qemu-aarch64 2>/dev/null || true
     echo ">> debootstrap $UBU_CODENAME (arm64) from $UBU_MIRROR"
     S debootstrap --arch=arm64 --variant=minbase --no-check-gpg \
-      --include="bash,ca-certificates,git,curl" \
+      --include="bash,ca-certificates,git,curl,zstd" \
       "$UBU_CODENAME" "$ROOTFS_STAGING" "$UBU_MIRROR"
   fi
 fi
@@ -146,23 +150,18 @@ if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
   sudo chown -R "$(id -u):$(id -g)" "$ROOTFS_STAGING" 2>/dev/null || true
 fi
 
-# --- 4. Emit the assets -------------------------------------------------------
+# --- 4. Emit the bundled APK bits ---------------------------------------------
 # proot + loader + shmem + daemon ship as native libs (lib/*.so), NOT assets:
 # the package manager extracts jniLibs with the executable bit on a
 # system-blessed path; some devices refuse execve() on app-chmodded filesDir
 # payloads (error=13). libtalloc.so.2 has no `.so` extension (AGP drops it from
 # jniLibs), so it ships as an asset extracted to filesDir/native_deps at install.
+# The rootfs itself is NOT bundled: it lives in dist/container and is downloaded
+# by the runner at install (step 5), keeping the APK slim.
 JNILIBS="$ROOT/app/src/main/jniLibs/arm64-v8a"
 mkdir -p "$ASSETS" "$JNILIBS"
-echo ">> Writing $ASSETS/ubuntu-rootfs.bin (zstd tar, .bin extension avoids AGP gunzipping)"
-# zstd for ~25-30% smaller payload than gzip; -T0 spreads across cores. Use GNU
-# tar's --zstd if available, else pipe through zstd(1).
-if tar --zstd -cf "$ASSETS/ubuntu-rootfs.bin" -C "$ROOTFS_STAGING" . 2>/dev/null; then
-  :
-else
-  tar cf - -C "$ROOTFS_STAGING" . | zstd -T0 -c > "$ASSETS/ubuntu-rootfs.bin"
-fi
-rm -f "$ASSETS/ubuntu-rootfs.tar.gz" "$ASSETS/proot" "$ASSETS/proot-loader" \
+rm -f "$ASSETS/ubuntu-rootfs.bin" "$ASSETS/ubuntu-rootfs.tar.gz" \
+  "$ASSETS/ubuntu-rootfs.tar" "$ASSETS/proot" "$ASSETS/proot-loader" \
   "$ASSETS/forgerig-daemon"
 echo ">> Writing jniLibs: libproot.so libproot_loader.so libandroid-shmem.so libforgerig_daemon.so"
 cp "$PROOT_BIN" "$JNILIBS/libproot.so"
@@ -175,23 +174,65 @@ chmod 755 "$JNILIBS"/libproot.so "$JNILIBS"/libproot_loader.so \
   "$ASSETS"/libtalloc.so.2
 [ "$(readelf -d "$JNILIBS/libproot.so" | grep -c 'NEEDED.*libtalloc.so.2\|NEEDED.*libandroid-shmem.so')" -eq 2 ] \
   || echo "WARNING: expected proot to need libtalloc.so.2 + libandroid-shmem.so" >&2
-
-echo ">> Done. Assets:"
-ls -l "$ASSETS/ubuntu-rootfs.bin" "$ASSETS/libtalloc.so.2" \
-  "$JNILIBS"/libproot.so "$JNILIBS"/libproot_loader.so \
-  "$JNILIBS"/libandroid-shmem.so "$JNILIBS"/libforgerig_daemon.so
+echo ">> Bundled APK bits: $ASSETS/libtalloc.so.2 + $JNILIBS/*"
 
 # --- 5. Emit the swappable container payload (downloads from `container-latest`) --
-# The rootfs is the heavy, frequently-changing piece, so it is ALSO published as
-# a standalone GitHub release the app downloads (chunked + sha-verified) at
-# install, letting it upgrade independently of the runner APK. Each entry below
-# maps to a downloadable asset + its integrity fields.
+# The rootfs is the heavy, frequently-changing piece, so it is published as a
+# standalone GitHub release the app downloads (chunked + sha-verified) at
+# install, letting it upgrade independently of the runner APK. The manifest also
+# records the optional Lean toolchain (published upstream by leanprover/lean4):
+# its `url` lets the host-side daemon download it on demand and install it into
+# /usr/local inside the guest.
 DIST="$ROOT/dist/container"
 mkdir -p "$DIST"
-cp "$ASSETS/ubuntu-rootfs.bin" "$DIST/ubuntu-rootfs.bin"
+echo ">> Writing $DIST/ubuntu-rootfs.bin (zstd tar, .bin extension avoids AGP gunzipping)"
+# zstd for ~25-30% smaller payload than gzip; -T0 spreads across cores. Use GNU
+# tar's --zstd if available, else pipe through zstd(1).
+if tar --zstd -cf "$DIST/ubuntu-rootfs.bin" -C "$ROOTFS_STAGING" . 2>/dev/null; then
+  :
+else
+  tar cf - -C "$ROOTFS_STAGING" . | zstd -T0 -c > "$DIST/ubuntu-rootfs.bin"
+fi
 ROOTFS_SHA="$(sha256sum "$DIST/ubuntu-rootfs.bin" | cut -d' ' -f1)"
 ROOTFS_SIZE="$(stat -c%s "$DIST/ubuntu-rootfs.bin" 2>/dev/null || wc -c < "$DIST/ubuntu-rootfs.bin")"
-cat > "$DIST/container-manifest.json" <<JSON
+
+# Resolve the Lean aarch64 release from the GitHub API (no local download at
+# build time: size + sha256 digest come straight from the API payload).
+# FORGERIG_LEAN_VERSION pins a tag (e.g. "4.33.1"); default follows latest.
+LEAN_VERSION="${FORGERIG_LEAN_VERSION:-latest}"
+LEAN_JSON=""
+if [ "$LEAN_VERSION" = "latest" ]; then
+  LEAN_JSON="$(curl -fsSL --max-time 30 https://api.github.com/repos/leanprover/lean4/releases/latest 2>/dev/null || true)"
+else
+  LEAN_JSON="$(curl -fsSL --max-time 30 "https://api.github.com/repos/leanprover/lean4/releases/tags/v$LEAN_VERSION" 2>/dev/null || true)"
+fi
+
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$DIST" "$ROOTFS_SHA" "$ROOTFS_SIZE" "$LEAN_JSON" <<'PY'
+import json, sys
+dist, rootfs_sha, rootfs_size, lean_json = sys.argv[1:]
+assets = {"ubuntu-rootfs.bin": {"sha256": rootfs_sha, "size": int(rootfs_size)}}
+if lean_json:
+    try:
+        for a in json.loads(lean_json).get("assets", []):
+            if a.get("name", "").endswith("linux_aarch64.tar.zst"):
+                digest = a.get("digest") or ""
+                sha = digest.split(":", 1)[1] if ":" in digest else ""
+                assets[a["name"]] = {
+                    "sha256": sha,
+                    "size": a["size"],
+                    "url": a.get("browser_download_url", ""),
+                }
+                break
+    except Exception as e:
+        print(f"WARNING: could not parse Lean release JSON: {e}", file=sys.stderr)
+with open(f"{dist}/container-manifest.json", "w") as fh:
+    json.dump({"version": 2, "assets": assets}, fh, indent=2)
+    fh.write("\n")
+PY
+else
+  echo "WARNING: python3 unavailable; manifest omits the optional Lean entry" >&2
+  cat > "$DIST/container-manifest.json" <<JSON
 {
   "version": 1,
   "assets": {
@@ -199,5 +240,13 @@ cat > "$DIST/container-manifest.json" <<JSON
   }
 }
 JSON
+fi
+
 echo ">> Wrote $DIST/container-manifest.json"
 cat "$DIST/container-manifest.json"
+echo ">> Done. Bundled APK bits:"
+ls -l "$ASSETS/libtalloc.so.2" \
+  "$JNILIBS"/libproot.so "$JNILIBS"/libproot_loader.so \
+  "$JNILIBS"/libandroid-shmem.so "$JNILIBS"/libforgerig_daemon.so
+echo ">> Downloadable payload:"
+ls -l "$DIST/ubuntu-rootfs.bin"
