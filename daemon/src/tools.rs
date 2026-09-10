@@ -40,6 +40,11 @@ pub struct ShellResult {
     pub timed_out: bool,
 }
 
+/// Quote a value for POSIX sh (single quotes), safe for arbitrary paths/args.
+pub fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct BashExecutor;
 
@@ -49,8 +54,9 @@ pub struct BashExecutor;
 /// host-side), the command is wrapped in proot against the work rootfs;
 /// otherwise it runs directly via `sh` (the daemon itself living in-guest, or
 /// local dev). `sandbox` prepends resource limits and a disposable workdir so
-/// model-generated commands stay contained.
-fn build_cmd(command: &str, sandbox: bool) -> Command {
+/// model-generated commands stay contained. `binds` adds extra `-b host:guest`
+/// proot bindings (e.g. the Lean archive the bootstrap stages).
+fn build_cmd_binds(command: &str, sandbox: bool, binds: &[String]) -> Command {
     let line = if sandbox {
         format!(
             "ulimit -t {} -v {} 2>/dev/null; mkdir -p {} 2>/dev/null; cd {} 2>/dev/null || true; {}",
@@ -77,6 +83,9 @@ fn build_cmd(command: &str, sandbox: bool) -> Command {
         if let Ok(resolv) = std::env::var("CONTAINER_RESOLV_CONF") {
             cmd.arg("-b").arg(format!("{}:/etc/resolv.conf", resolv));
         }
+        for bind in binds {
+            cmd.arg("-b").arg(bind);
+        }
         cmd.arg("/bin/sh").arg("-c").arg(&line);
         cmd
     } else {
@@ -87,8 +96,12 @@ fn build_cmd(command: &str, sandbox: bool) -> Command {
 }
 
 async fn run_shell(command: &str, sandbox: bool, limit: Duration) -> ShellResult {
+    run_shell_binds(command, sandbox, limit, &[]).await
+}
+
+async fn run_shell_binds(command: &str, sandbox: bool, limit: Duration, binds: &[String]) -> ShellResult {
     let fut = async {
-        let output = build_cmd(command, sandbox).output().await?;
+        let output = build_cmd_binds(command, sandbox, binds).output().await?;
         Ok::<_, std::io::Error>(output)
     };
     match timeout(limit, fut).await {
@@ -121,6 +134,16 @@ pub async fn run_sandboxed(command: &str) -> ShellResult {
 /// Trusted shell for user `!` commands (no limits, longer timeout).
 pub async fn run_trusted(command: &str) -> ShellResult {
     run_shell(command, false, TRUSTED_TIMEOUT).await
+}
+
+/// Trusted shell with an explicit wall-clock limit (payload installs like Lean).
+pub async fn run_trusted_limited(command: &str, limit: Duration) -> ShellResult {
+    run_shell(command, false, limit).await
+}
+
+/// Trusted shell with extra proot `-b` bindings and an explicit timeout.
+pub async fn run_trusted_binds_limited(command: &str, binds: &[String], limit: Duration) -> ShellResult {
+    run_shell_binds(command, false, limit, binds).await
 }
 
 impl Tool for BashExecutor {

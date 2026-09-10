@@ -19,19 +19,27 @@ A branch cut from an old `main` will be CONFLICTING by the time you push.
 ## Before committing: verify the build
 - Android unit tests (assets not required):
   `export PATH="/data/data/com.termux/files/usr/bin:$PATH" && ./gradlew :app:testDebugUnitTest -PskipContainerAssetsCheck`
-- Full APK packaging requires generated container assets first:
+- Full APK packaging requires generated native bits first:
   `export HOME="/data/data/com.termux/files/home" && bash scripts/prepare-assets.sh`
   then `./gradlew assembleDebug` (fails loudly via `checkContainerAssets`
-  if `app/src/main/assets/ubuntu-rootfs.bin` or
-  `app/src/main/jniLibs/arm64-v8a/libproot{,_loader}.so` or its DT_NEEDED
-  libs (`app/src/main/assets/libtalloc.so.2`,
-  `app/src/main/jniLibs/arm64-v8a/libandroid-shmem.so`) are missing).
+  if `app/src/main/jniLibs/arm64-v8a/libproot{,_loader}.so`,
+  `libandroid-shmem.so`, `libforgerig_daemon.so`, or
+  `app/src/main/assets/libtalloc.so.2` are missing).
 
 ## Asset pipeline gotchas (must-know)
-- `scripts/prepare-assets.sh` emits `ubuntu-rootfs.bin` (gzipped tar with a
-  `.bin` extension) — NOT `.tar.gz`. AGP auto-gunzips `.gz` assets at merge
-  time, which renames the entry to `ubuntu-rootfs.tar` inside the APK and
-  breaks `AssetManager.open("ubuntu-rootfs.tar.gz")` with FileNotFoundException.
+- Rootfs is the HEAVY downloadable payload, NOT a bundled APK asset: the slim
+  runner APK ships only the native binaries; `ubuntu-rootfs.bin` (zstd tar,
+  `.bin` extension) + `container-manifest.json` are published to the
+  `container-latest` release and downloaded at install (`ContainetAssets`,
+  chunked + sha-verified, cached in filesDir/container). Keep the `.bin`
+  extension: AGP auto-gunzips `.gz` assets at merge time (renames the entry to
+  `ubuntu-rootfs.tar` and breaks `AssetManager.open(...)`). AssetExtractor
+  sniffs zstd (`28 B5 2F FD`) / gzip (`1F 8B`) magic bytes.
+- `container-manifest.json` (`version: 2`) also carries an optional Lean entry
+  (`lean-<ver>-linux_aarch64.tar.zst`) with sha256/size/`url` taken from the
+  leanprover/lean4 GitHub API — the host daemon downloads it on demand
+  (ureq, into `CONTAINER_CACHE` = filesDir/container) and extracts it into the
+  guest's /usr/local via proot. The guest debootstrap `--include` has `zstd`.
 - proot + loader + daemon ship as `app/src/main/jniLibs/arm64-v8a/` native
   libs (libproot.so, libproot_loader.so, libandroid-shmem.so,
   libforgerig_daemon.so) — NOT assets: some devices refuse execve() on
@@ -40,13 +48,13 @@ A branch cut from an old `main` will be CONFLICTING by the time you push.
   pins extraction at install.
 - The daemon runs HOST-side: `ContainerService` execs `libforgerig_daemon.so`
   directly (static musl) and sets `CONTAINER_PROOT`/`CONTAINER_ROOTFS`/
-  `PROOT_LOADER`/`CONTAINER_RESOLV_CONF`, so the daemon drives the work guest
-  through proot. There is no `root/start.sh` entrypoint anymore.
+  `PROOT_LOADER`/`CONTAINER_RESOLV_CONF`/`CONTAINER_CACHE`, so the daemon drives
+  the work guest through proot. There is no `root/start.sh` entrypoint anymore.
 - The work guest rootfs is Ubuntu/glibc (debootstrap'd aarch64 on the CI
   runner via qemu-user-static, with a raw ubuntu-base tarball fallback), NOT
   Alpine. `scripts/prepare-assets.sh` `--include` list is the way to add guest
-  packages (bash, git, python3, …). Keep it glibc: gh, node, Lean/elan all ship
-  glibc binaries.
+  packages (bash, git, python3, zstd, …). Keep it glibc: gh, node, Lean/elan
+  all ship glibc binaries.
 - Ubuntu base has hard links (usr/bin/perl etc.); `AssetExtractor` recreates
   BOTH symlinks and hardlinks (its symlink handling is what fixed ENOEXEC,
   hardlink handling is what keeps perl/gunzip whole).
@@ -60,13 +68,16 @@ A branch cut from an old `main` will be CONFLICTING by the time you push.
   and the daemon sets a guest `PATH=/usr/local/sbin:...:/bin` + `HOME=/root`
   per proot invocation (the host PATH is meaningless inside the guest).
   Both must ride along with any proot upgrade.
-- `AssetExtractor` opens `ubuntu-rootfs.bin` first, then falls back to
-  `.tar.gz` / plain `.tar` for older APKs. Keep all three in sync across
-  `prepare-assets.sh`, `checkContainerAssets` (app/build.gradle.kts),
-  `.gitignore`, and `AssetExtractor.ROOTFS_CANDIDATES`.
-- Generated assets are gitignored; CI regenerates them via `prepare-assets.sh`
-  with `FORGERIG_CARGO_TARGET=aarch64-unknown-linux-musl` and
-  `FORGERIG_CARGO_FEATURES=vendored-openssl` (openssl-sys cross-build fails otherwise).
+- `AssetExtractor` download-first fetches `ubuntu-rootfs.bin` from
+  `container-latest` (magic-sniffing zstd/gzip), then falls back to a bundled
+  asset for old fat APKs. Keep `ROOTFS_CANDIDATES`, `prepare-assets.sh`,
+  `checkContainerAssets` (app/build.gradle.kts), and `.gitignore` in sync.
+- Generated assets + `dist/` are gitignored; CI regenerates them via
+  `prepare-assets.sh` with `FORGERIG_CARGO_TARGET=aarch64-unknown-linux-musl`
+  and `FORGERIG_CARGO_FEATURES=vendored-openssl` (openssl-sys cross-build fails otherwise).
+  The `assets-latest` rolling release is the CI's rebuild cache (now repo-root
+  relative, incl. `dist/container/*`); `container-latest` is the app's payload
+  source.
 
 ## Environment notes (Termux)
 - `git`/`gh` live outside the default PATH for agents:

@@ -109,9 +109,10 @@ dependencies {
     implementation("com.github.luben:zstd-jni:1.5.6-7")
 }
 
-// Reject APKs built with placeholder container assets (see scripts/prepare-assets.sh).
-// proot ships as native libs (PackageManager extracts them executable);
-// only the rootfs blob lives in assets.
+// Reject APKs built with placeholder container binaries (see scripts/prepare-assets.sh).
+// proot ships as native libs (PackageManager extracts them executable); the
+// rootfs payload is NOT bundled — it is downloaded from `container-latest` at
+// install (ContainerAssets), so this check only needs the fat binary bits.
 val checkContainerAssets by tasks.registering(Exec::class) {
     workingDir = rootProject.projectDir
     commandLine("sh", "-c",
@@ -119,8 +120,7 @@ val checkContainerAssets by tasks.registering(Exec::class) {
         "test -s app/src/main/jniLibs/arm64-v8a/libproot_loader.so && " +
         "test -s app/src/main/jniLibs/arm64-v8a/libandroid-shmem.so && " +
         "test -s app/src/main/jniLibs/arm64-v8a/libforgerig_daemon.so && " +
-        "test -s app/src/main/assets/libtalloc.so.2 && " +
-        "(test -s app/src/main/assets/ubuntu-rootfs.bin || test -s app/src/main/assets/ubuntu-rootfs.tar.gz)")
+        "test -s app/src/main/assets/libtalloc.so.2")
 }
 // Only packaging needs the assets; unit tests must stay runnable without them.
 // `testDebugUnitTest` happens to pull the whole assemble<bool> graph (including

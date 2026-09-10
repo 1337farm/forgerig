@@ -81,11 +81,11 @@ class AssetExtractor(private val context: Context) {
             return "$libs:$deps"
         }
 
-        // The Alpine minirootfs ships no /etc/resolv.conf, so musl inside the
-        // guest cannot resolve anything (DNS lookup failure on every API call).
-        // Generate one from the device's current DNS servers (respects VPN /
-        // private DNS) with public fallback, refreshed on every launch. The
-        // caller bind-mounts the result over the guest's /etc/resolv.conf.
+        // The work rootfs ships no /etc/resolv.conf, so guest tools (apt/git/
+        // lean-lake) cannot resolve anything (DNS lookup failure on every API
+        // call). Generate one from the device's current DNS servers (respects
+        // VPN / private DNS) with public fallback, refreshed on every launch.
+        // The caller bind-mounts the result over the guest's /etc/resolv.conf.
         fun writeResolvConf(context: Context): File? {
             return try {
                 val servers = LinkedHashSet<String>()

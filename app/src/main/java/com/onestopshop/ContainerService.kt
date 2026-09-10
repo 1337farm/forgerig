@@ -197,6 +197,10 @@ class ContainerService : Service() {
                 pb.environment()["CONTAINER_PROOT"] = prootBin.absolutePath
                 pb.environment()["CONTAINER_ROOTFS"] = rootFsDir.absolutePath
                 pb.environment()["PROOT_LOADER"] = loaderBin.absolutePath
+                // Payload cache dir: shared with ContainerAssets so the host
+                // daemon's on-demand downloads (Lean toolchain) land in the
+                // same verified cache the app uses for the rootfs.
+                pb.environment()["CONTAINER_CACHE"] = File(filesDir, "container").absolutePath
                 // proot is dynamically linked against libtalloc.so.2 +
                 // libandroid-shmem.so; the linker finds them via LD_LIBRARY_PATH.
                 pb.environment()["LD_LIBRARY_PATH"] = AssetExtractor.loaderSearchPath(this)

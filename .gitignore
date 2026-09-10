@@ -8,7 +8,5 @@ daemon/target/
 daemon/oss_memory.db
 
 # Generated container assets (scripts/prepare-assets.sh)
-app/src/main/assets/ubuntu-rootfs.bin
-app/src/main/assets/ubuntu-rootfs.tar.gz
 app/src/main/jniLibs/
 app/src/main/assets/libtalloc.so.2

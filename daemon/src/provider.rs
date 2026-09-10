@@ -13,13 +13,14 @@ use rig::extractor::Extractor;
 use rig::providers::{gemini, openai};
 
 use crate::memory::EvaluationResult;
+use crate::lean::LeanExecutor;
 use crate::tools::BashExecutor;
 use crate::wasm::WasmTransformer;
 
 const SYSTEM_PREAMBLE: &str = "\
 You are an autonomous orchestrator daemon running in a Linux userland inside an \
-Android app. You have tools to run bash and transform WASM. Be concise and \
-action-oriented.";
+Android app. You have tools to run bash, transform WASM, and type-check Lean \
+theorem-prover sources. Be concise and action-oriented.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Provider {
@@ -173,6 +174,7 @@ impl Backend {
                 .preamble(SYSTEM_PREAMBLE)
                 .tool(BashExecutor::default())
                 .tool(WasmTransformer::default())
+                .tool(LeanExecutor::default())
                 .build();
             let eval = client.extractor::<EvaluationResult>(&eval_model).build();
             BackendKind::Gemini { agent, eval }
@@ -185,6 +187,7 @@ impl Backend {
                 .preamble(SYSTEM_PREAMBLE)
                 .tool(BashExecutor::default())
                 .tool(WasmTransformer::default())
+                .tool(LeanExecutor::default())
                 .build();
             let eval = client.extractor::<EvaluationResult>(&eval_model).build();
             BackendKind::Compat { agent, eval }
