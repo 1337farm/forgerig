@@ -108,7 +108,7 @@ jobs:
                 tar xzf "$DL/container-assets.tar.gz" -O jniLibs/arm64-v8a/libproot.so > "$STAGE/libproot.so" 2>/dev/null
                 tar xzf "$DL/container-assets.tar.gz" -O jniLibs/arm64-v8a/libforgerig_daemon.so > "$STAGE/libforgerig_daemon.so" 2>/dev/null
                 if ! readelf -h "$STAGE/libforgerig_daemon.so" >/dev/null 2>&1 \
-                   || ! tar tzf "$STAGE/rootfs.bin" 2>/dev/null | grep -q 'aarch64-linux-gnu/libc.so.6$' \
+                   || ! tar --zstd -tf "$STAGE/rootfs.bin" 2>/dev/null | grep -q 'aarch64-linux-gnu/libc.so.6$' \
                    || ! readelf -d "$STAGE/libproot.so" 2>/dev/null | grep -q 'NEEDED.*libtalloc.so.2' \
                    || ! readelf -d "$STAGE/libproot.so" 2>/dev/null | grep -q 'NEEDED.*libandroid-shmem.so'; then
                   echo "container-assets release failed quality gate; rebuilding"
