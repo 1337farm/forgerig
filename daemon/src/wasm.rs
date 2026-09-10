@@ -43,6 +43,9 @@ impl Default for WasmTransformer {
     }
 }
 
+// Test-only: the fuel-limit tests need a custom budget, so this constructor
+// exists only under cfg(test) to keep the production build warning-free.
+#[cfg(test)]
 impl WasmTransformer {
     pub fn new(fuel_limit: u64) -> Self {
         Self { fuel_limit }

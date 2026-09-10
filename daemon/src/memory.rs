@@ -1,6 +1,5 @@
 use tokio_rusqlite::Connection;
 use std::sync::Arc;
-use serde_json::Value;
 
 #[derive(Clone)]
 pub struct MemoryEngine {
@@ -32,17 +31,6 @@ impl MemoryEngine {
                 )",
                 [],
             )?;
-
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS kanban_tasks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    title TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    description TEXT NOT NULL,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )",
-                [],
-            )?;
             Ok(())
         }).await?;
 
@@ -51,9 +39,9 @@ impl MemoryEngine {
         })
     }
 
-    pub async fn log_trace(&self, prompt: &str, completion: &Value) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn log_trace(&self, prompt: &str, completion: &str) -> Result<(), Box<dyn std::error::Error>> {
         let prompt_str = prompt.to_string();
-        let completion_str = serde_json::to_string(completion)?;
+        let completion_str = completion.to_string();
 
         self.db.call(move |conn| {
             conn.execute(
@@ -100,46 +88,58 @@ impl MemoryEngine {
         let milestone_str = milestone.to_string();
         let context_str = context.to_string();
 
-        self.db.call({
-            let milestone_str = milestone_str.clone();
-            let context_str = context_str.clone();
-            move |conn| {
+        {
+            let (m, c) = (milestone_str.clone(), context_str.clone());
+            self.db.call(move |conn| {
                 conn.execute(
                     "INSERT INTO macro_memory (milestone, context) VALUES (?1, ?2)",
-                    (&milestone_str, &context_str),
+                    (&m, &c),
                 )?;
                 Ok(())
-            }
-        }).await?;
+            }).await?;
+        }
 
-        // Also append to AGENTS.md
+        // Also append to AGENTS.md in the current working directory (the work
+        // root when running in-guest, or the daemon CWD host-side).
         let append_content = format!("\n## Milestone: {}\n\n{}\n", milestone_str, context_str);
-        if let Ok(existing) = std::fs::read_to_string("AGENTS.md") {
-            // Append only if it's not already there (rudimentary check)
-            if !existing.contains(&milestone_str) {
-                use std::io::Write;
-                let mut file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("AGENTS.md")?;
-                file.write_all(append_content.as_bytes())?;
-            }
-        } else {
-             use std::io::Write;
-             let mut file = std::fs::OpenOptions::new()
-                 .create(true)
-                 .append(true)
-                 .open("AGENTS.md")?;
-             file.write_all(append_content.as_bytes())?;
+        match std::fs::read_to_string("AGENTS.md") {
+            Ok(existing) if !existing.contains(&milestone_str) => write_agents_append(append_content)?,
+            Ok(_) => {}
+            Err(_) => write_agents_append(append_content)?,
         }
 
         Ok(())
     }
+
+    /// Chronological (oldest-first) list of prior milestones.
+    pub async fn get_macro_memories(&self, limit: usize) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+        self.db.call(move |conn| {
+            let mut stmt = conn.prepare("SELECT milestone, context FROM macro_memory ORDER BY timestamp DESC LIMIT ?")?;
+            let mut rows = stmt.query([limit as i64])?;
+
+            let mut mems = Vec::new();
+            while let Some(row) = rows.next()? {
+                let milestone: String = row.get(0)?;
+                let context: String = row.get(1)?;
+                mems.push((milestone, context));
+            }
+            mems.reverse();
+            Ok(mems)
+        }).await.map_err(|e| e.into())
+    }
+}
+
+fn write_agents_append(content: String) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("AGENTS.md")?;
+    file.write_all(content.as_bytes())?;
+    Ok(())
 }
 
 use serde::{Deserialize, Serialize};
-use rig::extractor::Extractor;
-use rig::completion::CompletionModel;
 use schemars::JsonSchema;
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema)]
@@ -149,58 +149,45 @@ pub struct EvaluationResult {
     pub noisy_trace_ids: Vec<i64>,
 }
 
-pub struct HeuristicEvaluator<M: CompletionModel> {
-    extractor: Extractor<M, EvaluationResult>,
-}
-
-impl<M: CompletionModel> HeuristicEvaluator<M> {
-    pub fn new(extractor: Extractor<M, EvaluationResult>) -> Self {
-        Self { extractor }
+/// Evaluate recent traces, prune noise, and record milestone memory.
+pub async fn evaluate_and_process(
+    backend: &Arc<crate::provider::Backend>,
+    memory_engine: &Arc<MemoryEngine>,
+    traces: Vec<(i64, String, String)>,
+) -> Result<(), String> {
+    if traces.is_empty() {
+        return Ok(());
     }
 
-    pub async fn evaluate_and_process(&self, memory_engine: Arc<MemoryEngine>, traces: Vec<(i64, String, String)>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if traces.is_empty() {
-            return Ok(());
-        }
-
-        // Prepare trace data for LLM evaluation
-        let mut trace_text = String::new();
-        for (id, prompt, completion) in &traces {
-            trace_text.push_str(&format!("Trace ID: {}\nPrompt: {}\nCompletion: {}\n\n", id, prompt, completion));
-        }
-
-        let evaluation_prompt = format!(
-            "Evaluate the following execution traces and determine if a major milestone has been reached.\n\
-             If a milestone has been reached, provide a summary of the architectural decisions made.\n\
-             Identify any trace IDs that are noisy terminal retries, compilation noise, or failures that can be safely pruned.\n\n\
-             Traces:\n{}",
-            trace_text
-        );
-
-        match self.extractor.extract(&evaluation_prompt).await {
-            Ok(result) => {
-                // Prune noisy traces
-                if !result.noisy_trace_ids.is_empty() {
-                    if let Err(e) = memory_engine.prune_traces(result.noisy_trace_ids.clone()).await {
-                        eprintln!("Failed to prune traces: {}", e);
-                    }
-                }
-
-                // Log macro memory if milestone reached
-                if result.milestone_reached {
-                    if let Some(summary) = &result.milestone_summary {
-                        let milestone_title = format!("Milestone at {}", chrono::Utc::now().to_rfc3339());
-                        if let Err(e) = memory_engine.log_macro_memory(&milestone_title, summary).await {
-                            eprintln!("Failed to log macro memory: {}", e);
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("Extraction failed: {}", e);
-            }
-        }
-
-        Ok(())
+    let mut trace_text = String::new();
+    for (id, prompt, completion) in &traces {
+        trace_text.push_str(&format!("Trace ID: {}\nPrompt: {}\nCompletion: {}\n\n", id, prompt, completion));
     }
+
+    let evaluation_prompt = format!(
+        "Evaluate the following execution traces and determine if a major milestone has been reached.\n\
+         If a milestone has been reached, provide a summary of the architectural decisions made.\n\
+         Identify any trace IDs that are noisy terminal retries, compilation noise, or failures that can be safely pruned.\n\n\
+         Traces:\n{}",
+        trace_text
+    );
+
+    let result = backend.evaluate(&evaluation_prompt).await?;
+
+    if !result.noisy_trace_ids.is_empty() {
+        if let Err(e) = memory_engine.prune_traces(result.noisy_trace_ids.clone()).await {
+            eprintln!("Failed to prune traces: {}", e);
+        }
+    }
+
+    if result.milestone_reached {
+        if let Some(summary) = &result.milestone_summary {
+            let milestone_title = format!("Milestone at {}", chrono::Utc::now().to_rfc3339());
+            if let Err(e) = memory_engine.log_macro_memory(&milestone_title, summary).await {
+                eprintln!("Failed to log macro memory: {}", e);
+            }
+        }
+    }
+
+    Ok(())
 }

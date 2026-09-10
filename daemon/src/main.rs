@@ -1,4 +1,3 @@
-use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -6,17 +5,14 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::accept_async;
 use futures_util::{StreamExt, SinkExt};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
-use rig::providers::openai::Client;
-use rig::completion::Prompt;
-use tools::BashExecutor;
-use wasm::WasmTransformer;
-use memory::{MemoryEngine, HeuristicEvaluator, EvaluationResult};
+use memory::MemoryEngine;
 
 mod tools;
 mod wasm;
 mod memory;
+mod provider;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct RpcRequest {
@@ -42,38 +38,97 @@ struct RpcError {
     message: String,
 }
 
+async fn build_context(memory: &Arc<MemoryEngine>, prompt: &str) -> String {
+    match memory.get_macro_memories(5).await {
+        Ok(mems) if !mems.is_empty() => {
+            let body = mems
+                .into_iter()
+                .map(|(m, c)| format!("## {}\n{}", m, c))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            format!("### Architectural memory (prior milestones)\n{}\n\n### Current task\n{}", body, prompt)
+        }
+        _ => prompt.to_string(),
+    }
+}
+
+async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &Arc<MemoryEngine>) -> RpcResponse {
+    fn ok(result: Value, id: Option<Value>) -> RpcResponse {
+        RpcResponse { jsonrpc: "2.0".into(), result: Some(result), error: None, id }
+    }
+    fn err(code: i32, message: String, id: Option<Value>) -> RpcResponse {
+        RpcResponse { jsonrpc: "2.0".into(), result: None, error: Some(RpcError { code, message }), id }
+    }
+
+    match req.method.as_str() {
+        "status" => ok(json!({ "provider": backend.describe() }), req.id),
+        "exec" => {
+            let cmd = req.params.as_ref().and_then(|p| p.get("command").and_then(|c| c.as_str())).map(|s| s.trim().to_string());
+            match cmd {
+                Some(c) if !c.is_empty() => {
+                    let r = tools::run_trusted(&c).await;
+                    ok(json!({ "stdout": r.stdout, "stderr": r.stderr, "exit_code": r.exit_code, "timed_out": r.timed_out }), req.id)
+                }
+                _ => err(-32602, "Missing 'command' in params".into(), req.id),
+            }
+        }
+        "chat" => {
+            let prompt = req.params.as_ref().and_then(|p| p.get("prompt").and_then(|p| p.as_str())).map(|s| s.to_string());
+            match prompt {
+                Some(p) if !p.trim().is_empty() => {
+                    let full = build_context(memory, &p).await;
+                    match backend.chat(&full).await {
+                        Ok(completion) => {
+                            if let Err(e) = memory.log_trace(&p, &completion).await {
+                                eprintln!("Failed to log trace to memory: {}", e);
+                            }
+                            // Periodically evaluate traces (every 5th) to detect
+                            // milestones and prune noise; runs detached.
+                            let backend2 = Arc::clone(backend);
+                            let memory2 = Arc::clone(memory);
+                            tokio::spawn(async move {
+                                let recent = memory2.get_recent_traces(1).await.map_err(|e| e.to_string());
+                                if let Ok(recent) = recent {
+                                    if let Some((id, _, _)) = recent.first() {
+                                        if id % 5 == 0 {
+                                            let traces = memory2.get_recent_traces(10).await.map_err(|e| e.to_string());
+                                            if let Ok(traces) = traces {
+                                                if let Err(e) = memory::evaluate_and_process(&backend2, &memory2, traces).await {
+                                                    eprintln!("Background evaluation failed: {}", e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+                            ok(json!(completion), req.id)
+                        }
+                        Err(e) => err(-32603, format!("Agent error: {}", e), req.id),
+                    }
+                }
+                _ => err(-32602, "Missing 'prompt' in params".into(), req.id),
+            }
+        }
+        _ => err(-32601, "Method not found".into(), req.id),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let port = env::var("PORT").unwrap_or_else(|_| "8080".to_string());
+    let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
     let addr = format!("127.0.0.1:{}", port);
 
-    let openai_api_key = env::var("OPENAI_API_KEY").unwrap_or_else(|_| "dummy-key".to_string());
-    let openai_client = Client::new(&openai_api_key);
-
-    let agent = openai_client
-        .agent("gpt-4")
-        .preamble("You are an autonomous orchestrator daemon running on a Linux userland.")
-        .tool(BashExecutor::default())
-        .tool(WasmTransformer::default())
-        .build();
-    let agent = Arc::new(agent);
-
+    let backend = Arc::new(provider::Backend::resolve());
     let memory_engine = Arc::new(MemoryEngine::new("oss_memory.db").await?);
+    println!("Listening on: {} ({})", addr, backend.describe());
 
-    // Initialize the Heuristic Evaluator
-    let evaluator = Arc::new(HeuristicEvaluator::new(
-        openai_client.extractor::<EvaluationResult>("gpt-4").build()
-    ));
-
-    println!("Listening on: {}", addr);
     let listener = TcpListener::bind(&addr).await?;
 
     while let Ok((stream, _)) = listener.accept().await {
-        let agent = Arc::clone(&agent);
+        let backend = Arc::clone(&backend);
         let memory = Arc::clone(&memory_engine);
-        let evaluator = Arc::clone(&evaluator);
 
         tokio::spawn(async move {
             // Peek (without consuming) to decide whether this is a WebSocket
@@ -108,117 +163,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Ok(msg) = msg {
                     if msg.is_text() {
                         let text = msg.to_text().unwrap();
-                        println!("Received: {}", text);
-
                         let response = match serde_json::from_str::<RpcRequest>(text) {
-                            Ok(req) => {
-                                println!("Parsed JSON-RPC request: {:?}", req);
-
-                                if req.method == "chat" {
-                                    if let Some(params) = &req.params {
-                                        if let Some(prompt) = params.get("prompt").and_then(|p| p.as_str()) {
-                                            match agent.prompt(prompt).await {
-                                                Ok(completion) => {
-                                                    let completion_val = serde_json::json!(completion);
-                                                    if let Err(e) = memory.log_trace(prompt, &completion_val).await {
-                                                        eprintln!("Failed to log trace to memory: {}", e);
-                                                    }
-
-                                                    // Periodically evaluate traces instead of every single prompt
-                                                    // For now, we can check a simple mod condition on a static or passed counter,
-                                                    // but to avoid global mutable state we evaluate if the recent traces count is > 0
-                                                    // and we limit evaluating to avoid spamming the LLM
-                                                    let memory_clone = Arc::clone(&memory);
-                                                    let evaluator_clone = Arc::clone(&evaluator);
-                                                    tokio::spawn(async move {
-                                                        let trace_count_res = memory_clone.get_recent_traces(1).await.map_err(|e| e.to_string());
-                                                        if let Ok(recent) = trace_count_res {
-                                                            if !recent.is_empty() && recent[0].0 % 5 == 0 {
-                                                                let traces_result = memory_clone.get_recent_traces(10).await.map_err(|e| e.to_string());
-                                                                match traces_result {
-                                                                    Ok(traces) => {
-                                                                        if let Err(e) = evaluator_clone.evaluate_and_process(memory_clone, traces).await {
-                                                                            eprintln!("Background evaluation failed: {}", e);
-                                                                        }
-                                                                    }
-                                                                    Err(e) => {
-                                                                        eprintln!("Failed to get recent traces for evaluation: {}", e);
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    });
-
-                                                    RpcResponse {
-                                                        jsonrpc: "2.0".to_string(),
-                                                        result: Some(completion_val),
-                                                        error: None,
-                                                        id: req.id,
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    RpcResponse {
-                                                        jsonrpc: "2.0".to_string(),
-                                                        result: None,
-                                                        error: Some(RpcError {
-                                                            code: -32603,
-                                                            message: format!("Agent error: {}", e),
-                                                        }),
-                                                        id: req.id,
-                                                    }
-                                                }
-                                            }
-                                        } else {
-                                            RpcResponse {
-                                                jsonrpc: "2.0".to_string(),
-                                                result: None,
-                                                error: Some(RpcError {
-                                                    code: -32602,
-                                                    message: "Missing 'prompt' in params".to_string(),
-                                                }),
-                                                id: req.id,
-                                            }
-                                        }
-                                    } else {
-                                        RpcResponse {
-                                            jsonrpc: "2.0".to_string(),
-                                            result: None,
-                                            error: Some(RpcError {
-                                                code: -32602,
-                                                message: "Missing params".to_string(),
-                                            }),
-                                            id: req.id,
-                                        }
-                                    }
-                                } else {
-                                    RpcResponse {
-                                        jsonrpc: "2.0".to_string(),
-                                        result: None,
-                                        error: Some(RpcError {
-                                            code: -32601,
-                                            message: "Method not found".to_string(),
-                                        }),
-                                        id: req.id,
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                println!("Failed to parse JSON-RPC: {}", e);
-                                RpcResponse {
-                                    jsonrpc: "2.0".to_string(),
-                                    result: None,
-                                    error: Some(RpcError {
-                                        code: -32700,
-                                        message: "Parse error".to_string(),
-                                    }),
-                                    id: None,
-                                }
-                            }
+                            Ok(req) => handle_rpc(req, &backend, &memory).await,
+                            Err(_) => RpcResponse {
+                                jsonrpc: "2.0".into(),
+                                result: None,
+                                error: Some(RpcError { code: -32700, message: "Parse error".into() }),
+                                id: None,
+                            },
                         };
 
                         let response_str = serde_json::to_string(&response).unwrap();
                         if let Err(e) = ws_sender.send(tokio_tungstenite::tungstenite::Message::Text(response_str)).await {
-                            println!("Error sending message: {}", e);
+                            eprintln!("Error sending message: {}", e);
                             break;
                         }
                     }
@@ -232,7 +189,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Serve a small landing page so `http://127.0.0.1:$PORT` in the app's WebView
 /// renders the orchestrator UI instead of a connection error. The page then
-/// opens the WebSocket on the same port for JSON-RPC `chat`.
+/// opens the WebSocket on the same port for JSON-RPC (chat, exec, status).
 async fn serve_http(mut stream: TcpStream) {
     let body = r#"<!doctype html>
 <html>
@@ -241,43 +198,62 @@ async fn serve_http(mut stream: TcpStream) {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ForgeRig</title>
 <style>
-  body { font-family: sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; background: #0f1115; color: #e6e6e6; }
+  body { font-family: sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; background: #0f1115; color: #e6e6e6; }
   h1 { font-size: 1.4rem; }
-  #status { color: #7cf787; }
+  #status { color: #7cf787; font-size: .9rem; }
+  #provider { color: #8ab4f8; font-size: .8rem; font-family: monospace; }
   input, pre { width: 100%; box-sizing: border-box; }
-  input { padding: .6rem; margin: .5rem 0; font-size: 1rem; }
+  input { padding: .6rem; margin: .5rem 0; font-size: 1rem; background: #1b1f27; color: #e6e6e6; border: 1px solid #333; border-radius: 6px; }
   pre { background: #1b1f27; border-radius: 6px; padding: .8rem; white-space: pre-wrap; word-break: break-word; min-height: 4rem; }
+  .hint { color: #777; font-size: .75rem; margin-top: .25rem; }
 </style>
 </head>
 <body>
 <h1>ForgeRig</h1>
 <p id="status">Connecting…</p>
-<input id="prompt" placeholder="Ask the orchestrator daemon…" autofocus>
+<p id="provider"></p>
+<div>
+  <input id="prompt" placeholder="Ask, or type !command to run in the container…" autofocus>
+  <div class="hint">Messages starting with ! run directly in the container and never reach the model — put auth tokens/secrets here.</div>
+</div>
 <pre id="out">Ready.</pre>
 <script>
-  var ws=null, label=document.getElementById('status'), out=document.getElementById('out');
+  var ws=null, label=document.getElementById('status'), out=document.getElementById('out'), prov=document.getElementById('provider');
+  var pending=null, reqId=0;
   function connect(){
     label.textContent='Connecting…';
     ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/');
-    ws.onopen=function(){ label.textContent='Connected to ForgeRig daemon'; };
+    ws.onopen=function(){ label.textContent='Connected to ForgeRig daemon'; send('status',{}); };
     ws.onclose=function(){ label.textContent='Disconnected — retrying…'; setTimeout(connect,1000); };
     ws.onmessage=function(e){
-      var d;
-      try { d=JSON.parse(e.data); } catch(_) { return; }
-      if (d.result) out.textContent=JSON.stringify(d.result,null,2);
-      else if (d.error) out.textContent='Error: '+d.error.message;
+      var d; try { d=JSON.parse(e.data); } catch(_) { return; }
+      if (d.error) { out.textContent='Error: '+d.error.message; return; }
+      var r=d.result;
+      if (pending==='status') { prov.textContent='Provider: '+(r && r.provider ? r.provider : 'unknown'); }
+      else if (pending==='exec') {
+        var t='';
+        if (r && r.stdout) t+=r.stdout;
+        if (r && r.stderr) t+='\n[stderr]\n'+r.stderr;
+        if (r && (r.exit_code!==0 || r.timed_out)) t+='\n[exit '+r.exit_code+(r.timed_out?' timed out':'')+']';
+        out.textContent=t||'(no output)';
+      } else { out.textContent=typeof r==='string' ? r : JSON.stringify(r,null,2); }
+      pending=null;
     };
   }
+  function send(method, params){
+    if (!ws || ws.readyState!==1) { out.textContent='Not connected to daemon yet.'; return; }
+    pending=method; reqId++;
+    ws.send(JSON.stringify({jsonrpc:'2.0',method:method,params:params,id:reqId}));
+    if (method!=='status') out.textContent=method==='chat'?'Thinking…':'Running…';
+  }
   document.getElementById('prompt').addEventListener('keydown',function(e){
-    if (e.key==='Enter') send();
-  });
-  function send(){
+    if (e.key!=='Enter') return;
     var p=document.getElementById('prompt').value;
     if (!p) return;
-    if (!ws || ws.readyState!==1) { out.textContent='Not connected to daemon yet.'; return; }
-    ws.send(JSON.stringify({jsonrpc:'2.0',method:'chat',params:{prompt:p},id:1}));
-    out.textContent='Thinking…';
-  }
+    document.getElementById('prompt').value='';
+    if (p.charAt(0)==='!') send('exec',{command:p.slice(1).trim()});
+    else send('chat',{prompt:p});
+  });
   connect();
 </script>
 </body>
