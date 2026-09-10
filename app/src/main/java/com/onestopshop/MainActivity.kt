@@ -344,11 +344,6 @@ class MainActivity : AppCompatActivity() {
         }
 
         @JavascriptInterface
-        fun getLogFilePath(): String {
-            return "Downloads/${AssetExtractor.sharedLogFileName()}"
-        }
-
-        @JavascriptInterface
         fun installNow() {
             if (phase == "installing") {
                 return
@@ -473,17 +468,6 @@ class MainActivity : AppCompatActivity() {
                         "nothing serves HTTP. See Downloads/${AssetExtractor.sharedLogFileName()} for details."
                 }
             }
-        }
-
-        @JavascriptInterface
-        fun startContainer() {
-            startContainerInternal()
-        }
-
-        @JavascriptInterface
-        fun isInstalled(): Boolean {
-            val entrypoint = File(context.filesDir, "ubuntu_rootfs/root/start.sh")
-            return entrypoint.exists()
         }
     }
 
