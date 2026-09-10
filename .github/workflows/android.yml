@@ -89,7 +89,7 @@ jobs:
               # workspace: a poison archive must never land in the APK.
               STAGE="$DL/stage"; rm -rf "$STAGE"; mkdir -p "$STAGE"
               OK=1
-              FILES="assets/ubuntu-rootfs.bin assets/libtalloc.so.2 jniLibs/arm64-v8a/libproot.so jniLibs/arm64-v8a/libproot_loader.so jniLibs/arm64-v8a/libandroid-shmem.so"
+              FILES="assets/ubuntu-rootfs.bin assets/libtalloc.so.2 jniLibs/arm64-v8a/libproot.so jniLibs/arm64-v8a/libproot_loader.so jniLibs/arm64-v8a/libandroid-shmem.so jniLibs/arm64-v8a/libforgerig_daemon.so"
               for F in $FILES; do
                 EXP="$(python3 -c "import json;print(json.load(open('$MAN'))['files'].get('$F',''))" 2>/dev/null || true)"
                 GOT="$(tar xzf "$DL/container-assets.tar.gz" -O "$F" 2>/dev/null | sha256sum | cut -d' ' -f1)"
@@ -99,14 +99,16 @@ jobs:
                 fi
               done
               if [ "$OK" = 1 ]; then
-                # Quality gate: the rootfs must contain the baked daemon and the
-                # proot stack must keep both DT_NEEDED runtimes, or a poison
-                # release could ship a broken container. NOTE: prepare-assets.sh
-                # packs with `tar -C staging .`, so members carry a `./` prefix
-                # (./usr/bin/...); the daemon match must NOT be ^-anchored.
+                # Quality gate: the daemon jniLib must be a valid ELF, the rootfs must be
+                # glibc (Ubuntu), and the proot stack must keep both DT_NEEDED
+                # runtimes, or a poison release could ship a broken container.
+                # NOTE: prepare-assets.sh packs with `tar -C staging .`, so members
+                # carry a `./` prefix (./usr/bin/...); matches must NOT be ^-anchored.
                 tar xzf "$DL/container-assets.tar.gz" -O assets/ubuntu-rootfs.bin > "$STAGE/rootfs.bin" 2>/dev/null
                 tar xzf "$DL/container-assets.tar.gz" -O jniLibs/arm64-v8a/libproot.so > "$STAGE/libproot.so" 2>/dev/null
-                if ! tar tzf "$STAGE/rootfs.bin" 2>/dev/null | grep -q 'usr/bin/forgerig-daemon$' \
+                tar xzf "$DL/container-assets.tar.gz" -O jniLibs/arm64-v8a/libforgerig_daemon.so > "$STAGE/libforgerig_daemon.so" 2>/dev/null
+                if ! readelf -h "$STAGE/libforgerig_daemon.so" >/dev/null 2>&1 \
+                   || ! tar tzf "$STAGE/rootfs.bin" 2>/dev/null | grep -q 'aarch64-linux-gnu/libc.so.6$' \
                    || ! readelf -d "$STAGE/libproot.so" 2>/dev/null | grep -q 'NEEDED.*libtalloc.so.2' \
                    || ! readelf -d "$STAGE/libproot.so" 2>/dev/null | grep -q 'NEEDED.*libandroid-shmem.so'; then
                   echo "container-assets release failed quality gate; rebuilding"
@@ -191,7 +193,7 @@ jobs:
           ( cd "$ASSETS" && tar czf "$OUT/container-assets.tar.gz" \
               assets/ubuntu-rootfs.bin assets/libtalloc.so.2 \
               jniLibs/arm64-v8a/libproot.so jniLibs/arm64-v8a/libproot_loader.so \
-              jniLibs/arm64-v8a/libandroid-shmem.so )
+              jniLibs/arm64-v8a/libandroid-shmem.so jniLibs/arm64-v8a/libforgerig_daemon.so )
           # PR runs check out the synthetic refs/pull/N/merge ref, so name the
           # manifest after the real PR head SHA (same idiom as the APK publish).
           SHA="${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
@@ -209,6 +211,7 @@ jobs:
               "jniLibs/arm64-v8a/libproot.so",
               "jniLibs/arm64-v8a/libproot_loader.so",
               "jniLibs/arm64-v8a/libandroid-shmem.so",
+              "jniLibs/arm64-v8a/libforgerig_daemon.so",
           ]:
               with open(f"{assets}/{rel}", "rb") as fh:
                   files[rel] = hashlib.sha256(fh.read()).hexdigest()
@@ -227,7 +230,7 @@ jobs:
           gh release create assets-latest "$OUT/container-assets.tar.gz" "$OUT/assets-manifest.json" \
             --repo "${{ github.repository }}" \
             --title "ForgeRig container assets (latest)" \
-            --notes "Rolling release of the packaged rootfs + proot stack + baked daemon. Re-published whenever the container assets rebuild; restored by runs with identical daemon/ and scripts/prepare-assets.sh trees."
+            --notes "Rolling release of the packaged rootfs + proot stack + host-side daemon. Re-published whenever the container assets rebuild; restored by runs with identical daemon/ and scripts/prepare-assets.sh trees."
 
       - name: Show sccache stats
         if: always()
