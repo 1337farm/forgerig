@@ -72,6 +72,41 @@ class AssetExtractor(private val context: Context) {
             return "$libs:$deps"
         }
 
+        // The Alpine minirootfs ships no /etc/resolv.conf, so musl inside the
+        // guest cannot resolve anything (DNS lookup failure on every API call).
+        // Generate one from the device's current DNS servers (respects VPN /
+        // private DNS) with public fallback, refreshed on every launch. The
+        // caller bind-mounts the result over the guest's /etc/resolv.conf.
+        fun writeResolvConf(context: Context): File? {
+            return try {
+                val servers = LinkedHashSet<String>()
+                try {
+                    val proc = Runtime.getRuntime().exec(arrayOf("getprop"))
+                    proc.inputStream.bufferedReader().useLines { lines ->
+                        lines.forEach { line ->
+                            val m = Regex("""\[(?:net|dhcp)[^]]*dns\d*\]: \[(.+)]""").find(line.trim())
+                            val ip = m?.groupValues?.getOrNull(1)?.trim()
+                            if (!ip.isNullOrEmpty() && ip != "0.0.0.0" && ip != "::") servers.add(ip)
+                        }
+                    }
+                    proc.waitFor()
+                } catch (e: Exception) {
+                    Log.w(TAG, "getprop for DNS failed: $e")
+                }
+                if (servers.isEmpty()) {
+                    servers.add("8.8.8.8")
+                    servers.add("1.1.1.1")
+                }
+                val file = File(context.filesDir, "resolv.conf")
+                file.writeText(servers.joinToString("\n", postfix = "\n") { "nameserver $it" })
+                logShared(context, "resolv.conf: ${servers.joinToString(",")}")
+                file
+            } catch (e: Exception) {
+                Log.w(TAG, "writeResolvConf failed: $e")
+                null
+            }
+        }
+
         // One-line diagnosis of the container entrypoint: shebang plus whether
         // the guest interpreter resolves (following one symlink level). Logged
         // before every launch; an unresolvable interpreter means proot will die
