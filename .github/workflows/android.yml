@@ -41,6 +41,10 @@ jobs:
     timeout-minutes: 120
     permissions:
       contents: write
+      # For the cargo target + sccache saves below (cache-cargo/setup-sccache
+      # use the actions backend). Without this the composites only "restore"
+      # into an empty cache and every run is cold.
+      actions: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -55,15 +59,87 @@ jobs:
       - name: Grant execute permission
         run: chmod +x gradlew scripts/prepare-assets.sh
 
+      # --- Container-assets cache (rolling release restore) ------------------
+      # The container assets (rootfs + proot stack + baked daemon) are the slow
+      # part of every run: cargo cross-compile plus Alpine/Termux downloads.
+      # Publish them as a source-tree-bound rolling release (same pattern as
+      # dep-*-latest/engine-latest in flashforge-farm) and restore before paying
+      # that cost. The bundle only depends on daemon/ + scripts/prepare-assets.sh
+      # (subtree SHAs), so UI-only PRs and the post-merge main dispatch reuse
+      # the last verified pack instead of rebuilding.
+      - name: Restore container assets from release
+        id: assets-rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          HIT=0
+          DL="$RUNNER_TEMP/rel-assets"; mkdir -p "$DL"
+          if gh release download assets-latest --pattern 'container-assets.tar.gz' --pattern 'assets-manifest.json' \
+               --dir "$DL" --clobber >/dev/null 2>&1; then
+            MAN="$DL/assets-manifest.json"
+            DAEMON_SRC="$(git rev-parse HEAD:daemon 2>/dev/null || true)"
+            PREPARE_SRC="$(git rev-parse HEAD:scripts/prepare-assets.sh 2>/dev/null || true)"
+            WANT_DAEMON="$(python3 -c "import json;print(json.load(open('$MAN')).get('daemon_src',''))" 2>/dev/null || true)"
+            WANT_PREPARE="$(python3 -c "import json;print(json.load(open('$MAN')).get('prepare_src',''))" 2>/dev/null || true)"
+            if [ -z "$DAEMON_SRC" ] || [ -z "$PREPARE_SRC" ] \
+               || [ "$DAEMON_SRC" != "$WANT_DAEMON" ] || [ "$PREPARE_SRC" != "$WANT_PREPARE" ]; then
+              echo "container-asset sources changed since release (daemon/prepare $DAEMON_SRC/$PREPARE_SRC vs $WANT_DAEMON/$WANT_PREPARE); rebuilding"
+            else
+              # Verify member shas from the archive WITHOUT touching the
+              # workspace: a poison archive must never land in the APK.
+              STAGE="$DL/stage"; rm -rf "$STAGE"; mkdir -p "$STAGE"
+              OK=1
+              FILES="assets/ubuntu-rootfs.bin assets/libtalloc.so.2 jniLibs/arm64-v8a/libproot.so jniLibs/arm64-v8a/libproot_loader.so jniLibs/arm64-v8a/libandroid-shmem.so"
+              for F in $FILES; do
+                EXP="$(python3 -c "import json;print(json.load(open('$MAN'))['files'].get('$F',''))" 2>/dev/null || true)"
+                GOT="$(tar xzf "$DL/container-assets.tar.gz" -O "$F" 2>/dev/null | sha256sum | cut -d' ' -f1)"
+                if [ -z "$EXP" ] || [ "$EXP" != "$GOT" ]; then
+                  echo "container-asset $F sha mismatch (got=$GOT); rebuilding"
+                  OK=0; break
+                fi
+              done
+              if [ "$OK" = 1 ]; then
+                # Quality gate: the rootfs must contain the baked daemon and the
+                # proot stack must keep both DT_NEEDED runtimes, or a poison
+                # release could ship a broken container.
+                tar xzf "$DL/container-assets.tar.gz" -O assets/ubuntu-rootfs.bin > "$STAGE/rootfs.bin" 2>/dev/null
+                tar xzf "$DL/container-assets.tar.gz" -O jniLibs/arm64-v8a/libproot.so > "$STAGE/libproot.so" 2>/dev/null
+                if ! tar tzf "$STAGE/rootfs.bin" 2>/dev/null | grep -q '^usr/bin/forgerig-daemon$' \
+                   || ! readelf -d "$STAGE/libproot.so" 2>/dev/null | grep -q 'NEEDED.*libtalloc.so.2' \
+                   || ! readelf -d "$STAGE/libproot.so" 2>/dev/null | grep -q 'NEEDED.*libandroid-shmem.so'; then
+                  echo "container-assets release failed quality gate; rebuilding"
+                else
+                  tar xzf "$DL/container-assets.tar.gz" -C "$GITHUB_WORKSPACE/app/src/main"
+                  HIT=1
+                  echo "container assets release verified and staged (no rebuild)"
+                fi
+              fi
+            fi
+          else
+            echo "no usable assets-latest release; continuing"
+          fi
+          echo "hit=$HIT" >> "$GITHUB_OUTPUT"
+
+      - name: Compute native build need
+        id: build-needed
+        run: |
+          NEED=1
+          if [ "${{ steps.assets-rel.outputs.hit }}" = "1" ]; then
+            NEED=0
+          fi
+          echo "needed=$NEED" >> "$GITHUB_OUTPUT"
+
       # Distributed Rust compiler cache (GHA backend). Warms cold builds;
       # per-branch incremental state comes from the cargo target cache below.
       - name: Setup sccache
+        if: steps.build-needed.outputs.needed == '1'
         uses: 1337farm/actions/setup-sccache@v1
 
       # Caches ~/.cargo/registry and daemon/target. The shared-key pins the
       # cross target + feature set: bump it if either changes, otherwise a
       # stale cache would silently rebuild with the wrong flags.
       - name: Cache Rust build
+        if: steps.build-needed.outputs.needed == '1'
         uses: 1337farm/actions/cache-cargo@v1
         with:
           workspaces: daemon
@@ -74,9 +150,11 @@ jobs:
       # and re-seeds the cache. Exports CC/AR_*_aarch64_unknown_linux_musl and
       # prepends bin/ to PATH for the build step below.
       - name: Cache musl cross toolchain
+        if: steps.build-needed.outputs.needed == '1'
         uses: 1337farm/actions/cache-musl-toolchain@v1
 
       - name: Prepare container assets (proot + rootfs + daemon)
+        if: steps.build-needed.outputs.needed == '1'
         env:
           RUSTC_WRAPPER: sccache
           SCCACHE_GHA_ENABLED: "true"
@@ -94,6 +172,61 @@ jobs:
           FORGERIG_CARGO_FEATURES=vendored-openssl \
           bash scripts/prepare-assets.sh
 
+      - name: Publish container-assets release
+        # Anything that had to rebuild the container assets backfills the
+        # rolling tag on ANY branch (PR / push / dispatch), like the APK
+        # publish: a later run with the same daemon/prepare source restores
+        # instead of downloading Alpine + Termux proot and cross-compiling.
+        # Poison-proof: restored releases never republish (rel hit => skip),
+        # and only a fresh build that passed prepare-assets reaches this step.
+        if: steps.assets-rel.outputs.hit != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          OUT="$RUNNER_TEMP/assets-release"; mkdir -p "$OUT"
+          ASSETS="$GITHUB_WORKSPACE/app/src/main"
+          ( cd "$ASSETS" && tar czf "$OUT/container-assets.tar.gz" \
+              assets/ubuntu-rootfs.bin assets/libtalloc.so.2 \
+              jniLibs/arm64-v8a/libproot.so jniLibs/arm64-v8a/libproot_loader.so \
+              jniLibs/arm64-v8a/libandroid-shmem.so )
+          # PR runs check out the synthetic refs/pull/N/merge ref, so name the
+          # manifest after the real PR head SHA (same idiom as the APK publish).
+          SHA="${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+          SHA="$(printf '%s' "$SHA" | cut -c1-10)"
+          DAEMON_SRC="$(git rev-parse HEAD:daemon)"
+          PREPARE_SRC="$(git rev-parse HEAD:scripts/prepare-assets.sh)"
+          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          python3 - "$OUT" "$ASSETS" "$SHA" "$DATE" "$DAEMON_SRC" "$PREPARE_SRC" <<'PY'
+          import hashlib, json, sys
+          out, assets, sha, date, daemon_src, prepare_src = sys.argv[1:]
+          files = {}
+          for rel in [
+              "assets/ubuntu-rootfs.bin",
+              "assets/libtalloc.so.2",
+              "jniLibs/arm64-v8a/libproot.so",
+              "jniLibs/arm64-v8a/libproot_loader.so",
+              "jniLibs/arm64-v8a/libandroid-shmem.so",
+          ]:
+              with open(f"{assets}/{rel}", "rb") as fh:
+                  files[rel] = hashlib.sha256(fh.read()).hexdigest()
+          manifest = {
+              "commit": sha,
+              "built_at": date,
+              "daemon_src": daemon_src,
+              "prepare_src": prepare_src,
+              "files": files,
+          }
+          with open(f"{out}/assets-manifest.json", "w") as fh:
+              json.dump(manifest, fh, indent=2)
+              fh.write("\n")
+          PY
+          gh release delete assets-latest --yes --cleanup-tag --repo "${{ github.repository }}" 2>/dev/null || true
+          gh release create assets-latest "$OUT/container-assets.tar.gz" "$OUT/assets-manifest.json" \
+            --repo "${{ github.repository }}" \
+            --title "ForgeRig container assets (latest)" \
+            --notes "Rolling release of the packaged rootfs + proot stack + baked daemon. Re-published whenever the container assets rebuild; restored by runs with identical daemon/ and scripts/prepare-assets.sh trees."
+
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
@@ -107,7 +240,10 @@ jobs:
         with:
           name: ForgeRig-Release-APK
           path: app/build/outputs/apk/release/forgerig-*.apk
-          retention-days: 7
+          # 30-day retention protects the post-merge reuse window: a merged
+          # PR's APK artifact stays downloadable while the dispatched main
+          # rebuild/republish lands.
+          retention-days: 30
 
       - name: Publish APK release
         if: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') }}
