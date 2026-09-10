@@ -32,21 +32,33 @@ A branch cut from an old `main` will be CONFLICTING by the time you push.
   `.bin` extension) — NOT `.tar.gz`. AGP auto-gunzips `.gz` assets at merge
   time, which renames the entry to `ubuntu-rootfs.tar` inside the APK and
   breaks `AssetManager.open("ubuntu-rootfs.tar.gz")` with FileNotFoundException.
-- proot + loader ship as `app/src/main/jniLibs/arm64-v8a/libproot{,_loader}.so`
-  (NOT assets): some devices refuse execve() on app-chmodded filesDir payloads
-  (error=13) with the +x bit correctly set — only PackageManager-extracted
+- proot + loader + daemon ship as `app/src/main/jniLibs/arm64-v8a/` native
+  libs (libproot.so, libproot_loader.so, libandroid-shmem.so,
+  libforgerig_daemon.so) — NOT assets: some devices refuse execve() on
+  app-chmodded filesDir payloads (error=13), so only PackageManager-extracted
   native libs run everywhere. `packaging { jniLibs { useLegacyPackaging = true } }`
-  in app/build.gradle.kts pins extraction at install (the manifest attribute
-  is deprecated).
-  `AssetExtractor.resolveProotFile/resolveLoaderFile` are the single source
-  of truth for their runtime paths.
+  pins extraction at install.
+- The daemon runs HOST-side: `ContainerService` execs `libforgerig_daemon.so`
+  directly (static musl) and sets `CONTAINER_PROOT`/`CONTAINER_ROOTFS`/
+  `PROOT_LOADER`/`CONTAINER_RESOLV_CONF`, so the daemon drives the work guest
+  through proot. There is no `root/start.sh` entrypoint anymore.
+- The work guest rootfs is Ubuntu/glibc (debootstrap'd aarch64 on the CI
+  runner via qemu-user-static, with a raw ubuntu-base tarball fallback), NOT
+  Alpine. `scripts/prepare-assets.sh` `--include` list is the way to add guest
+  packages (bash, git, python3, …). Keep it glibc: gh, node, Lean/elan all ship
+  glibc binaries.
+- Ubuntu base has hard links (usr/bin/perl etc.); `AssetExtractor` recreates
+  BOTH symlinks and hardlinks (its symlink handling is what fixed ENOEXEC,
+  hardlink handling is what keeps perl/gunzip whole).
 - Termux-built proot is dynamically linked (`DT_NEEDED libtalloc.so.2`,
   `libandroid-shmem.so`) with RUNPATH `/data/data/com.termux/...`. That dir is
   unreadable to the app UID, so `prepare-assets.sh` ships `libandroid-shmem.so`
   as a jniLib. `libtalloc.so.2` has no `.so` extension — AGP drops non-`.so`
   names from merged jniLibs — so it ships as `assets/libtalloc.so.2` and
   `AssetExtractor` extracts it to `filesDir/native_deps/`. `ContainerService`
-  sets `LD_LIBRARY_PATH=nativeLibraryDir:filesDir/native_deps` before exec.
+  sets `LD_LIBRARY_PATH=nativeLibraryDir:filesDir/native_deps` before exec,
+  and the daemon sets a guest `PATH=/usr/local/sbin:...:/bin` + `HOME=/root`
+  per proot invocation (the host PATH is meaningless inside the guest).
   Both must ride along with any proot upgrade.
 - `AssetExtractor` opens `ubuntu-rootfs.bin` first, then falls back to
   `.tar.gz` / plain `.tar` for older APKs. Keep all three in sync across
