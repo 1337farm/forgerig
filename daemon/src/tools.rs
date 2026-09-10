@@ -1,9 +1,20 @@
 use serde::{Deserialize, Serialize};
 use rig::tool::Tool;
 use tokio::process::Command;
-use std::process::Output;
+use tokio::time::{timeout, Duration};
 use thiserror::Error;
 use serde_json::json;
+
+/// CPU-seconds cap for sandboxed (untrusted) commands.
+const SANDBOX_CPU_SEC: u64 = 120;
+/// Virtual-memory cap (KiB) for sandboxed commands (512 MiB).
+const SANDBOX_MEM_KIB: u64 = 524_288;
+/// Wall-clock cap for sandboxed commands.
+const SANDBOX_TIMEOUT: Duration = Duration::from_secs(120);
+/// Wall-clock cap for trusted (`!`) commands.
+const TRUSTED_TIMEOUT: Duration = Duration::from_secs(600);
+
+const SANDBOX_WORKDIR: &str = "/root/workspace";
 
 #[derive(Error, Debug)]
 pub enum BashExecutorError {
@@ -17,32 +28,108 @@ pub struct BashExecutorArgs {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct BashExecutorResult {
+pub struct ShellResult {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: Option<i32>,
+    pub timed_out: bool,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct BashExecutor;
+
+/// Build the host `Command` that runs `command` in the work guest.
+///
+/// When `CONTAINER_PROOT` + `CONTAINER_ROOTFS` are set (the daemon running
+/// host-side), the command is wrapped in proot against the work rootfs;
+/// otherwise it runs directly via `sh` (the daemon itself living in-guest, or
+/// local dev). `sandbox` prepends resource limits and a disposable workdir so
+/// model-generated commands stay contained.
+fn build_cmd(command: &str, sandbox: bool) -> Command {
+    let line = if sandbox {
+        format!(
+            "ulimit -t {} -v {} 2>/dev/null; mkdir -p {} 2>/dev/null; cd {} 2>/dev/null || true; {}",
+            SANDBOX_CPU_SEC, SANDBOX_MEM_KIB, SANDBOX_WORKDIR, SANDBOX_WORKDIR, command
+        )
+    } else {
+        command.to_string()
+    };
+
+    let proot = std::env::var("CONTAINER_PROOT").ok();
+    let rootfs = std::env::var("CONTAINER_ROOTFS").ok();
+    if let (Some(proot), Some(rootfs)) = (proot, rootfs) {
+        let mut cmd = Command::new(&proot);
+        cmd.kill_on_drop(true)
+            .arg("-r")
+            .arg(&rootfs)
+            .arg("-0")
+            .arg("-w")
+            .arg("/root")
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg(&line);
+        cmd
+    } else {
+        let mut cmd = Command::new("sh");
+        cmd.kill_on_drop(true).arg("-c").arg(&line);
+        cmd
+    }
+}
+
+async fn run_shell(command: &str, sandbox: bool, limit: Duration) -> ShellResult {
+    let fut = async {
+        let output = build_cmd(command, sandbox).output().await?;
+        Ok::<_, std::io::Error>(output)
+    };
+    match timeout(limit, fut).await {
+        Ok(Ok(output)) => ShellResult {
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            exit_code: output.status.code(),
+            timed_out: false,
+        },
+        Ok(Err(e)) => ShellResult {
+            stdout: String::new(),
+            stderr: format!("failed to spawn: {e}"),
+            exit_code: None,
+            timed_out: false,
+        },
+        Err(_) => ShellResult {
+            stdout: String::new(),
+            stderr: format!("command timed out after {}s", limit.as_secs()),
+            exit_code: None,
+            timed_out: true,
+        },
+    }
+}
+
+/// Model-facing, sandboxed shell (resource limits + disposable workdir).
+pub async fn run_sandboxed(command: &str) -> ShellResult {
+    run_shell(command, true, SANDBOX_TIMEOUT).await
+}
+
+/// Trusted shell for user `!` commands (no limits, longer timeout).
+pub async fn run_trusted(command: &str) -> ShellResult {
+    run_shell(command, false, TRUSTED_TIMEOUT).await
+}
 
 impl Tool for BashExecutor {
     const NAME: &'static str = "bash_executor";
 
     type Error = BashExecutorError;
     type Args = BashExecutorArgs;
-    type Output = BashExecutorResult;
+    type Output = ShellResult;
 
     async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
         rig::completion::ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Execute a bash command in the native Linux userland and return stdout, stderr, and exit code.".to_string(),
+            description: "Execute a shell command (POSIX sh) in the Linux work container and return stdout, stderr, and exit code. Commands run in a disposable /root/workspace with CPU, memory, and time limits.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "The bash command to execute"
+                        "description": "The shell command to execute"
                     }
                 }
             })
@@ -50,19 +137,6 @@ impl Tool for BashExecutor {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let output: Output = Command::new("bash")
-            .arg("-c")
-            .arg(&args.command)
-            .output()
-            .await?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-        Ok(BashExecutorResult {
-            stdout,
-            stderr,
-            exit_code: output.status.code(),
-        })
+        Ok(run_sandboxed(&args.command).await)
     }
 }
