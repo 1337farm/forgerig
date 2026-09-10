@@ -216,6 +216,16 @@ class ContainerService : Service() {
                 // UID cannot read. LD_LIBRARY_PATH steers the linker to our own
                 // lib dir so those bundled DT_NEEDED deps resolve.
                 pb.environment()["LD_LIBRARY_PATH"] = AssetExtractor.loaderSearchPath(this)
+                // Provider/model/key from the (encrypted) settings store. Only
+                // non-empty values are set so the daemon's defaults apply when
+                // nothing is configured. Secrets stay in env, never in files.
+                SettingsStore.load(this).let { s ->
+                    if (s.provider.isNotEmpty()) pb.environment()["FORGERIG_PROVIDER"] = s.provider
+                    if (s.model.isNotEmpty()) pb.environment()["FORGERIG_MODEL"] = s.model
+                    if (s.evalModel.isNotEmpty()) pb.environment()["FORGERIG_EVAL_MODEL"] = s.evalModel
+                    if (s.baseUrl.isNotEmpty()) pb.environment()["FORGERIG_BASE_URL"] = s.baseUrl
+                    if (s.apiKey.isNotEmpty()) pb.environment()["FORGERIG_API_KEY"] = s.apiKey
+                }
                 pb.redirectErrorStream(true)
                 pb.directory(rootFsDir)
 

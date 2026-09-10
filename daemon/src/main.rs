@@ -209,7 +209,10 @@ async fn serve_http(mut stream: TcpStream) {
 </style>
 </head>
 <body>
-<h1>ForgeRig</h1>
+<div style="display:flex; justify-content:space-between; align-items:center;">
+<h1 style="margin:0;">ForgeRig</h1>
+<button id="settingsBtn" onclick="openSettings()" style="background:#333;color:#e6e6e6;border:1px solid #555;border-radius:6px;padding:.4rem .7rem;cursor:pointer;">⚙ Settings</button>
+</div>
 <p id="status">Connecting…</p>
 <p id="provider"></p>
 <div>
@@ -245,6 +248,10 @@ async fn serve_http(mut stream: TcpStream) {
     pending=method; reqId++;
     ws.send(JSON.stringify({jsonrpc:'2.0',method:method,params:params,id:reqId}));
     if (method!=='status') out.textContent=method==='chat'?'Thinking…':'Running…';
+  }
+  function openSettings(){
+    if (window.NativeHost) { try { window.NativeHost.openSettings(); } catch(e){} }
+    else { out.textContent='Configure provider settings in the ForgeRig app.'; }
   }
   document.getElementById('prompt').addEventListener('keydown',function(e){
     if (e.key!=='Enter') return;
