@@ -43,6 +43,12 @@ impl Default for WasmTransformer {
     }
 }
 
+impl WasmTransformer {
+    pub fn new(fuel_limit: u64) -> Self {
+        Self { fuel_limit }
+    }
+}
+
 impl Tool for WasmTransformer {
     const NAME: &'static str = "wasm_transformer";
 
