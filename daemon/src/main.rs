@@ -283,11 +283,10 @@ async fn serve_http(mut stream: TcpStream) {
 </body>
 </html>"#;
 
-    let status_line = "HTTP/1.1 200 OK\r\n";
-    let headers = "Content-Type: text/html; charset=utf-8\r\nConnection: close\r\n";
     let response = format!(
-        "{}\r\n{}\r\nContent-Length: {}\r\n\r\n{}",
-        status_line, headers, body.as_bytes().len(), body
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.as_bytes().len(),
+        body
     );
     let _ = stream.write_all(response.as_bytes()).await;
     let _ = stream.shutdown().await;
