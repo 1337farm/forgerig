@@ -68,6 +68,9 @@ class AssetExtractor(private val context: Context) {
         // prepare-assets.sh, checkContainerAssets, and .gitignore.
         const val TALLOC_ASSET = "libtalloc.so.2"
 
+        // Key in container-manifest.json for the swappable Ubuntu rootfs.
+        const val ROOTFS_ASSET = "ubuntu-rootfs.bin"
+
         fun resolveTallocFile(context: Context): File =
             File(context.filesDir, "native_deps/libtalloc.so.2")
 
@@ -236,25 +239,39 @@ class AssetExtractor(private val context: Context) {
         }
     }
 
-    private data class RootfsStream(val stream: InputStream, val gzipped: Boolean, val assetName: String) : java.io.Closeable {
+    private data class RootfsStream(
+        val stream: InputStream,
+        val gzipped: Boolean,
+        val assetName: String,
+        val totalBytes: Long,
+    ) : java.io.Closeable {
         override fun close() = stream.close()
     }
 
     private fun openRootfs(): RootfsStream {
+        // Online-first: fetch the swappable container payload (slim, upgradable
+        // APK). Fall back to the bundled asset so full/offline APKs still work.
+        try {
+            val file = ContainerAssets.ensure(context, ROOTFS_ASSET, ContainerAssets.fetchManifest())
+            log("Rootfs from container download: ${file.absolutePath} (${file.length()} bytes)")
+            return RootfsStream(FileInputStream(file), gzipped = true, assetName = file.absolutePath, totalBytes = file.length())
+        } catch (e: Exception) {
+            log("Container download unavailable (${e.message}); falling back to bundled rootfs")
+        }
         var lastError: Exception? = null
         for (name in ROOTFS_CANDIDATES) {
             try {
                 val stream = context.assets.open(name)
                 val gzipped = name.endsWith(".gz") || name.endsWith(".bin")
-                return RootfsStream(stream, gzipped, name)
+                return RootfsStream(stream, gzipped, name, assetLength(name))
             } catch (e: IOException) {
                 lastError = e
             }
         }
         throw IOException(
-            "Bundled rootfs archive is missing (tried ${ROOTFS_CANDIDATES.joinToString(", ")}). " +
-                "Bundled assets: [${listBundledAssets()}]. " +
-                "Last error: ${lastError?.message}"
+            "Rootfs archive unavailable (download failed and no bundled asset: " +
+                "${ROOTFS_CANDIDATES.joinToString(", ")}). " +
+                "Bundled assets: [${listBundledAssets()}]. Last error: ${lastError?.message}"
         )
     }
 
@@ -315,10 +332,10 @@ class AssetExtractor(private val context: Context) {
                 var done = 0
                 var symlinks = 0
                 openRootfs().use { rootfs ->
-                    // Single pass: byte-based progress from the compressed size,
-                    // so the archive is gunzipped/parsed exactly once.
-                    val totalBytes = assetLength(rootfs.assetName)
-                    log("Rootfs asset: ${rootfs.assetName} (${if (totalBytes > 0) "$totalBytes bytes" else "size unknown"})")
+                    // Single pass: byte-based progress from the (compressed)
+                    // source size, so the archive is decompressed/parsed once.
+                    val totalBytes = rootfs.totalBytes
+                    log("Rootfs: ${rootfs.assetName} (${if (totalBytes > 0) "$totalBytes bytes" else "size unknown"})")
                     val counting = CountingInputStream(rootfs.stream)
                     val tarStream = if (rootfs.gzipped) {
                         TarArchiveInputStream(GZIPInputStream(counting))
