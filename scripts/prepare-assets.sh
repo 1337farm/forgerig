@@ -139,6 +139,13 @@ fi
 [ -x "$ROOTFS_STAGING/bin/sh" ] || [ -x "$ROOTFS_STAGING/usr/bin/env" ] \
   || { echo "ERROR: Ubuntu rootfs has no /bin/sh" >&2; exit 1; }
 
+# debootstrap leaves root-owned (0600) files (etc/shadow, dev/*, dpkg locks);
+# make them readable/writable by the build user so the final tar + cleanup work
+# without root. Ownership in the guest is irrelevant (proot fakes -0).
+if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+  sudo chown -R "$(id -u):$(id -g)" "$ROOTFS_STAGING" 2>/dev/null || true
+fi
+
 # --- 4. Emit the assets -------------------------------------------------------
 # proot + loader + shmem + daemon ship as native libs (lib/*.so), NOT assets:
 # the package manager extracts jniLibs with the executable bit on a
