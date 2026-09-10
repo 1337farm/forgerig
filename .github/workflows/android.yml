@@ -101,10 +101,12 @@ jobs:
               if [ "$OK" = 1 ]; then
                 # Quality gate: the rootfs must contain the baked daemon and the
                 # proot stack must keep both DT_NEEDED runtimes, or a poison
-                # release could ship a broken container.
+                # release could ship a broken container. NOTE: prepare-assets.sh
+                # packs with `tar -C staging .`, so members carry a `./` prefix
+                # (./usr/bin/...); the daemon match must NOT be ^-anchored.
                 tar xzf "$DL/container-assets.tar.gz" -O assets/ubuntu-rootfs.bin > "$STAGE/rootfs.bin" 2>/dev/null
                 tar xzf "$DL/container-assets.tar.gz" -O jniLibs/arm64-v8a/libproot.so > "$STAGE/libproot.so" 2>/dev/null
-                if ! tar tzf "$STAGE/rootfs.bin" 2>/dev/null | grep -q '^usr/bin/forgerig-daemon$' \
+                if ! tar tzf "$STAGE/rootfs.bin" 2>/dev/null | grep -q 'usr/bin/forgerig-daemon$' \
                    || ! readelf -d "$STAGE/libproot.so" 2>/dev/null | grep -q 'NEEDED.*libtalloc.so.2' \
                    || ! readelf -d "$STAGE/libproot.so" 2>/dev/null | grep -q 'NEEDED.*libandroid-shmem.so'; then
                   echo "container-assets release failed quality gate; rebuilding"
