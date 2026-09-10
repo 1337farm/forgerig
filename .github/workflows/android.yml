@@ -232,6 +232,22 @@ jobs:
             --title "ForgeRig container assets (latest)" \
             --notes "Rolling release of the packaged rootfs + proot stack + host-side daemon. Re-published whenever the container assets rebuild; restored by runs with identical daemon/ and scripts/prepare-assets.sh trees."
 
+      - name: Publish container payload (container-latest)
+        # The rootfs is the heavy, independently-upgradable piece: publish it
+        # standalone so the slim runner APK downloads it (chunked + sha-verified)
+        # rather than baking it in. Same as the assets publish: only a fresh
+        # build that ran prepare-assets reaches this step.
+        if: steps.assets-rel.outputs.hit != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          gh release delete container-latest --yes --cleanup-tag --repo "${{ github.repository }}" 2>/dev/null || true
+          gh release create container-latest dist/container/ubuntu-rootfs.bin dist/container/container-manifest.json \
+            --repo "${{ github.repository }}" \
+            --title "ForgeRig container payload (latest)" \
+            --notes "Downloadable Ubuntu rootfs + integrity manifest fetched by the runner APK at install (chunked, sha-verified, cached). Upgrades independently of the APK."
+
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true

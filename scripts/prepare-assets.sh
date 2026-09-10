@@ -174,3 +174,24 @@ echo ">> Done. Assets:"
 ls -l "$ASSETS/ubuntu-rootfs.bin" "$ASSETS/libtalloc.so.2" \
   "$JNILIBS"/libproot.so "$JNILIBS"/libproot_loader.so \
   "$JNILIBS"/libandroid-shmem.so "$JNILIBS"/libforgerig_daemon.so
+
+# --- 5. Emit the swappable container payload (downloads from `container-latest`) --
+# The rootfs is the heavy, frequently-changing piece, so it is ALSO published as
+# a standalone GitHub release the app downloads (chunked + sha-verified) at
+# install, letting it upgrade independently of the runner APK. Each entry below
+# maps to a downloadable asset + its integrity fields.
+DIST="$ROOT/dist/container"
+mkdir -p "$DIST"
+cp "$ASSETS/ubuntu-rootfs.bin" "$DIST/ubuntu-rootfs.bin"
+ROOTFS_SHA="$(sha256sum "$DIST/ubuntu-rootfs.bin" | cut -d' ' -f1)"
+ROOTFS_SIZE="$(stat -c%s "$DIST/ubuntu-rootfs.bin" 2>/dev/null || wc -c < "$DIST/ubuntu-rootfs.bin")"
+cat > "$DIST/container-manifest.json" <<JSON
+{
+  "version": 1,
+  "assets": {
+    "ubuntu-rootfs.bin": { "sha256": "$ROOTFS_SHA", "size": $ROOTFS_SIZE }
+  }
+}
+JSON
+echo ">> Wrote $DIST/container-manifest.json"
+cat "$DIST/container-manifest.json"
