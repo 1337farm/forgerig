@@ -11,6 +11,8 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use rig::tool::Tool;
@@ -23,6 +25,10 @@ use crate::tools::{self, ShellResult};
 
 /// Guest path of the installed Lean binary (first entry in GUEST_PATH).
 const LEAN_BIN: &str = "/usr/local/bin/lean";
+/// Guest dir holding Lean's shared libs (libInit_shared.so, ...). It is NOT
+/// on the loader's default search path: installs run ldconfig over it, and
+/// every lean invocation also exports it via LD_LIBRARY_PATH.
+const LEAN_LIB: &str = "/usr/local/lib/lean";
 /// Where the archive is bound inside the guest during extraction.
 const LEAN_ARCHIVE_GUEST: &str = "/tmp/lean.tar.zst";
 /// Published alongside the rootfs on `container-latest`.
@@ -34,6 +40,31 @@ const PROVISION_TIMEOUT: Duration = Duration::from_secs(1800);
 const LEAN_TIMEOUT: Duration = Duration::from_secs(300);
 /// Network retries for the large Lean archive download.
 const LEAN_DOWNLOAD_ATTEMPTS: u32 = 3;
+
+/// Live download progress, polled by the UI via `lean_status`.
+static LEAN_DOWNLOADING: AtomicBool = AtomicBool::new(false);
+static LEAN_DOWNLOADED: AtomicU64 = AtomicU64::new(0);
+static LEAN_TOTAL: AtomicU64 = AtomicU64::new(0);
+static LEAN_PROVISIONING: AtomicBool = AtomicBool::new(false);
+static LEAN_LAST_MESSAGE: Mutex<String> = Mutex::new(String::new());
+
+/// RAII guard: marks the download active on creation and inactive on drop,
+///
+/// so every exit path (including `?` early-returns) clears the progress flag.
+struct DownloadProgress;
+impl DownloadProgress {
+    fn start(total: u64) -> Self {
+        LEAN_DOWNLOADING.store(true, Ordering::Relaxed);
+        LEAN_TOTAL.store(total, Ordering::Relaxed);
+        LEAN_DOWNLOADED.store(0, Ordering::Relaxed);
+        DownloadProgress
+    }
+}
+impl Drop for DownloadProgress {
+    fn drop(&mut self) {
+        LEAN_DOWNLOADING.store(false, Ordering::Relaxed);
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum LeanError {
@@ -55,6 +86,32 @@ pub enum LeanError {
 pub struct LeanStatus {
     pub ready: bool,
     pub version: Option<String>,
+    #[serde(default)]
+    pub downloading: bool,
+    #[serde(default)]
+    pub downloaded: u64,
+    #[serde(default)]
+    pub total: u64,
+    #[serde(default)]
+    pub provisioning: bool,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+fn snapshot(ready: bool, version: Option<String>) -> LeanStatus {
+    LeanStatus {
+        ready,
+        version,
+        downloading: LEAN_DOWNLOADING.load(Ordering::Relaxed),
+        downloaded: LEAN_DOWNLOADED.load(Ordering::Relaxed),
+        total: LEAN_TOTAL.load(Ordering::Relaxed),
+        provisioning: LEAN_PROVISIONING.load(Ordering::Relaxed),
+        message: LEAN_LAST_MESSAGE
+            .lock()
+            .ok()
+            .map(|m| m.clone())
+            .filter(|m| !m.is_empty()),
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -179,6 +236,7 @@ fn download_verify(entry: &LeanEntry, dest: &Path) -> Result<(), LeanError> {
     let mut buf = [0u8; 128 * 1024];
     let mut total = 0u64;
     let mut last_logged = 0u64;
+    let _progress = DownloadProgress::start(entry.size);
     loop {
         let n = reader.read(&mut buf).map_err(|e| LeanError::Download(e.to_string()))?;
         if n == 0 {
@@ -187,6 +245,7 @@ fn download_verify(entry: &LeanEntry, dest: &Path) -> Result<(), LeanError> {
         hasher.update(&buf[..n]);
         file.write_all(&buf[..n]).map_err(|e| LeanError::Download(e.to_string()))?;
         total += n as u64;
+        LEAN_DOWNLOADED.store(total, Ordering::Relaxed);
         if entry.size > 0 && total.saturating_sub(last_logged) >= entry.size / 10 {
             eprintln!("lean download: {}/{} bytes ({}%)", total, entry.size, total * 100 / entry.size);
             last_logged = total;
@@ -216,8 +275,8 @@ pub async fn extract_in_guest(archive: &Path) -> Result<(), LeanError> {
         .to_string();
     let bind = format!("{}:{}", guest, LEAN_ARCHIVE_GUEST);
     let cmd = format!(
-        "mkdir -p /usr/local/bin && zstd -d -c {} | tar -x --strip-components=1 -C /usr/local && {} --version",
-        LEAN_ARCHIVE_GUEST, LEAN_BIN
+        "mkdir -p /usr/local/bin && zstd -d -c {} | tar -x --strip-components=1 -C /usr/local && (ldconfig {} || true) && LD_LIBRARY_PATH={} {} --version",
+        LEAN_ARCHIVE_GUEST, LEAN_LIB, LEAN_LIB, LEAN_BIN
     );
     let r = tools::run_trusted_binds_limited(&cmd, &[bind], PROVISION_TIMEOUT).await;
     if r.timed_out {
@@ -234,8 +293,10 @@ pub async fn extract_in_guest(archive: &Path) -> Result<(), LeanError> {
 
 /// Whether the guest can run `lean` and its version banner, if any.
 pub async fn status() -> LeanStatus {
+    // The Lean libs live in /usr/local/lib/lean (not on the loader's default
+    // path), so the probe carries LD_LIBRARY_PATH explicitly.
     let check = tools::run_trusted_limited(
-        &format!("{} --version", LEAN_BIN),
+        &format!("LD_LIBRARY_PATH={} {} --version", LEAN_LIB, LEAN_BIN),
         LEAN_TIMEOUT,
     )
     .await;
@@ -245,7 +306,7 @@ pub async fn status() -> LeanStatus {
         if check.exit_code != Some(127) {
             eprintln!("lean status: check failed (exit {:?})", check.exit_code);
         }
-        return LeanStatus { ready: false, version: None };
+        return snapshot(false, None);
     }
     let v = format!("{}\n{}", check.stdout, check.stderr);
     let version = v
@@ -255,7 +316,7 @@ pub async fn status() -> LeanStatus {
     if version.is_none() {
         eprintln!("lean status: version banner not found");
     }
-    LeanStatus { ready: true, version }
+    snapshot(true, version)
 }
 
 /// Download (if needed) + verify + extract the Lean toolchain. Returns a
@@ -276,6 +337,24 @@ pub async fn provision() -> String {
             msg
         }
     }
+}
+
+/// Fire-and-forget provisioning: returns immediately so the UI can poll
+/// `lean_status` (downloading/downloaded/total) for a live progress bar
+/// while the ~550 MB archive downloads in the background.
+pub async fn kick_off_provision() -> String {
+    if LEAN_PROVISIONING.swap(true, Ordering::SeqCst) {
+        return "Lean provisioning already running".to_string();
+    }
+    tokio::spawn(async {
+        let msg = provision().await;
+        if let Ok(mut last) = LEAN_LAST_MESSAGE.lock() {
+            last.clear();
+            last.push_str(&msg);
+        }
+        LEAN_PROVISIONING.store(false, Ordering::SeqCst);
+    });
+    "Lean provisioning started".to_string()
 }
 
 async fn provision_inner() -> Result<String, LeanError> {
@@ -322,7 +401,7 @@ pub async fn run_on_file(file: &str) -> ShellResult {
             timed_out: false,
         };
     }
-    let r = tools::run_trusted_limited(&format!("{} {}", LEAN_BIN, tools::sh_quote(file)), LEAN_TIMEOUT).await;
+    let r = tools::run_trusted_limited(&format!("LD_LIBRARY_PATH={} {} {}", LEAN_LIB, LEAN_BIN, tools::sh_quote(file)), LEAN_TIMEOUT).await;
     if r.exit_code != Some(0) {
         eprintln!("lean run_on_file: exit {:?} file={}", r.exit_code, file);
     }
@@ -387,5 +466,20 @@ mod tests {
         assert_eq!(entry.name, "lean-4.33.1-linux_aarch64.tar.zst");
         assert_eq!(entry.sha256, "aa");
         assert_eq!(entry.size, 3);
+    }
+
+    #[test]
+    fn download_progress_guard_sets_and_clears_flag() {
+        assert!(!LEAN_DOWNLOADING.load(Ordering::Relaxed));
+        {
+            let _guard = DownloadProgress::start(581751016);
+            assert!(LEAN_DOWNLOADING.load(Ordering::Relaxed));
+            assert_eq!(LEAN_TOTAL.load(Ordering::Relaxed), 581751016);
+            assert_eq!(LEAN_DOWNLOADED.load(Ordering::Relaxed), 0);
+            let snap = snapshot(false, None);
+            assert!(snap.downloading);
+            assert_eq!(snap.total, 581751016);
+        }
+        assert!(!LEAN_DOWNLOADING.load(Ordering::Relaxed));
     }
 }
