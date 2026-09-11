@@ -57,6 +57,16 @@ if [[ "$DAEMON_TARGET" == *android* ]]; then
   export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK_LLVM/aarch64-linux-android26-clang"
   export CC_aarch64_linux_android="$CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER"
   export AR_aarch64_linux_android="$NDK_LLVM/llvm-ar"
+  # OpenSSL's own Makefiles invoke CROSS_COMPILE-prefixed binutils
+  # (aarch64-linux-android-ar/ranlib) which the NDK does not ship under those
+  # names — symlink the LLVM equivalents onto a private PATH.
+  [ -x "$NDK_LLVM/llvm-ar" ] && [ -x "$NDK_LLVM/llvm-ranlib" ] \
+    || { echo "ERROR: LLVM binutils missing in $NDK_LLVM" >&2; exit 1; }
+  NDK_BIN_PRIVATE="$WORK/ndk-bin"
+  mkdir -p "$NDK_BIN_PRIVATE"
+  ln -sf "$NDK_LLVM/llvm-ar" "$NDK_BIN_PRIVATE/aarch64-linux-android-ar"
+  ln -sf "$NDK_LLVM/llvm-ranlib" "$NDK_BIN_PRIVATE/aarch64-linux-android-ranlib"
+  export PATH="$NDK_BIN_PRIVATE:$PATH"
 fi
 if [ -n "$DAEMON_TARGET" ]; then
   echo ">> Building daemon for $DAEMON_TARGET"
