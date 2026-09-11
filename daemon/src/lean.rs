@@ -225,6 +225,7 @@ pub async fn status() -> LeanStatus {
     )
     .await;
     if check.exit_code != Some(0) {
+        eprintln!("lean status: not installed (exit {:?})", check.exit_code);
         return LeanStatus { ready: false, version: None };
     }
     let v = format!("{}\n{}", check.stdout, check.stderr);
@@ -232,6 +233,9 @@ pub async fn status() -> LeanStatus {
         .lines()
         .find(|l| l.contains("Lean (version"))
         .map(|l| l.to_string());
+    if version.is_none() {
+        eprintln!("lean status: version banner not found");
+    }
     LeanStatus { ready: true, version }
 }
 
@@ -244,9 +248,14 @@ pub async fn provision() -> String {
     match provision_inner().await {
         Ok(msg) => {
             let ver = status().await.version.unwrap_or_else(|| "unknown version".to_string());
+            println!("{} ({})", msg, ver);
             format!("{msg} ({ver})")
         }
-        Err(e) => format!("Lean provision failed: {e}"),
+        Err(e) => {
+            let msg = format!("Lean provision failed: {e}");
+            eprintln!("{msg}");
+            msg
+        }
     }
 }
 
@@ -274,6 +283,7 @@ async fn provision_inner() -> Result<String, LeanError> {
 /// Run `lean` on a file already written into the guest workspace.
 pub async fn run_on_file(file: &str) -> ShellResult {
     if !status().await.ready {
+        eprintln!("lean run_on_file: Lean not installed");
         return ShellResult {
             stdout: String::new(),
             stderr: "Lean is not installed in the container yet — call the daemon's lean_provision RPC (\"Download & install Lean\") first.".to_string(),
@@ -281,7 +291,11 @@ pub async fn run_on_file(file: &str) -> ShellResult {
             timed_out: false,
         };
     }
-    tools::run_trusted_limited(&format!("{} {}", LEAN_BIN, tools::sh_quote(file)), LEAN_TIMEOUT).await
+    let r = tools::run_trusted_limited(&format!("{} {}", LEAN_BIN, tools::sh_quote(file)), LEAN_TIMEOUT).await;
+    if r.exit_code != Some(0) {
+        eprintln!("lean run_on_file: exit {:?} file={}", r.exit_code, file);
+    }
+    r
 }
 
 impl Tool for LeanExecutor {
