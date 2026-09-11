@@ -32,6 +32,8 @@ const MANIFEST_URL: &str =
 const PROVISION_TIMEOUT: Duration = Duration::from_secs(1800);
 /// Single `lean` run cap.
 const LEAN_TIMEOUT: Duration = Duration::from_secs(300);
+/// Network retries for the large Lean archive download.
+const LEAN_DOWNLOAD_ATTEMPTS: u32 = 3;
 
 #[derive(Error, Debug)]
 pub enum LeanError {
@@ -238,7 +240,11 @@ pub async fn status() -> LeanStatus {
     )
     .await;
     if check.exit_code != Some(0) {
-        eprintln!("lean status: not installed (exit {:?})", check.exit_code);
+        // Exit 127 is the expected "Lean is not installed yet" probe result.
+        // Keep routine status polling quiet; unexpected failures still log.
+        if check.exit_code != Some(127) {
+            eprintln!("lean status: check failed (exit {:?})", check.exit_code);
+        }
         return LeanStatus { ready: false, version: None };
     }
     let v = format!("{}\n{}", check.stdout, check.stderr);
@@ -278,11 +284,23 @@ async fn provision_inner() -> Result<String, LeanError> {
         .map_err(|e| LeanError::Manifest(format!("join: {e}")))??;
     let dest = cache_dir().join(&entry.name);
     if !cached_is_valid(&entry, &dest) {
-        let entry = entry.clone();
-        let dest2 = dest.clone();
-        tokio::task::spawn_blocking(move || download_verify(&entry, &dest2))
-            .await
-            .map_err(|e| LeanError::Download(format!("join: {e}")))??;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let entry = entry.clone();
+            let dest2 = dest.clone();
+            let result = tokio::task::spawn_blocking(move || download_verify(&entry, &dest2))
+                .await
+                .map_err(|e| LeanError::Download(format!("join: {e}")))?;
+            match result {
+                Ok(()) => break,
+                Err(LeanError::Download(message)) if attempt < LEAN_DOWNLOAD_ATTEMPTS => {
+                    eprintln!("lean download attempt {attempt} failed: {message}; retrying");
+                    tokio::time::sleep(Duration::from_secs(2 * attempt as u64)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
     extract_in_guest(&dest).await?;
     Ok(format!(

@@ -45,6 +45,10 @@ android {
         buildConfigField("String", "GIT_SHA", "\"$gitCommitHash\"")
     }
 
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
+
     androidResources {
         // Keep the gzipped rootfs blob stored as-is instead of recompressing it.
         noCompress += "bin"
@@ -113,6 +117,7 @@ dependencies {
     // arm64-v8a/libzstd-jni-*.so, which AGP merges into lib/arm64-v8a/ (and with
     // useLegacyPackaging the app loads it via System.loadLibrary("zstd-jni-...")).
     implementation("com.github.luben:zstd-jni:1.5.6-7@aar")
+    testImplementation("junit:junit:4.13.2")
 }
 
 // Reject APKs built with placeholder container binaries (see scripts/prepare-assets.sh).

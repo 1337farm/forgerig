@@ -31,6 +31,7 @@ object ContainerAssets {
 
     private const val CHUNK = 4L * 1024 * 1024   // 4 MiB per range
     private const val PARALLEL = 4               // concurrent ranges
+    private const val MAX_CHUNK_ATTEMPTS = 3     // per-chunk retries for transient network/DNS flakes
 
     data class Asset(val name: String, val sha256: String, val size: Long)
 
@@ -109,7 +110,13 @@ fun fetchManifest(context: Context): Map<String, Asset> {
         return md.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
     }
 
-    private fun download(name: String, info: Asset, out: File, onProgress: ((Long) -> Unit)?) {
+    internal fun download(
+        name: String,
+        info: Asset,
+        out: File,
+        onProgress: ((Long) -> Unit)?,
+        connectionFactory: (URL) -> HttpURLConnection = { url -> url.openConnection() as HttpURLConnection },
+    ) {
         out.parentFile?.mkdirs()
         val part = File(out.path + ".part")
         val nChunks = ((info.size + CHUNK - 1) / CHUNK).toInt().coerceAtLeast(1)
@@ -126,43 +133,64 @@ fun fetchManifest(context: Context): Map<String, Asset> {
             val start = i * CHUNK
             val end = min(info.size - 1, start + CHUNK - 1)
             pool.execute {
+                var attempt = 0
+                var completed = false
+                var lastError: Exception? = null
                 try {
-                    if (end >= start) {
-                        val conn = (URL("$BASE_URL/$name").openConnection() as HttpURLConnection).apply {
-                            connectTimeout = 15_000
-                            readTimeout = 60_000
-                            setRequestProperty("Range", "bytes=$start-$end")
-                        }
+                    while (attempt < MAX_CHUNK_ATTEMPTS && !completed) {
+                        attempt++
                         try {
-                            if (conn.responseCode != 206 && conn.responseCode != 200) {
-                                throw IllegalStateException("HTTP ${conn.responseCode} for $name")
-                            }
-                            conn.inputStream.use { ins ->
-                                val buf = ByteArray(64 * 1024)
-                                var offset = start
-                                var n = ins.read(buf)
-                                while (n > 0) {
-                                    synchronized(raf) { raf.seek(offset); raf.write(buf, 0, n) }
-                                    offset += n
-                                    n = ins.read(buf)
+                            if (end >= start) {
+                                val conn = connectionFactory(URL("$BASE_URL/$name")).apply {
+                                    connectTimeout = 15_000
+                                    readTimeout = 60_000
+                                    setRequestProperty("Range", "bytes=$start-$end")
                                 }
-                                val chunkBytes = offset - start
-                                if (chunkBytes > 0) {
-                                    synchronized(written) {
-                                        val nowPct = ((written.addAndGet(chunkBytes) * 100) / info.size).toInt()
-                                        if (onProgress != null && nowPct > lastReportedPct) {
-                                            lastReportedPct = nowPct
-                                            onProgress(written.get())
+                                try {
+                                    val code = conn.responseCode
+                                    if (code != 206 && !(code == 200 && start == 0L)) {
+                                        throw IllegalStateException("HTTP $code for $name")
+                                    }
+                                    conn.inputStream.use { ins ->
+                                        val buf = ByteArray(64 * 1024)
+                                        var offset = start
+                                        var n = ins.read(buf)
+                                        while (n > 0) {
+                                            synchronized(raf) { raf.seek(offset); raf.write(buf, 0, n) }
+                                            offset += n
+                                            n = ins.read(buf)
+                                        }
+                                        val chunkBytes = offset - start
+                                        if (chunkBytes > 0) {
+                                            synchronized(written) {
+                                                val nowPct = ((written.addAndGet(chunkBytes) * 100) / info.size).toInt()
+                                                if (onProgress != null && nowPct > lastReportedPct) {
+                                                    lastReportedPct = nowPct
+                                                    onProgress(written.get())
+                                                }
+                                            }
                                         }
                                     }
+                                } finally {
+                                    conn.disconnect()
                                 }
                             }
-                        } finally {
-                            conn.disconnect()
+                            completed = true
+                        } catch (e: Exception) {
+                            lastError = e
+                            if (attempt < MAX_CHUNK_ATTEMPTS) {
+                                try {
+                                    Thread.sleep(1000L * attempt)
+                                } catch (_: InterruptedException) {
+                                    Thread.currentThread().interrupt()
+                                    break
+                                }
+                            }
                         }
                     }
-                } catch (e: Exception) {
-                    failures.add("chunk $i: ${e.message}")
+                    if (!completed) {
+                        failures.add("chunk $i after $attempt attempts: ${lastError?.message}")
+                    }
                 } finally {
                     latch.countDown()
                 }
