@@ -115,7 +115,7 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
             ok(json!(st), req.id)
         }
         "lean_provision" => {
-            let message = lean::provision().await;
+            let message = lean::kick_off_provision().await;
             ok(json!({ "message": message }), req.id)
         }
         "lean" => {
@@ -132,9 +132,27 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
     }
 }
 
+fn dns_probe(host: &str) {
+    // Daemon-side DNS diagnostic: isolates whether the failure is in musl
+    // resolution (no system resolver access from a static binary) vs network.
+    use std::net::ToSocketAddrs;
+    let t0 = std::time::Instant::now();
+    match (host, 443u16).to_socket_addrs() {
+        Ok(mut addrs) => {
+            let n = addrs.len();
+            eprintln!("dns probe: {} resolved {} addr(s) in {:?} (first={:?})", host, n, t0.elapsed(), addrs.next());
+        }
+        Err(e) => eprintln!("dns probe: {} FAILED to resolve in {:?}: {}", host, t0.elapsed(), e),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
+
+    dns_probe("github.com");
+    // Termux-style fallback: if the daemon cannot resolve, at least surface
+    // that fact for every HTTP-dependent feature up-front.
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
     let addr = format!("127.0.0.1:{}", port);
@@ -243,10 +261,11 @@ async fn serve_http(mut stream: TcpStream) {
   <span id="leanStatus" style="color:#e6c07b;">Lean: —</span>
   <button id="leanBtn" onclick="provisionLean()" style="background:#333;color:#e6e6e6;border:1px solid #555;border-radius:6px;padding:.3rem .8rem;cursor:pointer;margin-left:.5rem;">Download &amp; install Lean (~550 MB)</button>
 </div>
+<div id="leanBar" style="display:none;margin:.4rem 0;height:16px;background:#1b1f27;border:1px solid #555;border-radius:8px;overflow:hidden;max-width:420px;"><div id="leanFill" style="height:100%;width:0;background:#3498db;color:#fff;font-size:.65rem;line-height:16px;text-align:center;white-space:nowrap;">0%</div></div>
 <pre id="out">Ready.</pre>
 <script>
   var ws=null, label=document.getElementById('status'), out=document.getElementById('out'), prov=document.getElementById('provider');
-  var pending=null, reqId=0;
+  var pending=null, reqId=0, leanTimer=null, leanPollId=0, leanWasProvisioning=false;
   function connect(){
     label.textContent='Connecting…';
     ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/');
@@ -255,6 +274,7 @@ async fn serve_http(mut stream: TcpStream) {
     ws.onmessage=function(e){
       var d; try { d=JSON.parse(e.data); } catch(_) { return; }
       if (d.error) { out.textContent='Error: '+d.error.message; return; }
+      if (leanPollId && d.id===leanPollId) { leanPollId=0; onLeanPoll(d.result); return; }
       var r=d.result;
       var leanStatus=document.getElementById('leanStatus'), leanBtn=document.getElementById('leanBtn');
       if (pending==='status') { prov.textContent='Provider: '+(r && r.provider ? r.provider : 'unknown'); }
@@ -265,12 +285,12 @@ async fn serve_http(mut stream: TcpStream) {
         if (r && (r.exit_code!==0 || r.timed_out)) t+='\n[exit '+r.exit_code+(r.timed_out?' timed out':'')+']';
         out.textContent=t||'(no output)';
       } else if (pending==='lean_status') {
+        updateLeanBar(r);
         if (r && r.ready) { leanStatus.textContent='Lean: ready ('+(r.version||'?')+')'; leanBtn.style.display='none'; }
-        else { leanStatus.textContent='Lean: not installed'; leanBtn.disabled=false; leanBtn.style.display=''; }
+        else { leanStatus.textContent='Lean: '+((r && r.message) ? r.message : 'not installed'); leanBtn.disabled=false; leanBtn.style.display=''; }
       } else if (pending==='lean_provision') {
         leanStatus.textContent='Lean: '+(r && r.message ? r.message : 'done');
-        leanBtn.disabled=false;
-        if (r && r.message && r.message.indexOf('already installed')>=0) leanBtn.style.display='none';
+        leanBtn.disabled=true;
         setTimeout(refreshLean, 1500);
       } else { out.textContent=typeof r==='string' ? r : JSON.stringify(r,null,2); }
       pending=null;
@@ -282,6 +302,25 @@ async fn serve_http(mut stream: TcpStream) {
       pending='lean_status';
     }
   }
+  function updateLeanBar(r){
+    var bar=document.getElementById('leanBar'), fill=document.getElementById('leanFill');
+    if (!bar || !fill) return;
+    if (r && r.downloading && r.total>0) {
+      var pct=Math.floor(r.downloaded*100/r.total);
+      bar.style.display='block'; fill.style.width=pct+'%'; fill.textContent=pct+'%';
+    } else if (r && !r.ready && (r.downloading || r.provisioning)) {
+      bar.style.display='block'; fill.style.width='100%'; fill.textContent='working…';
+    } else { bar.style.display='none'; }
+  }
+  function onLeanPoll(r){
+    updateLeanBar(r);
+    if (r && r.ready) { if (leanTimer) { clearInterval(leanTimer); leanTimer=null; } refreshLean(); return; }
+    if (leanWasProvisioning && r && !r.provisioning) {
+      if (leanTimer) { clearInterval(leanTimer); leanTimer=null; }
+      refreshLean();
+    }
+    leanWasProvisioning=!!(r && r.provisioning);
+  }
   function provisionLean(){
     if (!ws || ws.readyState!==1) { out.textContent='Not connected to daemon yet.'; return; }
     var leanStatus=document.getElementById('leanStatus'), leanBtn=document.getElementById('leanBtn');
@@ -289,6 +328,11 @@ async fn serve_http(mut stream: TcpStream) {
     leanBtn.disabled=true;
     pending='lean_provision'; reqId++;
     ws.send(JSON.stringify({jsonrpc:'2.0',method:'lean_provision',params:{},id:reqId}));
+    if (leanTimer) clearInterval(leanTimer);
+    leanWasProvisioning=true;
+    leanTimer=setInterval(function(){
+      if (ws && ws.readyState===1) { leanPollId=++reqId; ws.send(JSON.stringify({jsonrpc:'2.0',method:'lean_status',params:{},id:leanPollId})); }
+    }, 1000);
   }
   function send(method, params){
     if (!ws || ws.readyState!==1) { out.textContent='Not connected to daemon yet.'; return; }
