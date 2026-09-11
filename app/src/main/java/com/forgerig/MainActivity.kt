@@ -7,6 +7,7 @@ import android.os.Bundle
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import androidx.appcompat.app.AppCompatDelegate
 import androidx.appcompat.app.AppCompatActivity
 import org.json.JSONArray
 import org.json.JSONObject
@@ -37,11 +38,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_YES)
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
         // Initialize WebView
         webView = findViewById(R.id.webView)
+        webView.setBackgroundColor(0xFF0F1115.toInt())
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
@@ -79,23 +82,25 @@ class MainActivity : AppCompatActivity() {
                     <html>
                     <head>
                         <meta name="viewport" content="width=device-width, initial-scale=1">
+                        <meta name="color-scheme" content="dark">
                         <style>
-                            body { font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background-color: #f0f0f0; }
-                            .message { text-align: center; padding: 20px; background: white; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); width: 84%; max-width: 420px; }
-                            .btn { background-color: #3498db; border: none; color: white; padding: 15px 32px; text-align: center; text-decoration: none; display: inline-block; font-size: 16px; margin: 4px 2px; cursor: pointer; border-radius: 8px; }
-                            .btn:disabled { background-color: #9bb8d0; cursor: default; }
-                            .progress-track { margin: 12px 0 8px; height: 12px; background-color: #e0e0e0; border-radius: 6px; overflow: hidden; display: none; }
+                            body { font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background-color: #0f1115; color: #e6e6e6; }
+                            h2 { color: #e6e6e6; }
+                            .message { text-align: center; padding: 20px; background: #1b1f27; border: 1px solid #333; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.35); width: 84%; max-width: 420px; }
+                            .btn { background-color: #3498db; border: 1px solid #2980b9; color: white; padding: 15px 32px; text-align: center; text-decoration: none; display: inline-block; font-size: 16px; margin: 4px 2px; cursor: pointer; border-radius: 8px; }
+                            .btn:disabled { background-color: #33505f; border-color: #33505f; cursor: default; }
+                            .progress-track { margin: 12px 0 8px; height: 12px; background-color: #2a2f3a; border: 1px solid #333; border-radius: 6px; overflow: hidden; display: none; }
                             .progress-fill { height: 100%; width: 0; background-color: #3498db; border-radius: 6px; transition: width 0.2s ease; }
-                            .step-count { margin: 8px 0 4px; font-size: 14px; font-weight: bold; color: #333; display: none; }
+                            .step-count { margin: 8px 0 4px; font-size: 14px; font-weight: bold; color: #e6e6e6; display: none; }
                             .steps { list-style: none; margin: 8px 0; padding: 0; text-align: left; display: none; }
-                            .steps li { margin: 6px 0; font-size: 14px; color: #bbb; }
-                            .steps li.done { color: #27ae60; text-decoration: line-through; }
-                            .steps li.active { color: #111; font-weight: bold; }
-                            .steps li.failed { color: #c0392b; font-weight: bold; }
+                            .steps li { margin: 6px 0; font-size: 14px; color: #8a8f9a; }
+                            .steps li.done { color: #7cf787; text-decoration: line-through; }
+                            .steps li.active { color: #e6e6e6; font-weight: bold; }
+                            .steps li.failed { color: #ff7b72; font-weight: bold; }
                             .steps .dot { display: inline-block; width: 10px; height: 10px; margin-right: 6px; border-radius: 50%; background-color: #3498db; animation: pulse 1s infinite; }
                             @keyframes pulse { 50% { opacity: 0.25; } }
-                            .detail { margin: 4px 0 8px; font-size: 12px; color: #999; display: none; word-break: break-all; text-align: left; background: #fafafa; padding: 6px; border-radius: 4px; max-height: 100px; overflow-y: auto; }
-                            .error { margin: 12px 0; padding: 10px; border-radius: 6px; background-color: #fdecea; color: #c0392b; font-size: 14px; display: none; word-break: break-all; text-align: left; }
+                            .detail { margin: 4px 0 8px; font-size: 12px; color: #b8bcc4; display: none; word-break: break-all; text-align: left; background: #141820; border: 1px solid #333; padding: 6px; border-radius: 4px; max-height: 100px; overflow-y: auto; }
+                            .error { margin: 12px 0; padding: 10px; border-radius: 6px; background-color: #381d1d; border: 1px solid #7a2b2b; color: #ffb4ab; font-size: 14px; display: none; word-break: break-all; text-align: left; }
                         </style>
                         <script>
                             var installState = null;
