@@ -1,4 +1,4 @@
-package com.onestopshop
+package com.forgerig
 
 import android.content.ContentValues
 import android.content.Context

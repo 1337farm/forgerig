@@ -71,7 +71,7 @@
 ## Screens
 ### Screen 1: Launch & Setup
  * Logo & Monogram: Replaced the interlocking "OC" neon loop with a three-node geometric neon OSS glyph.
- * Branding & Labels: Primary text displays ForgeRig with the standalone descriptor; all legacy "OpenCode" (OC) branding and secondary sub-labels removed.
+ * Branding & Labels: Primary text displays ForgeRig with the standalone descriptor; all legacy branding and secondary sub-labels removed.
  * Action Element: Retains the single-tap container extraction trigger mapped directly to the local PRoot unpacker.
 
 ### Screen 2: Environment Boot

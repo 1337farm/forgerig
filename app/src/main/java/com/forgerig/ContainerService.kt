@@ -1,4 +1,4 @@
-package com.onestopshop
+package com.forgerig
 
 import android.app.Notification
 import android.app.NotificationChannel

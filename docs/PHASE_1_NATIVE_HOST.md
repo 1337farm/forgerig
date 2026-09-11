@@ -9,4 +9,4 @@
 ## Container Lifecycle & Connection Persistence
  * Wrap the PRoot container process inside an Android Foreground Service equipped with PARTIAL_WAKE_LOCK and explicit Wi-Fi locks to eliminate OS background thread suspension.
  * Configure the embedded Android WebView client to prevent background sleep cycles, ensuring persistent WebSocket communication between the UI and local daemons.
- * Implement native GitHub OAuth orchestration using custom URI callbacks (opencode://oauth-callback), automatically exchanging the auth code for a token and injecting it into /root/.gitconfig.
+ * Implement native GitHub OAuth orchestration using custom URI callbacks (forgerig://oauth-callback), automatically exchanging the auth code for a token and injecting it into /root/.gitconfig.
