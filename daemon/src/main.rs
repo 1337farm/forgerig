@@ -114,6 +114,9 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
             let st = lean::status().await;
             ok(json!(st), req.id)
         }
+        "lean_progress" => {
+            ok(json!(lean::progress()), req.id)
+        }
         "lean_provision" => {
             let message = lean::kick_off_provision().await;
             ok(json!({ "message": message }), req.id)
@@ -324,14 +327,16 @@ async fn serve_http(mut stream: TcpStream) {
   function provisionLean(){
     if (!ws || ws.readyState!==1) { out.textContent='Not connected to daemon yet.'; return; }
     var leanStatus=document.getElementById('leanStatus'), leanBtn=document.getElementById('leanBtn');
+    var bar=document.getElementById('leanBar'), fill=document.getElementById('leanFill');
     leanStatus.textContent='Lean: downloading + installing (~550 MB, may take several minutes)…';
-    leanBtn.disabled=true;
+    leanBtn.style.display='none';
+    bar.style.display='block'; fill.style.width='100%'; fill.textContent='starting…';
     pending='lean_provision'; reqId++;
     ws.send(JSON.stringify({jsonrpc:'2.0',method:'lean_provision',params:{},id:reqId}));
     if (leanTimer) clearInterval(leanTimer);
     leanWasProvisioning=true;
     leanTimer=setInterval(function(){
-      if (ws && ws.readyState===1) { leanPollId=++reqId; ws.send(JSON.stringify({jsonrpc:'2.0',method:'lean_status',params:{},id:leanPollId})); }
+      if (ws && ws.readyState===1) { leanPollId=++reqId; ws.send(JSON.stringify({jsonrpc:'2.0',method:'lean_progress',params:{},id:leanPollId})); }
     }, 1000);
   }
   function send(method, params){

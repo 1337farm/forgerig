@@ -114,6 +114,14 @@ fn snapshot(ready: bool, version: Option<String>) -> LeanStatus {
     }
 }
 
+/// Progress-only status: reads the shared atomics WITHOUT spawning a proot
+/// child, so the UI can poll it every second while a download/extract runs.
+/// `ready`/`version` are left unset here; the full `status()` sets them (it
+/// has to run `lean --version` in the guest, which the progress path avoids).
+pub fn progress() -> LeanStatus {
+    snapshot(false, None)
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LeanExecutorArgs {
     /// Guest path of the `.lean` source to type-check.
@@ -244,6 +252,7 @@ fn download_stream<R: Read>(mut reader: R, dest: &Path, entry: &LeanEntry) -> Re
     let mut total = 0u64;
     let mut last_logged = 0u64;
     let _progress = DownloadProgress::start(entry.size);
+    eprintln!("lean download: started ({} bytes)", entry.size);
     loop {
         let n = reader.read(&mut buf).map_err(|e| LeanError::Download(e.to_string()))?;
         if n == 0 {
@@ -285,8 +294,10 @@ pub async fn extract_in_guest(archive: &Path) -> Result<(), LeanError> {
         "mkdir -p /usr/local/bin && zstd -d -c {} | tar -x --strip-components=1 -C /usr/local && (ldconfig {} || true) && LD_LIBRARY_PATH={} {} --version",
         LEAN_ARCHIVE_GUEST, LEAN_LIB, LEAN_LIB, LEAN_BIN
     );
+    eprintln!("lean provision: extracting into guest /usr/local (unpacking archive)");
     let r = tools::run_trusted_binds_limited(&cmd, &[bind], PROVISION_TIMEOUT).await;
     if r.timed_out {
+        eprintln!("lean provision: extraction timed out");
         return Err(LeanError::Install("extraction timed out".to_string()));
     }
     if r.exit_code != Some(0) {
@@ -330,8 +341,10 @@ pub async fn status() -> LeanStatus {
 /// human-readable report; never panics.
 pub async fn provision() -> String {
     if let Some(ver) = status().await.version {
+        println!("lean provision: already installed ({ver})");
         return format!("Lean already installed ({ver})");
     }
+    println!("lean provision: starting download + install");
     match provision_inner().await {
         Ok(msg) => {
             let ver = status().await.version.unwrap_or_else(|| "unknown version".to_string());
@@ -351,8 +364,10 @@ pub async fn provision() -> String {
 /// while the ~550 MB archive downloads in the background.
 pub async fn kick_off_provision() -> String {
     if LEAN_PROVISIONING.swap(true, Ordering::SeqCst) {
+        eprintln!("lean provision: button pressed but provisioning already running");
         return "Lean provisioning already running".to_string();
     }
+    eprintln!("lean provision: button pressed — starting download + install");
     tokio::spawn(async {
         let msg = provision().await;
         if let Ok(mut last) = LEAN_LAST_MESSAGE.lock() {
@@ -370,6 +385,12 @@ async fn provision_inner() -> Result<String, LeanError> {
         .map_err(|e| LeanError::Manifest(format!("join: {e}")))??;
     let dest = cache_dir().join(&entry.name);
     if !cached_is_valid(&entry, &dest) {
+        eprintln!(
+            "lean provision: downloading {} ({} bytes) to {}",
+            entry.name,
+            entry.size,
+            dest.display()
+        );
         let mut attempt = 0;
         loop {
             attempt += 1;
