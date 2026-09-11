@@ -419,8 +419,16 @@ class AssetExtractor(private val context: Context) {
                                 // old behavior) leaves empty files behind, so the
                                 // script interpreter (/bin/sh -> /bin/busybox)
                                 // cannot run and proot dies with ENOEXEC.
+                                //
+                                // Tar order is unpredictable: a symlink entry like
+                                // `./lib` (-> usr/lib) often arrives AFTER directory
+                                // entries `./lib/aarch64-linux-gnu/`, which have
+                                // already mkdir'd the target path. delete() cannot
+                                // remove a non-empty dir, so Os.symlink would throw
+                                // EEXIST — clear whatever's there first (mirrors
+                                // GNU tar).
                                 outputFile.parentFile?.mkdirs()
-                                outputFile.delete()
+                                prepareTarget(outputFile)
                                 try {
                                     android.system.Os.symlink(entry.linkName, outputFile.absolutePath)
                                     symlinks++
@@ -432,7 +440,7 @@ class AssetExtractor(private val context: Context) {
                                 // Reference the earlier member by hardlink, or copy its
                                 // content as a fallback if createLink is unavailable.
                                 outputFile.parentFile?.mkdirs()
-                                outputFile.delete()
+                                prepareTarget(outputFile)
                                 try {
                                     java.nio.file.Files.createLink(
                                         outputFile.toPath(),
@@ -449,6 +457,7 @@ class AssetExtractor(private val context: Context) {
                                 }
                             } else {
                                 outputFile.parentFile?.mkdirs()
+                                prepareTarget(outputFile)
                                 FileOutputStream(outputFile).use { output ->
                                     tarStream.copyTo(output)
                                 }
@@ -507,6 +516,20 @@ class AssetExtractor(private val context: Context) {
             val n = super.read(b, off, len)
             if (n > 0) bytesRead += n
             return n
+        }
+    }
+
+    // Clear whatever sits at `path` so a following symlink/hardlink/file can be
+    // created there. Unlike delete(), this also removes non-empty directories
+    // (tar order can mkdir ./lib/aarch64-linux-gnu/ before the ./lib symlink
+    // entry arrives). Symlinks are matched via Files.isSymbolicLink, which does
+    // not follow the link, so dangling links are handled too.
+    private fun prepareTarget(path: File) {
+        val p = path.toPath()
+        when {
+            java.nio.file.Files.isSymbolicLink(p) -> java.nio.file.Files.delete(p)
+            path.isDirectory -> path.deleteRecursively()
+            path.exists() -> path.delete()
         }
     }
 
