@@ -65,12 +65,18 @@ object ContainerAssets {
     /**
      * Return a verified asset file: a valid cached copy is used if present,
      * otherwise it is downloaded (chunked + parallel) and sha-verified.
+     * [onProgress] reports bytes downloaded so far (called on the worker pool).
      */
-    fun ensure(context: Context, name: String, manifest: Map<String, Asset>): File {
+    fun ensure(
+        context: Context,
+        name: String,
+        manifest: Map<String, Asset>,
+        onProgress: ((Long) -> Unit)? = null,
+    ): File {
         val info = manifest[name] ?: throw IllegalStateException("no manifest entry for $name")
         val file = assetFile(context, name)
         if (isValid(file, info)) return file
-        download(name, info, file)
+        download(name, info, file, onProgress)
         if (!isValid(file, info)) throw IllegalStateException("download failed sha256 for $name")
         return file
     }
@@ -91,7 +97,7 @@ object ContainerAssets {
         return md.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
     }
 
-    private fun download(name: String, info: Asset, out: File) {
+    private fun download(name: String, info: Asset, out: File, onProgress: ((Long) -> Unit)?) {
         out.parentFile?.mkdirs()
         val part = File(out.path + ".part")
         val nChunks = ((info.size + CHUNK - 1) / CHUNK).toInt().coerceAtLeast(1)
@@ -101,6 +107,8 @@ object ContainerAssets {
         val latch = CountDownLatch(nChunks)
         val raf = RandomAccessFile(part, "rw").apply { setLength(info.size) }
         val failures = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val written = java.util.concurrent.atomic.AtomicLong(0L)
+        var lastReportedPct = -1
 
         for (i in 0 until nChunks) {
             val start = i * CHUNK
@@ -126,6 +134,16 @@ object ContainerAssets {
                                     offset += n
                                     n = ins.read(buf)
                                 }
+                                val chunkBytes = offset - start
+                                if (chunkBytes > 0) {
+                                    synchronized(written) {
+                                        val nowPct = ((written.addAndGet(chunkBytes) * 100) / info.size).toInt()
+                                        if (onProgress != null && nowPct > lastReportedPct) {
+                                            lastReportedPct = nowPct
+                                            onProgress(written.get())
+                                        }
+                                    }
+                                }
                             }
                         } finally {
                             conn.disconnect()
@@ -150,5 +168,6 @@ object ContainerAssets {
             part.copyTo(out, overwrite = true)
             part.delete()
         }
+        onProgress?.invoke(info.size)
     }
 }
