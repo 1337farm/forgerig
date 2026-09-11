@@ -272,7 +272,7 @@ async fn serve_http(mut stream: TcpStream) {
   function connect(){
     label.textContent='Connecting…';
     ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/');
-    ws.onopen=function(){ label.textContent='Connected to ForgeRig daemon'; send('status',{}); refreshLean(); };
+    ws.onopen=function(){ label.textContent='Connected to ForgeRig daemon'; send('status',{}); refreshLean(); pollTick(); };
     ws.onclose=function(){ label.textContent='Disconnected — retrying…'; setTimeout(connect,1000); };
     ws.onmessage=function(e){
       var d; try { d=JSON.parse(e.data); } catch(_) { return; }
@@ -305,6 +305,12 @@ async fn serve_http(mut stream: TcpStream) {
       pending='lean_status';
     }
   }
+  function pollTick(){
+    if (ws && ws.readyState===1) {
+      leanPollId=++reqId;
+      ws.send(JSON.stringify({jsonrpc:'2.0',method:'lean_progress',params:{},id:leanPollId}));
+    }
+  }
   function updateLeanBar(r){
     var bar=document.getElementById('leanBar'), fill=document.getElementById('leanFill');
     if (!bar || !fill) return;
@@ -317,12 +323,16 @@ async fn serve_http(mut stream: TcpStream) {
   }
   function onLeanPoll(r){
     updateLeanBar(r);
-    if (r && r.ready) { if (leanTimer) { clearInterval(leanTimer); leanTimer=null; } refreshLean(); return; }
-    if (leanWasProvisioning && r && !r.provisioning) {
-      if (leanTimer) { clearInterval(leanTimer); leanTimer=null; }
-      refreshLean();
+    var lb=document.getElementById('leanBtn');
+    if (r && (r.provisioning || r.downloading)) {
+      lb.style.display='none';
+      leanWasProvisioning=!!r.provisioning;
+      if (!leanTimer) leanTimer=setInterval(pollTick, 1000);
+      return;
     }
-    leanWasProvisioning=!!(r && r.provisioning);
+    if (leanTimer) { clearInterval(leanTimer); leanTimer=null; }
+    leanWasProvisioning=false;
+    refreshLean();
   }
   function provisionLean(){
     if (!ws || ws.readyState!==1) { out.textContent='Not connected to daemon yet.'; return; }
@@ -335,9 +345,7 @@ async fn serve_http(mut stream: TcpStream) {
     ws.send(JSON.stringify({jsonrpc:'2.0',method:'lean_provision',params:{},id:reqId}));
     if (leanTimer) clearInterval(leanTimer);
     leanWasProvisioning=true;
-    leanTimer=setInterval(function(){
-      if (ws && ws.readyState===1) { leanPollId=++reqId; ws.send(JSON.stringify({jsonrpc:'2.0',method:'lean_progress',params:{},id:leanPollId})); }
-    }, 1000);
+    leanTimer=setInterval(pollTick, 1000);
   }
   function send(method, params){
     if (!ws || ws.readyState!==1) { out.textContent='Not connected to daemon yet.'; return; }

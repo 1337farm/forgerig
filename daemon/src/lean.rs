@@ -322,7 +322,11 @@ pub async fn status() -> LeanStatus {
         // Exit 127 is the expected "Lean is not installed yet" probe result.
         // Keep routine status polling quiet; unexpected failures still log.
         if check.exit_code != Some(127) {
-            eprintln!("lean status: check failed (exit {:?})", check.exit_code);
+            eprintln!(
+                "lean status: check failed (exit {:?}) stderr={}",
+                check.exit_code,
+                check.stderr.trim()
+            );
         }
         return snapshot(false, None);
     }
