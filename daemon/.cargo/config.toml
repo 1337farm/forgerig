@@ -1,3 +1,8 @@
-[target.aarch64-unknown-linux-musl]
-linker = "aarch64-linux-musl-gcc"
-rustflags = ["-C", "target-feature=+crt-static"]
+# The daemon ships as a Bionic (aarch64-linux-android) binary, NOT musl-static:
+# musl has no usable DNS on Android (no /etc/resolv.conf), so every
+# daemon-side HTTPS call (ureq, reqwest via rig) failed name resolution.
+# The NDK clang linker cannot be hardcoded here (the NDK lives at different
+# paths on CI vs dev machines), so prepare-assets.sh exports
+# CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER (+ CC/AR) from ANDROID_NDK_HOME
+# when FORGERIG_CARGO_TARGET names an android target. Local Termux builds
+# need no --target at all: the host triple is already aarch64-linux-android.

@@ -19,12 +19,13 @@ The APK embeds a real proot binary, its loader, and a minirootfs with the compil
 daemon inside. These are generated (not committed):
 
 ```bash
-# host toolchain (fast, for local checks)
+# host toolchain (fast, for local checks; the Termux host is already Bionic)
 bash scripts/prepare-assets.sh
 
-# cross-build the daemon for the arm64 musl rootfs (as CI does)
-rustup target add aarch64-unknown-linux-musl
-FORGERIG_CARGO_TARGET=aarch64-unknown-linux-musl bash scripts/prepare-assets.sh
+# cross-build the daemon for Android/Bionic (as CI does; needs the NDK)
+rustup target add aarch64-linux-android
+export ANDROID_NDK_HOME=/path/to/android-ndk
+FORGERIG_CARGO_TARGET=aarch64-linux-android bash scripts/prepare-assets.sh
 ```
 
 `prepare-assets.sh` fetches the pinned proot package and Alpine minirootfs from

@@ -22,13 +22,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = "0.4.45"
 schemars = "0.8.22"
 # Blocking HTTP for on-demand payload downloads (Lean bootstrap). ureq 2.x uses
-# rustls by default, so the static aarch64-musl build needs no extra C libs.
+# rustls by default, so no extra C libs are needed for TLS itself.
 ureq = "2.10"
 sha2 = "0.10"
 
 [features]
-# rig-core pulls reqwest with default TLS (native-tls -> openssl-sys). For the
-# static aarch64-musl CI build there is no system OpenSSL for that target, so we
-# vendor OpenSSL (built by the musl cross gcc) via this opt-in feature. Local
-# host builds use the system OpenSSL and don't need it.
+# rig-core pulls reqwest with default TLS (native-tls -> openssl-sys). There
+# is no system OpenSSL for the aarch64-linux-android CI target, so we vendor
+# OpenSSL (built by the NDK clang) via this opt-in feature. Local host builds
+# use the system OpenSSL and don't need it.
 vendored-openssl = ["openssl-sys/vendored"]

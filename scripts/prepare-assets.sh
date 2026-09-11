@@ -15,12 +15,16 @@
 # auto-gunzips it at merge time (which would rename the entry and break
 # AssetManager.open). The app's AssetExtractor sniffs zstd/gzip magic bytes.
 #
-# The daemon runs HOST-side (a static musl binary exec'd straight from the
+# The daemon runs HOST-side (a Bionic PIE binary exec'd straight from the
 # app's native lib dir) and drives the work guest through proot, so it ships
-# as a jniLib rather than being baked into the rootfs.
-# Cross-build it with:
-#   export FORGERIG_CARGO_TARGET=aarch64-unknown-linux-musl
-# (the GitHub runner does this). Pass extra cargo features via
+# as a jniLib rather than being baked into the rootfs. Bionic (not musl-static):
+# musl has no usable DNS on Android (no /etc/resolv.conf), so every daemon-side
+# HTTPS call failed name resolution. Cross-build it with:
+#   export FORGERIG_CARGO_TARGET=aarch64-linux-android
+#   export ANDROID_NDK_HOME=/path/to/android-ndk
+# (the GitHub runner does this; the script derives the NDK clang linker from
+# ANDROID_NDK_HOME). Local Termux builds need no --target: the host triple is
+# already aarch64-linux-android. Pass extra cargo features via
 # FORGERIG_CARGO_FEATURES (CI sets "vendored-openssl").
 #
 # Overrides for offline/pinned use:
@@ -38,12 +42,31 @@ echo ">> Preparing container assets"
 # Run as root when we can (needed for debootstrap/qemu); no-op otherwise.
 S() { if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@" 2>/dev/null || "$@"; fi; }
 
-# --- 1. Build the daemon (host-side orchestrator, static musl) ----------------
+# --- 1. Build the daemon (host-side orchestrator, Bionic PIE) ------------------
 DAEMON_TARGET="${FORGERIG_CARGO_TARGET:-}"
 CARGO_FEATURES="${FORGERIG_CARGO_FEATURES:-}"
 CARGO_ARGS=""
 if [ -n "$CARGO_FEATURES" ]; then
   CARGO_ARGS="--features $CARGO_FEATURES"
+fi
+if [[ "$DAEMON_TARGET" == *android* ]]; then
+  # The NDK lives at different paths per machine, so derive the cross linker
+  # from ANDROID_NDK_HOME (minSdk 26 => android26 clang).
+  : "${ANDROID_NDK_HOME:?set ANDROID_NDK_HOME to cross-build the daemon for Android}"
+  NDK_LLVM="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+  export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK_LLVM/aarch64-linux-android26-clang"
+  export CC_aarch64_linux_android="$CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER"
+  export AR_aarch64_linux_android="$NDK_LLVM/llvm-ar"
+  # OpenSSL's own Makefiles invoke CROSS_COMPILE-prefixed binutils
+  # (aarch64-linux-android-ar/ranlib) which the NDK does not ship under those
+  # names — symlink the LLVM equivalents onto a private PATH.
+  [ -x "$NDK_LLVM/llvm-ar" ] && [ -x "$NDK_LLVM/llvm-ranlib" ] \
+    || { echo "ERROR: LLVM binutils missing in $NDK_LLVM" >&2; exit 1; }
+  NDK_BIN_PRIVATE="$WORK/ndk-bin"
+  mkdir -p "$NDK_BIN_PRIVATE"
+  ln -sf "$NDK_LLVM/llvm-ar" "$NDK_BIN_PRIVATE/aarch64-linux-android-ar"
+  ln -sf "$NDK_LLVM/llvm-ranlib" "$NDK_BIN_PRIVATE/aarch64-linux-android-ranlib"
+  export PATH="$NDK_BIN_PRIVATE:$PATH"
 fi
 if [ -n "$DAEMON_TARGET" ]; then
   echo ">> Building daemon for $DAEMON_TARGET"
@@ -55,6 +78,17 @@ else
   DAEMON_BIN="$ROOT/daemon/target/release/daemon"
 fi
 [ -x "$DAEMON_BIN" ] || { echo "ERROR: daemon binary missing: $DAEMON_BIN" >&2; exit 1; }
+if [[ "$DAEMON_TARGET" == *android* ]] || [ -z "$DAEMON_TARGET" ]; then
+  # The shipped daemon must be a dynamically-linked Bionic binary (NEEDED
+  # libc.so): a static musl binary has no DNS on Android and can never
+  # resolve daemon-side HTTPS (Lean downloads, model APIs).
+  if command -v readelf >/dev/null 2>&1; then
+    readelf -d "$DAEMON_BIN" | grep -q 'NEEDED.*libc\.so' \
+      || { echo "ERROR: $DAEMON_BIN is not a Bionic dynamic binary (missing NEEDED libc.so)" >&2; exit 1; }
+  else
+    echo "WARNING: readelf unavailable; skipping Bionic linkage check" >&2
+  fi
+fi
 
 # --- 2. Fetch proot + runtime deps (Termux aarch64 packages) ------------------
 # proot is dynamically linked against libtalloc.so.2 and libandroid-shmem.so

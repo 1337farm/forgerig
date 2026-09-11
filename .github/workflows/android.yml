@@ -99,15 +99,18 @@ jobs:
                 fi
               done
               if [ "$OK" = 1 ]; then
-                # Quality gate: the daemon jniLib must be a valid ELF, the rootfs must be
-                # glibc (Ubuntu), and the proot stack must keep both DT_NEEDED
-                # runtimes, or a poison release could ship a broken container.
+                # Quality gate: the daemon jniLib must be a valid ELF linked
+                # against Bionic libc (a static musl binary has no DNS on
+                # Android), the rootfs must be glibc (Ubuntu), and the proot
+                # stack must keep both DT_NEEDED runtimes, or a poison release
+                # could ship a broken container.
                 # NOTE: prepare-assets.sh packs with `tar -C staging .`, so members
                 # carry a `./` prefix (./usr/bin/...); matches must NOT be ^-anchored.
                 tar xzf "$DL/container-assets.tar.gz" -O dist/container/ubuntu-rootfs.bin > "$STAGE/rootfs.bin" 2>/dev/null
                 tar xzf "$DL/container-assets.tar.gz" -O app/src/main/jniLibs/arm64-v8a/libproot.so > "$STAGE/libproot.so" 2>/dev/null
                 tar xzf "$DL/container-assets.tar.gz" -O app/src/main/jniLibs/arm64-v8a/libforgerig_daemon.so > "$STAGE/libforgerig_daemon.so" 2>/dev/null
                 if ! readelf -h "$STAGE/libforgerig_daemon.so" >/dev/null 2>&1 \
+                   || ! readelf -d "$STAGE/libforgerig_daemon.so" 2>/dev/null | grep -q 'NEEDED.*libc\.so' \
                    || ! tar --zstd -tf "$STAGE/rootfs.bin" 2>/dev/null | grep -q 'aarch64-linux-gnu/libc.so.6$' \
                    || ! readelf -d "$STAGE/libproot.so" 2>/dev/null | grep -q 'NEEDED.*libtalloc.so.2' \
                    || ! readelf -d "$STAGE/libproot.so" 2>/dev/null | grep -q 'NEEDED.*libandroid-shmem.so'; then
@@ -147,21 +150,32 @@ jobs:
         uses: 1337farm/actions/cache-cargo@v1
         with:
           workspaces: daemon
-          shared-key: aarch64-unknown-linux-musl_vendored-openssl
+          shared-key: aarch64-linux-android_vendored-openssl
 
-      # Full aarch64 musl cross toolchain (rusqlite needs a real cross cc).
-      # Restores from cache on hit; on miss downloads via multi-mirror fallback
-      # and re-seeds the cache. Exports CC/AR_*_aarch64_unknown_linux_musl and
-      # prepends bin/ to PATH for the build step below.
-      - name: Cache musl cross toolchain
+      # Android NDK (daemon cross toolchain: NDK clang is the linker + cc for
+      # the aarch64-linux-android target). Cached by version; on miss
+      # sdkmanager downloads it once and re-seeds the cache.
+      - name: Setup Android SDK
         if: steps.build-needed.outputs.needed == '1'
-        uses: 1337farm/actions/cache-musl-toolchain@v1
+        uses: android-actions/setup-android@v3
+
+      - name: Cache Android NDK
+        if: steps.build-needed.outputs.needed == '1'
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/lib/android/sdk/ndk
+          key: android-ndk-27.0.12077973
+
+      - name: Install Android NDK
+        if: steps.build-needed.outputs.needed == '1'
+        run: sdkmanager "ndk;27.0.12077973"
 
       - name: Prepare container assets (proot + rootfs + daemon)
         if: steps.build-needed.outputs.needed == '1'
         env:
           RUSTC_WRAPPER: sccache
           SCCACHE_GHA_ENABLED: "true"
+          ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/27.0.12077973
         run: |
           set -e
           if ! command -v rustup >/dev/null 2>&1; then
@@ -170,9 +184,9 @@ jobs:
             curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
             . "$CARGO_HOME/env"
           fi
-          rustup target add aarch64-unknown-linux-musl
+          rustup target add aarch64-linux-android
           rustc --version && cargo --version
-          FORGERIG_CARGO_TARGET=aarch64-unknown-linux-musl \
+          FORGERIG_CARGO_TARGET=aarch64-linux-android \
           FORGERIG_CARGO_FEATURES=vendored-openssl \
           bash scripts/prepare-assets.sh
 
