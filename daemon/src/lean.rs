@@ -93,8 +93,21 @@ fn cache_dir() -> PathBuf {
     PathBuf::from("/tmp/forgerig-container")
 }
 
-/// Blocking manifest lookup (downloads the JSON from the daemon).
+/// Blocking manifest lookup (tries cache first, then downloads the JSON from the daemon).
 fn fetch_lean_entry() -> Result<LeanEntry, LeanError> {
+    // Try to read manifest from cache file first (written by the app).
+    if let Ok(cache_dir) = std::env::var("CONTAINER_CACHE") {
+        let manifest_path = format!("{}/container-manifest.json", cache_dir);
+        if let Ok(body) = std::fs::read_to_string(&manifest_path) {
+            if let Ok(v) = serde_json::from_str::<Value>(&body) {
+                if let Some(entry) = find_lean_entry(&v) {
+                    return Ok(entry);
+                }
+            }
+        }
+    }
+
+    // Fallback to downloading from network.
     let url = manifest_url();
     let resp = ureq::get(&url).call().map_err(|e| LeanError::Manifest(format!("{url}: {e}")))?;
     let status = resp.status();
@@ -106,10 +119,11 @@ fn fetch_lean_entry() -> Result<LeanEntry, LeanError> {
         .read_to_string(&mut body)
         .map_err(|e| LeanError::Manifest(e.to_string()))?;
     let v: Value = serde_json::from_str(&body).map_err(|e| LeanError::Manifest(e.to_string()))?;
-    let assets = v
-        .get("assets")
-        .and_then(|a| a.as_object())
-        .ok_or(LeanError::NoEntry)?;
+    find_lean_entry(&v).ok_or(LeanError::NoEntry)
+}
+
+fn find_lean_entry(v: &Value) -> Option<LeanEntry> {
+    let assets = v.get("assets").and_then(|a| a.as_object())?;
     for (name, meta) in assets {
         if name.ends_with("linux_aarch64.tar.zst") {
             let entry = LeanEntry {
@@ -118,13 +132,12 @@ fn fetch_lean_entry() -> Result<LeanEntry, LeanError> {
                 size: meta.get("size").and_then(|s| s.as_u64()).unwrap_or(0),
                 url: meta.get("url").and_then(|s| s.as_str()).unwrap_or_default().to_string(),
             };
-            if entry.url.is_empty() {
-                return Err(LeanError::NoEntry);
+            if !entry.url.is_empty() {
+                return Some(entry);
             }
-            return Ok(entry);
         }
     }
-    Err(LeanError::NoEntry)
+    None
 }
 
 fn sha256_file(path: &Path) -> std::io::Result<String> {

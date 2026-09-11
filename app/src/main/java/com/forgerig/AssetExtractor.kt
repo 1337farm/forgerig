@@ -273,7 +273,7 @@ class AssetExtractor(private val context: Context) {
         // Online-first: fetch the swappable container payload (slim, upgradable
         // APK). Fall back to the bundled asset so full/offline APKs still work.
         try {
-            val manifest = ContainerAssets.fetchManifest()
+            val manifest = ContainerAssets.fetchManifest(context)
             val mib = manifest[ROOTFS_ASSET]?.size ?: 0L
             val file = ContainerAssets.ensure(context, ROOTFS_ASSET, manifest) { bytes ->
                 if (mib > 0) {

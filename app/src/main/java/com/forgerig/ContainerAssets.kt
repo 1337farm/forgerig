@@ -40,13 +40,15 @@ object ContainerAssets {
     fun assetFile(context: Context, name: String): File =
         File(cacheDir(context), name)
 
-    fun fetchManifest(): Map<String, Asset> {
+fun fetchManifest(context: Context): Map<String, Asset> {
         val conn = (URL("$BASE_URL/container-manifest.json").openConnection() as HttpURLConnection).apply {
             connectTimeout = 15_000
             readTimeout = 20_000
         }
         try {
-            return conn.inputStream.bufferedReader().use { r -> parseManifest(r.readText()) }
+            val text = conn.inputStream.bufferedReader().use { r -> r.readText() }
+            writeManifestJsonToCache(context, text)
+            return parseManifest(text)
         } finally {
             conn.disconnect()
         }
@@ -60,6 +62,16 @@ object ContainerAssets {
             map[key] = Asset(key, a.getString("sha256"), a.getLong("size"))
         }
         return map
+    }
+
+    /**
+     * Write the raw manifest JSON to the app's cache directory so that the daemon
+     * can read it without performing its own HTTP fetch (which may fail due to DNS issues).
+     */
+    private fun writeManifestJsonToCache(context: Context, manifestJson: String) {
+        val cacheDir = cacheDir(context)
+        val manifestFile = File(cacheDir, "container-manifest.json")
+        manifestFile.writeText(manifestJson)
     }
 
     /**
