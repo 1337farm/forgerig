@@ -76,6 +76,12 @@ fn build_cmd_binds(command: &str, sandbox: bool, binds: &[String]) -> Command {
             .arg("-0")
             .arg("-w")
             .arg("/root")
+            // Pin the guest temp dir: proot's f2fs bug probe (and tools like
+            // lean) create scratch files in $TMPDIR//tmp, and an inherited
+            // host TMPDIR (e.g. a Termux /data/data/.../usr/tmp that doesn't
+            // exist in the guest) would make proot print warnings and skip
+            // its f2fs workaround. The Ubuntu guest always has /tmp (0777).
+            .env("TMPDIR", "/tmp")
             .env("PATH", GUEST_PATH)
             .env("HOME", "/root");
         // Bind the host-generated resolv.conf so guest tools (apt/git/gh) can
