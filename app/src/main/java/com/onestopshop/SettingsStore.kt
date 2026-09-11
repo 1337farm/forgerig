@@ -36,6 +36,7 @@ object SettingsStore {
             )
         } catch (e: Exception) {
             Log.w(TAG, "Encrypted prefs unavailable; falling back to plaintext", e)
+            AssetExtractor.logShared(ctx, "WARNING: Encrypted prefs unavailable; falling back to plaintext | $e")
             ctx.getSharedPreferences("${FILE}_plain", Context.MODE_PRIVATE)
         }
     }
