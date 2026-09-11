@@ -211,31 +211,44 @@ esac
 LEAN_JSON="$(curl -fsSL --max-time 30 "https://api.github.com/repos/leanprover/lean4/$LEAN_ENDPOINT" 2>/dev/null || true)"
 
 if command -v python3 >/dev/null 2>&1; then
-  python3 - "$DIST" "$ROOTFS_SHA" "$ROOTFS_SIZE" "$LEAN_JSON" <<'PY'
-import json, sys
-dist, rootfs_sha, rootfs_size, lean_json = sys.argv[1:]
+  # The 50-release listing is ~400 KB — far over the ~128 KB argv budget
+  # (E2BIG "Argument list too long", exit 126). Stage it in a temp file.
+  LEAN_JSON_FILE="$(mktemp)"
+  if [ -n "$LEAN_JSON" ]; then
+    printf '%s' "$LEAN_JSON" > "$LEAN_JSON_FILE"
+  else
+    : > "$LEAN_JSON_FILE"
+  fi
+  python3 - "$DIST" "$ROOTFS_SHA" "$ROOTFS_SIZE" "$LEAN_JSON_FILE" <<'PY'
+import json, os, sys
+dist, rootfs_sha, rootfs_size, lean_json_file = sys.argv[1:]
 assets = {"ubuntu-rootfs.bin": {"sha256": rootfs_sha, "size": int(rootfs_size)}}
-if lean_json:
-    try:
-        data = json.loads(lean_json)
-        releases = data if isinstance(data, list) else [data]
-        for rel in releases:
-            if rel.get("draft") or not rel.get("assets"):
-                continue
-            for a in rel["assets"]:
-                if a.get("name", "").endswith("linux_aarch64.tar.zst"):
-                    digest = a.get("digest") or ""
-                    sha = digest.split(":", 1)[1] if ":" in digest else ""
-                    assets[a["name"]] = {
-                        "sha256": sha,
-                        "size": a["size"],
-                        "url": a.get("browser_download_url", ""),
-                    }
-                    break
-            if any(n.endswith("linux_aarch64.tar.zst") for n in assets):
+try:
+    with open(lean_json_file) as fh:
+        data = json.load(fh)
+    releases = data if isinstance(data, list) else [data]
+    for rel in releases:
+        if rel.get("draft") or not rel.get("assets"):
+            continue
+        for a in rel["assets"]:
+            if a.get("name", "").endswith("linux_aarch64.tar.zst"):
+                digest = a.get("digest") or ""
+                sha = digest.split(":", 1)[1] if ":" in digest else ""
+                assets[a["name"]] = {
+                    "sha256": sha,
+                    "size": a["size"],
+                    "url": a.get("browser_download_url", ""),
+                }
                 break
-    except Exception as e:
-        print(f"WARNING: could not parse Lean release JSON: {e}", file=sys.stderr)
+        if any(n.endswith("linux_aarch64.tar.zst") for n in assets):
+            break
+except Exception as e:
+    print(f"WARNING: could not parse Lean release JSON: {e}", file=sys.stderr)
+finally:
+    try:
+        os.remove(lean_json_file)
+    except OSError:
+        pass
 with open(f"{dist}/container-manifest.json", "w") as fh:
     json.dump({"version": 2, "assets": assets}, fh, indent=2)
     fh.write("\n")
