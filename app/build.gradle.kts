@@ -106,7 +106,13 @@ dependencies {
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
     implementation("androidx.security:security-crypto:1.0.0")
     implementation("org.apache.commons:commons-compress:1.24.0")
-    implementation("com.github.luben:zstd-jni:1.5.6-7")
+    // @aar: the base zstd-jni artifact is a plain jar whose natives live under
+    // /linux|darwin|win/... — AGP strips the linux/ resource out of the APK and
+    // ships nothing loadable on Android, so ZstdCompressorInputStream blows up
+    // with UnsatisfiedLinkError at install. The .aar variant carries jni/
+    // arm64-v8a/libzstd-jni-*.so, which AGP merges into lib/arm64-v8a/ (and with
+    // useLegacyPackaging the app loads it via System.loadLibrary("zstd-jni-...")).
+    implementation("com.github.luben:zstd-jni:1.5.6-7@aar")
 }
 
 // Reject APKs built with placeholder container binaries (see scripts/prepare-assets.sh).

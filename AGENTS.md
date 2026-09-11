@@ -40,6 +40,13 @@ A branch cut from an old `main` will be CONFLICTING by the time you push.
   leanprover/lean4 GitHub API — the host daemon downloads it on demand
   (ureq, into `CONTAINER_CACHE` = filesDir/container) and extracts it into the
   guest's /usr/local via proot. The guest debootstrap `--include` has `zstd`.
+  The default follows the NEWEST published release INCLUDING pre-releases
+  (`releases?per_page=50`, first aarch64 asset); set `FORGERIG_LEAN_VERSION`
+  to `stable` or a tag (`4.34.0`) to pin it.
+- zstd decompression in the app needs the Android lib from zstd-jni: depend on
+  `com.github.luben:zstd-jni:...@aar` (the plain jar variant ships no loadable
+  Android .so → UnsatisfiedLinkError crashes install). Install failures catch
+  `Throwable` so Errors surface in the shared log/UI.
 - proot + loader + daemon ship as `app/src/main/jniLibs/arm64-v8a/` native
   libs (libproot.so, libproot_loader.so, libandroid-shmem.so,
   libforgerig_daemon.so) — NOT assets: some devices refuse execve() on

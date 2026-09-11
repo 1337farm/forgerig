@@ -270,7 +270,18 @@ class AssetExtractor(private val context: Context) {
         // Online-first: fetch the swappable container payload (slim, upgradable
         // APK). Fall back to the bundled asset so full/offline APKs still work.
         try {
-            val file = ContainerAssets.ensure(context, ROOTFS_ASSET, ContainerAssets.fetchManifest())
+            val manifest = ContainerAssets.fetchManifest()
+            val mib = manifest[ROOTFS_ASSET]?.size ?: 0L
+            val file = ContainerAssets.ensure(context, ROOTFS_ASSET, manifest) { bytes ->
+                if (mib > 0) {
+                    val pct = (2 + 5 * bytes / mib).toInt().coerceIn(2, 7)
+                    progress.onProgress(
+                        pct,
+                        "Downloading container payload…",
+                        "${bytes / (1024 * 1024)} / ${mib / (1024 * 1024)} MB"
+                    )
+                }
+            }
             log("Rootfs from container download: ${file.absolutePath} (${file.length()} bytes)")
             val (stream, comp) = compressionOf(FileInputStream(file))
             return RootfsStream(stream, comp, file.absolutePath, file.length())
@@ -349,6 +360,15 @@ class AssetExtractor(private val context: Context) {
 
                 var done = 0
                 var symlinks = 0
+                // Preflight the zstd native library BEFORE any decompression: a
+                // missing/unloadable libzstd-jni surfaces as UnsatisfiedLinkError
+                // (an Error that catch(Exception) would silently swallow and crash
+                // the app with). Convert it into a visible install failure.
+                try {
+                    com.github.luben.zstd.util.Native.load()
+                } catch (t: Throwable) {
+                    throw IOException("zstd native library (libzstd-jni) failed to load: $t")
+                }
                 openRootfs().use { rootfs ->
                     // Single pass: byte-based progress from the (compressed)
                     // source size, so the archive is decompressed/parsed once.
@@ -461,10 +481,13 @@ class AssetExtractor(private val context: Context) {
                 progress.onProgress(100, "Environment ready", "")
                 log("DONE: Environment ready ($done files, $symlinks symlinks)")
                 progress.onDone()
-            } catch (e: Exception) {
-                Log.e(TAG, "Installation failed", e)
-                log("ERROR: Installation failed | ${e}")
-                progress.onError("Installation failed", e.toString())
+            } catch (t: Throwable) {
+                // Throwable, not Exception: UnsatisfiedLinkError/OutOfMemoryError
+                // (and their kin) must surface as a readable install failure in
+                // the UI + shared log instead of killing the process.
+                Log.e(TAG, "Installation failed", t)
+                log("ERROR: Installation failed | ${t}\n${t.stackTraceToString()}")
+                progress.onError("Installation failed", t.toString())
             }
         }
     }
