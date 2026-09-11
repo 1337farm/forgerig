@@ -230,7 +230,14 @@ fn download_verify(entry: &LeanEntry, dest: &Path) -> Result<(), LeanError> {
     if status != 200 {
         return Err(LeanError::Download(format!("HTTP {status} from {}", entry.url)));
     }
-    let mut reader = resp.into_reader();
+    download_stream(resp.into_reader(), dest, entry)
+}
+
+/// Stream a verified payload into `dest`, updating the shared progress
+/// atomics (`DownloadProgress` guard + `LEAN_DOWNLOADED`) as bytes land.
+/// Split out of `download_verify` so a unit test can feed an in-memory
+/// reader and assert the counters the progress bar reads.
+fn download_stream<R: Read>(mut reader: R, dest: &Path, entry: &LeanEntry) -> Result<(), LeanError> {
     let mut file = std::fs::File::create(dest).map_err(|e| LeanError::Download(e.to_string()))?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 128 * 1024];
@@ -481,5 +488,42 @@ mod tests {
             assert_eq!(snap.total, 581751016);
         }
         assert!(!LEAN_DOWNLOADING.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn download_stream_updates_progress_and_verifies_bytes() {
+        let data: Vec<u8> = (0..(256 * 1024)).map(|i| (i % 251) as u8).collect();
+        let sha = Sha256::digest(&data)
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
+        let entry = LeanEntry {
+            name: "t.tar.zst".to_string(),
+            sha256: sha.clone(),
+            size: data.len() as u64,
+            url: String::new(),
+        };
+        let dir = std::env::temp_dir().join(format!("lean-progress-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("t.tar.zst");
+
+        // Sanity: a byte-exact stream verifies and the counters end at total.
+        download_stream(std::io::Cursor::new(data.clone()), &dest, &entry).unwrap();
+        assert_eq!(LEAN_DOWNLOADED.load(Ordering::Relaxed), data.len() as u64);
+        assert!(!LEAN_DOWNLOADING.load(Ordering::Relaxed));
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+
+        let snap = snapshot(false, None);
+        assert_eq!(snap.downloaded, data.len() as u64);
+        assert_eq!(snap.total, data.len() as u64);
+        assert!(!snap.downloading);
+
+        // A truncated stream must NOT verify: size mismatch, no success snapshot.
+        LEAN_DOWNLOADED.store(0, Ordering::Relaxed);
+        let short = &data[..data.len() - 1];
+        assert!(download_stream(std::io::Cursor::new(short.to_vec()), &dest, &entry).is_err());
+        assert!(!LEAN_DOWNLOADING.load(Ordering::Relaxed));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
