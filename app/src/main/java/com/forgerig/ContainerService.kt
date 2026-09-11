@@ -204,6 +204,10 @@ class ContainerService : Service() {
                 // proot is dynamically linked against libtalloc.so.2 +
                 // libandroid-shmem.so; the linker finds them via LD_LIBRARY_PATH.
                 pb.environment()["LD_LIBRARY_PATH"] = AssetExtractor.loaderSearchPath(this)
+                // TLS trust roots for the daemon's OpenSSL-based HTTPS (reqwest
+                // via rig): Android has no /etc/ssl/certs, but the system
+                // CACerts dir uses OpenSSL hash naming, so point OpenSSL at it.
+                pb.environment()["SSL_CERT_DIR"] = "/system/etc/security/cacerts"
                 // Guest DNS: generated on the host, the daemon bind-mounts it.
                 AssetExtractor.writeResolvConf(this)?.let { resolv ->
                     pb.environment()["CONTAINER_RESOLV_CONF"] = resolv.absolutePath

@@ -79,6 +79,6 @@
  * Zero-OAuth Flow: Bypasses third-party auth gates entirely, streaming unpacking progress directly until the local WebSocket endpoint signals readiness.
 
 ### Screen 3: Unified Workspace & Agent Interface
- * Header Re-architecture: Completely removed the user profile avatar, name label, and external "ONLINE" status indicator. The top bar now strictly reports local engine telemetry (ForgeRig header paired with Daemon: aarch64-musl).
+ * Header Re-architecture: Completely removed the user profile avatar, name label, and external "ONLINE" status indicator. The top bar now strictly reports local engine telemetry (ForgeRig header paired with Daemon: aarch64-android).
  * Shell & Tooling Namespaces: Shell prompt updated to oss@localhost:~$, and native execution calls operate through the oss-agent / oss-daemon binary interface.
  * Telemetry HUD: The bottom-right floating overlay tracks local system load, memory usage, and autonomous agent status without external network dependencies.

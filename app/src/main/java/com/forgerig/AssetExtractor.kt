@@ -58,7 +58,7 @@ class AssetExtractor(private val context: Context) {
         fun resolveLoaderFile(context: Context): File =
             File(context.applicationInfo.nativeLibraryDir, "libproot_loader.so")
 
-        // The host-side orchestrator daemon (static musl) exec'd directly by the
+        // The host-side orchestrator daemon (Bionic PIE) exec'd directly by the
         // app; it drives the work guest through proot via CONTAINER_* env.
         fun resolveDaemonFile(context: Context): File =
             File(context.applicationInfo.nativeLibraryDir, "libforgerig_daemon.so")

@@ -58,8 +58,9 @@ A branch cut from an old `main` will be CONFLICTING by the time you push.
   native libs run everywhere. `packaging { jniLibs { useLegacyPackaging = true } }`
   pins extraction at install.
 - The daemon runs HOST-side: `ContainerService` execs `libforgerig_daemon.so`
-  directly (static musl) and sets `CONTAINER_PROOT`/`CONTAINER_ROOTFS`/
-  `PROOT_LOADER`/`CONTAINER_RESOLV_CONF`/`CONTAINER_CACHE`, so the daemon drives
+  directly (Bionic PIE, NOT musl-static — musl has no DNS on Android) and sets
+  `CONTAINER_PROOT`/`CONTAINER_ROOTFS`/`PROOT_LOADER`/`CONTAINER_RESOLV_CONF`/
+  `CONTAINER_CACHE`/`SSL_CERT_DIR`, so the daemon drives
   the work guest through proot. There is no `root/start.sh` entrypoint anymore.
 - The work guest rootfs is Ubuntu/glibc (debootstrap'd aarch64 on the CI
   runner via qemu-user-static, with a raw ubuntu-base tarball fallback), NOT
@@ -84,8 +85,9 @@ A branch cut from an old `main` will be CONFLICTING by the time you push.
   asset for old fat APKs. Keep `ROOTFS_CANDIDATES`, `prepare-assets.sh`,
   `checkContainerAssets` (app/build.gradle.kts), and `.gitignore` in sync.
 - Generated assets + `dist/` are gitignored; CI regenerates them via
-  `prepare-assets.sh` with `FORGERIG_CARGO_TARGET=aarch64-unknown-linux-musl`
-  and `FORGERIG_CARGO_FEATURES=vendored-openssl` (openssl-sys cross-build fails otherwise).
+  `prepare-assets.sh` with `FORGERIG_CARGO_TARGET=aarch64-linux-android`,
+  `ANDROID_NDK_HOME` (linker/CC/AR derived from the NDK clang), and
+  `FORGERIG_CARGO_FEATURES=vendored-openssl` (openssl-sys cross-build fails otherwise).
   The `assets-latest` rolling release is the CI's rebuild cache (now repo-root
   relative, incl. `dist/container/*`); `container-latest` is the app's payload
   source.
