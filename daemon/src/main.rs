@@ -215,6 +215,7 @@ async fn serve_http(mut stream: TcpStream) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
 <title>ForgeRig</title>
 <style>
   body { font-family: sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; background: #0f1115; color: #e6e6e6; }
