@@ -1,13 +1,13 @@
 # ForgeRig
 
-ForgeRig (formerly OneStopShop / OpenCode) is a standalone ARM64 Linux engine providing an isolated Linux userland on unrooted Android devices.
+ForgeRig is a standalone ARM64 Linux engine providing an isolated Linux userland on unrooted Android devices.
 
 ## Features
 
 - **Isolated Linux Userland:** Boots a real aarch64 Alpine rootfs inside a PRoot environment; both the rootfs and the proot binary are extracted from the APK at install time.
 - **Persistent Daemon Orchestration:** The rootfs launches a Rust orchestrator daemon (`forgerig-daemon`) that serves HTTP + WebSocket JSON-RPC on a dynamically allocated local port, kept awake by a background service.
 - **Embedded Web UI:** The WebView connects to `http://127.0.0.1:$PORT`, gets a landing page from the daemon, and opens a WebSocket for prompts.
-- **Seamless GitHub Integration:** Uses custom URI scheme routing (`opencode://oauth-callback`) to silently exchange auth codes and inject access tokens into the container's `.gitconfig`.
+- **Seamless GitHub Integration:** Uses custom URI scheme routing (`forgerig://oauth-callback`) to silently exchange auth codes and inject access tokens into the container's `.gitconfig`.
 
 ## Development
 

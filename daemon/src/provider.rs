@@ -49,7 +49,7 @@ impl Provider {
             "mistral" | "leanstral" => Provider::Mistral,
             "gemini" | "google" => Provider::Gemini,
             "ollama" => Provider::Ollama,
-            "custom" | "opencode" => Provider::Custom,
+            "custom" => Provider::Custom,
             _ => Provider::OpenAi,
         }
     }

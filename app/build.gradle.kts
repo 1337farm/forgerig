@@ -30,11 +30,11 @@ val gitCommitHash: String = try {
 }
 
 android {
-    namespace = "com.onestopshop"
+    namespace = "com.forgerig"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.onestopshop"
+        applicationId = "com.forgerig"
         minSdk = 26
         targetSdk = 34
         versionCode = 1
