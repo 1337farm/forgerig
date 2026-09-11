@@ -531,7 +531,7 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
             } catch (e: Exception) {
-                e.printStackTrace()
+                AssetExtractor.logShared(this@MainActivity, "ERROR: GitHub token exchange failed | $e")
             }
         }
     }
@@ -556,7 +556,7 @@ class MainActivity : AppCompatActivity() {
 
             gitConfigFile.writeText(gitConfigContent)
         } catch (e: Exception) {
-            e.printStackTrace()
+            AssetExtractor.logShared(this@MainActivity, "ERROR: guest gitconfig write failed | $e")
         }
     }
 }

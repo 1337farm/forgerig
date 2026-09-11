@@ -156,10 +156,10 @@ class AssetExtractor(private val context: Context) {
 
         fun logShared(context: Context, message: String) {
             Log.i(TAG, message)
+            val fileName = sharedLogFileName()
             try {
                 val stamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
                 val line = "[$stamp] $message\n"
-                val fileName = sharedLogFileName()
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     val resolver = context.contentResolver
                     var uri = LogUriCache.uri ?: resolveLogUri(resolver, fileName)?.also { LogUriCache.uri = it }
@@ -183,7 +183,10 @@ class AssetExtractor(private val context: Context) {
                     FileOutputStream(File(downloadsDir, fileName), true).use { it.write(line.toByteArray()) }
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "writeSharedLog failed: ${e.message}")
+                // A failure to append to the shared log is itself an error: it
+                // must stay visible somewhere, so escalate to Log.e (the app's
+                // logcat is the last-resort sink when Downloads storage fails).
+                Log.e(TAG, "writeSharedLog failed for '$fileName': ${e.message}")
             }
         }
 
