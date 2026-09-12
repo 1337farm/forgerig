@@ -13,8 +13,14 @@ A branch cut from an old `main` will be CONFLICTING by the time you push.
    - If commits were already merged upstream, `git rebase --skip` the
      duplicates (signing config, dead-code cleanup, progress UI, etc. —
      check `git log --oneline origin/main` first).
-   - Never force-push someone else's branch; use `--force-with-lease`
-     only on your own task branches.
+    - Never force-push someone else's branch; use `--force-with-lease`
+      only on your own task branches.
+
+## After opening a PR: babysit it to green
+Always watch the PR with `bash scripts/babysit-pr.sh <PR> [interval] [max_polls] [--apk[=dir]]`
+and hold the turn until it is done: keep polling, and fix every follow-up
+failure the script reports instead of stopping at the first red check
+(exit 1 = a check failed: read the run log, fix, push, re-run the script).
 
 ## Before committing: verify the build
 - Android unit tests (assets not required):
