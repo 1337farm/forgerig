@@ -42,6 +42,18 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        // POST_NOTIFICATIONS is a runtime permission on Android 13+. The
+        // foreground-service notification is cosmetic, so request it best-effort
+        // (never blocks startup); ContainerService skips notify if denied.
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            try {
+                requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1001)
+            } catch (_: Exception) {
+            }
+        }
+
         // Initialize WebView
         webView = findViewById(R.id.webView)
         webView.setBackgroundColor(0xFF0F1115.toInt())
