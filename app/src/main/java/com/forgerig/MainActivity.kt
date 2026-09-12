@@ -114,12 +114,20 @@ class MainActivity : AppCompatActivity() {
                             @keyframes pulse { 50% { opacity: 0.25; } }
                             .detail { margin: 4px 0 8px; font-size: 12px; color: #b8bcc4; display: none; word-break: break-all; text-align: left; background: #141820; border: 1px solid #333; padding: 6px; border-radius: 4px; max-height: 100px; overflow-y: auto; }
                             .error { margin: 12px 0; padding: 10px; border-radius: 6px; background-color: #381d1d; border: 1px solid #7a2b2b; color: #ffb4ab; font-size: 14px; display: none; word-break: break-all; text-align: left; }
+                            #splash { display: none; text-align: center; padding: 16px 6px 10px; }
+                            #splash .logo { font-size: 26px; font-weight: bold; color: #e6e6e6; letter-spacing: 1px; }
+                            #splash .sub { margin: 12px 0 4px; font-size: 13px; color: #8a8f9a; }
+                            #splash .spin { width: 34px; height: 34px; margin: 14px auto 0; border-radius: 50%; border: 3px solid #2a2f3a; border-top-color: #3498db; animation: spin 0.9s linear infinite; }
+                            @keyframes spin { to { transform: rotate(360deg); } }
                         </style>
                         <script>
                             var installState = null;
-                            var autoLaunched = false;
 
                             var reloading = false;
+                            // True once THIS page pressed Install: keeps the fresh-install
+                            // steps UI even after bin/sh lands mid-extraction (which would
+                            // otherwise flip isRelaunch() to the splash).
+                            var freshInstall = false;
                             var FALLBACK_LABELS = ['Prepare runtime', 'Unpack container files', 'Finalize environment', 'Start container service', 'Connect to daemon'];
 
                             function stepLabels() {
@@ -139,14 +147,21 @@ class MainActivity : AppCompatActivity() {
                                     if (raw) {
                                         try { installState = JSON.parse(raw); } catch (e) {}
                                     }
-                                    // Reopening after a completed install: the daemon isn't
-                                    // running yet, so auto-start the container instead of
-                                    // forcing the user to reinstall. Only once.
-                                    if (!autoLaunched && installState && installState.phase === 'idle' &&
-                                        typeof window.NativeHost.isInstalled === 'function' &&
-                                        window.NativeHost.isInstalled()) {
-                                        autoLaunched = true;
-                                        window.NativeHost.launchExisting();
+                                    // Re-attach to whatever the service is doing: an
+                                    // installed env (or a just-finished extraction)
+                                    // auto-launches the container; an idle state with
+                                    // partial download files resumes the install.
+                                    // Re-entry guards live on the native side
+                                    // (shared state), so repeated ticks are no-ops.
+                                    if (installState && typeof window.NativeHost.isInstalled === 'function') {
+                                        if ((installState.phase === 'idle' && window.NativeHost.isInstalled()) ||
+                                            installState.phase === 'extracted') {
+                                            window.NativeHost.launchExisting();
+                                        } else if (installState.phase === 'idle' &&
+                                            typeof window.NativeHost.hasPartialDownload === 'function' &&
+                                            window.NativeHost.hasPartialDownload()) {
+                                            window.NativeHost.installNow();
+                                        }
                                     }
                                 }
                                 renderInstall();
@@ -177,6 +192,23 @@ class MainActivity : AppCompatActivity() {
                                 return doneCount;
                             }
 
+                            function isRelaunch() {
+                                try {
+                                    return !freshInstall && installState && installState.phase === 'installing' &&
+                                        window.NativeHost && window.NativeHost.isInstalled &&
+                                        window.NativeHost.isInstalled();
+                                } catch (e) { return false; }
+                            }
+
+                            function showSplash(text) {
+                                ['title', 'step-count', 'steps', 'progress-track', 'detail-text', 'error-text', 'log-path', 'install-btn', 'retry-btn', 'copy-btn', 'settings-btn'].forEach(function(id) {
+                                    var el = document.getElementById(id);
+                                    if (el) el.style.display = 'none';
+                                });
+                                document.getElementById('splash-text').innerText = text || 'Starting…';
+                                document.getElementById('splash').style.display = 'block';
+                            }
+
                             function renderInstall() {
                                 if (!installState) { return; }
 
@@ -190,6 +222,13 @@ class MainActivity : AppCompatActivity() {
                                 var installBtn = document.getElementById('install-btn');
                                 var retryBtn = document.getElementById('retry-btn');
                                 var copyBtn = document.getElementById('copy-btn');
+
+                                if (phase === 'installing' && isRelaunch()) {
+                                    // Reopened into an installed env (or mid-launch):
+                                    // splash instead of the install steps.
+                                    showSplash(installState.stage || 'Starting ForgeRig…');
+                                    return;
+                                }
 
                                 if (phase === 'installing') {
                                     installBtn.style.display = 'none';
@@ -208,15 +247,7 @@ class MainActivity : AppCompatActivity() {
                                     detail.style.display = installState.detail ? 'block' : 'none';
                                     detail.innerText = installState.detail;
                                 } else if (phase === 'ready') {
-                                    installBtn.style.display = 'none';
-                                    copyBtn.style.display = 'none';
-                                    err.style.display = 'none';
-                                    track.style.display = 'none';
-                                    renderSteps(false);
-                                    steps.style.display = 'block';
-                                    count.style.display = 'block';
-                                    count.innerText = stepsTotal() + ' of ' + stepsTotal() + ' steps complete — opening workspace…';
-                                    detail.style.display = 'none';
+                                    showSplash('Environment ready — opening workspace…');
                                     var reloads = 0;
                                     try { reloads = parseInt(sessionStorage.getItem('readyReloads') || '0', 10); } catch (e) {}
                                     if (reloads < 3 && !reloading) {
@@ -296,6 +327,7 @@ class MainActivity : AppCompatActivity() {
                             function install() {
                                 if (window.NativeHost) {
                                     try { sessionStorage.setItem('readyReloads', '0'); } catch (e) {}
+                                    freshInstall = true;
                                     installState = {phase: 'installing', step: 0, stepsTotal: 5, stepLabels: stepLabels(), percent: 0, stage: 'Starting…', detail: '', error: '', errorDetail: '', logFile: (installState && installState.logFile) || 'forgerig-install.log'};
                                     renderInstall();
                                     window.NativeHost.installNow();
@@ -314,6 +346,7 @@ class MainActivity : AppCompatActivity() {
                     <body>
                         <div class="message">
                             <h2 id="title">ForgeRig</h2>
+                            <div id="splash"><div class="logo">ForgeRig</div><div class="spin"></div><p class="sub" id="splash-text">Starting…</p></div>
                             <p class="step-count" id="step-count"></p>
                             <ol class="steps" id="steps"></ol>
                             <div class="progress-track" id="progress-track"><div class="progress-fill" id="progress-fill"></div></div>
@@ -362,6 +395,15 @@ class MainActivity : AppCompatActivity() {
 
         @JavascriptInterface
         fun getInstallState(): String {
+            // Mirror the service-owned state first: a reopened activity
+            // re-attaches to an install already running in the service.
+            phase = InstallState.phase
+            percent = InstallState.percent
+            stage = InstallState.stage
+            detail = InstallState.detail
+            error = InstallState.error
+            errorDetail = InstallState.errorDetail
+            step = InstallState.step
             return JSONObject()
                 .put("phase", phase)
                 .put("percent", percent)
@@ -387,9 +429,10 @@ class MainActivity : AppCompatActivity() {
 
         @JavascriptInterface
         fun installNow() {
-            if (phase == "installing") {
+            if (InstallState.phase == "installing") {
                 return
             }
+            InstallState.resetForInstall()
             phase = "installing"
             percent = 0
             step = 0
@@ -397,35 +440,9 @@ class MainActivity : AppCompatActivity() {
             detail = ""
             error = ""
             errorDetail = ""
-
-            // Show the foreground notification the moment install is pressed;
-            // the service idles in install mode until extraction completes.
-            startInstallService()
-
-            AssetExtractor(context)
-                .setProgressListener(object : InstallProgress {
-                    override fun onProgress(percent: Int, stage: String, detail: String) {
-                        this@WebAppInterface.percent = percent
-                        this@WebAppInterface.stage = stage
-                        this@WebAppInterface.detail = detail
-                    }
-
-                    override fun onStep(step: Int) {
-                        this@WebAppInterface.step = step
-                    }
-
-                    override fun onError(message: String, detail: String) {
-                        phase = "failed"
-                        error = message
-                        errorDetail = detail
-                        stopContainerService()
-                    }
-
-                    override fun onDone() {
-                        launchContainerAndWait()
-                    }
-                })
-                .extractAssets()
+            // Extraction runs in the foreground service (survives swipe-away);
+            // progress is polled back through getInstallState().
+            startServiceAction(ContainerService.ACTION_INSTALL)
         }
 
         /** True once the Ubuntu rootfs has been extracted (environment installed). */
@@ -440,22 +457,42 @@ class MainActivity : AppCompatActivity() {
         }
 
         /**
-         * Reopen path: the environment is already installed, so skip extraction and
-         * just (re)start the container service + wait for the daemon. Reuses the same
+         * Reopen path: the environment is already installed (or just finished
+         * extracting in the service), so skip extraction and just (re)start
+         * the container service + wait for the daemon. Reuses the same
          * `phase == "installing"` probe loop so its status/ready/failed handling applies.
          */
         @JavascriptInterface
         fun launchExisting() {
-            if (phase == "installing" || phase == "launching") {
+            if (InstallState.phase == "installing") {
                 return
             }
+            InstallState.phase = "installing"
             phase = "installing"
+            InstallState.step = 3
             step = 3
+            InstallState.stage = "Starting container service…"
             stage = "Starting container service…"
+            InstallState.detail = ""
             detail = ""
+            InstallState.error = ""
             error = ""
+            InstallState.errorDetail = ""
             errorDetail = ""
             launchContainerAndWait()
+        }
+
+        /** True when a previous run left partial download files to resume. */
+        @JavascriptInterface
+        fun hasPartialDownload(): Boolean {
+            return try {
+                val dir = File(context.filesDir, "container")
+                dir.listFiles()?.any { f ->
+                    f.isFile && (f.name.endsWith(".part") || f.name.endsWith(".resume"))
+                } == true
+            } catch (e: Exception) {
+                false
+            }
         }
 
         private fun startServiceAction(action: String) {
@@ -476,10 +513,6 @@ class MainActivity : AppCompatActivity() {
 
         private fun startContainerInternal() {
             startServiceAction(ContainerService.ACTION_START_CONTAINER)
-        }
-
-        private fun startInstallService() {
-            startServiceAction(ContainerService.ACTION_INSTALL)
         }
 
         private fun stopContainerService() {
@@ -512,12 +545,15 @@ class MainActivity : AppCompatActivity() {
                     phase = "failed"
                     error = "Could not start container service"
                     errorDetail = e.toString()
+                    InstallState.phase = "failed"
+                    InstallState.error = error
+                    InstallState.errorDetail = errorDetail
                     stopContainerService()
                     return@thread
                 }
                 step = 4
                 stage = "Connecting to daemon…"
-                val maxAttempts = 30
+                val maxAttempts = 60
                 var attempt = 0
                 var ready = false
                 val statusFile = File(context.filesDir, "ubuntu_rootfs/.forgerig-status")
@@ -530,6 +566,9 @@ class MainActivity : AppCompatActivity() {
                                 phase = "failed"
                                 error = "Container exited early"
                                 errorDetail = "Container status: $status. See Downloads/${AssetExtractor.sharedLogFileName()} for details."
+                                InstallState.phase = "failed"
+                                InstallState.error = error
+                                InstallState.errorDetail = errorDetail
                                 break
                             }
                         }
@@ -556,19 +595,24 @@ class MainActivity : AppCompatActivity() {
                     } catch (e: Exception) {
                         AssetExtractor.logShared(context, "Probe attempt $attempt/$maxAttempts failed: ${e.message}")
                     }
-                    Thread.sleep(2000)
+                    Thread.sleep(1000)
                 }
                 if (ready) {
                     AssetExtractor.logShared(context, "DONE: Container ready, opening workspace")
                     percent = 100
                     phase = "ready"
+                    InstallState.percent = 100
+                    InstallState.phase = "ready"
                 } else if (phase == "installing") {
-                    AssetExtractor.logShared(context, "ERROR: Container did not respond in 60s after $maxAttempts attempts")
+                    AssetExtractor.logShared(context, "ERROR: Container did not respond after $maxAttempts attempts")
                     phase = "failed"
-                    error = "Container did not respond in 60s"
+                    error = "Container did not respond in time"
                     errorDetail = "Timed out after $maxAttempts attempts probing " +
                         "http://127.0.0.1:${MainActivity.allocatedPort}/. The service started but " +
                         "nothing serves HTTP. See Downloads/${AssetExtractor.sharedLogFileName()} for details."
+                    InstallState.phase = "failed"
+                    InstallState.error = error
+                    InstallState.errorDetail = errorDetail
                     stopContainerService()
                 }
             }

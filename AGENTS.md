@@ -91,6 +91,12 @@ failure the script reports instead of stopping at the first red check
   dismissible) while the service runs, and Stop kills the container +
   service (also under Settings → Stop container). Install starts the service
   in install mode first so the notification exists from the first press.
+  Install text carries the live stage (`Installing… X% — <stage>`); the
+  channel is created before every startForeground (posting to a missing
+  channel kills the process).
+- Reopens never show install steps for an installed env: the fallback page
+  renders a splash (logo + spinner + live stage) while launching, same splash
+  on the post-install ready transition. Daemon probing is 1s × 60 attempts.
 - Downloads resume: rootfs chunks track a `.resume` sidecar and failed runs
   keep `.part` (the final SHA still guards every assembly); the daemon
   resumes the Lean archive via `Range` into `.part`. Never delete partials

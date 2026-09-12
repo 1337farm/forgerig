@@ -28,6 +28,36 @@ interface InstallProgress {
     fun onDone()
 }
 
+/**
+ * Install state shared process-wide. Extraction now runs inside the
+ * foreground service (so swiping the app away can't kill it); any activity
+ * instance polls this to render progress, which is how a reopened app
+ * re-attaches to an ongoing install instead of showing a dead button.
+ * The service writes; activities mirror into their own fields for the JS.
+ */
+object InstallState {
+    @Volatile var phase: String = "idle"
+    @Volatile var percent: Int = 0
+    @Volatile var stage: String = ""
+    @Volatile var detail: String = ""
+    @Volatile var error: String = ""
+    @Volatile var errorDetail: String = ""
+    @Volatile var step: Int = -1
+    /** Set by Stop; the chunk loop aborts promptly on it. */
+    @Volatile var cancelled: Boolean = false
+
+    fun resetForInstall() {
+        phase = "installing"
+        percent = 0
+        step = 0
+        stage = "Preparing…"
+        detail = ""
+        error = ""
+        errorDetail = ""
+        cancelled = false
+    }
+}
+
 class AssetExtractor(private val context: Context) {
 
     companion object {
