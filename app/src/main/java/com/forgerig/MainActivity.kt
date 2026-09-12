@@ -465,8 +465,11 @@ class MainActivity : AppCompatActivity() {
                 } else {
                     context.startService(serviceIntent)
                 }
-            } catch (e: Exception) {
-                AssetExtractor.logShared(context, "ERROR: service action $action failed | $e")
+            } catch (t: Throwable) {
+                // Throwable, not Exception: an Error here (e.g. a missing
+                // framework symbol on old devices) must land in the shared
+                // log, never kill the app from the JS bridge thread.
+                AssetExtractor.logShared(context, "ERROR: service action $action failed | $t")
             }
         }
 
