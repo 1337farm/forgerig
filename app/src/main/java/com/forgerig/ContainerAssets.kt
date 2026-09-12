@@ -198,7 +198,7 @@ fun fetchManifest(context: Context): Map<String, Asset> {
                 var completed = false
                 var lastError: Exception? = null
                 try {
-                    while (attempt < MAX_CHUNK_ATTEMPTS && !completed) {
+                    while (attempt < MAX_CHUNK_ATTEMPTS && !completed && !InstallState.cancelled) {
                         attempt++
                         try {
                             if (end >= start) {
@@ -254,7 +254,12 @@ fun fetchManifest(context: Context): Map<String, Asset> {
                         }
                     }
                     if (!completed) {
-                        failures.add("chunk $i after $attempt attempts: ${lastError?.message}")
+                        val reason = if (InstallState.cancelled) {
+                            "cancelled"
+                        } else {
+                            "after $attempt attempts: ${lastError?.message}"
+                        }
+                        failures.add("chunk $i $reason")
                     }
                 } finally {
                     latch.countDown()

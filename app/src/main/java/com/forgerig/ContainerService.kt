@@ -50,23 +50,102 @@ class ContainerService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> shutdown("stop requested")
-            ACTION_INSTALL -> updateNotification("Installing environment…")
+            ACTION_INSTALL -> startInstall()
             ACTION_START_CONTAINER -> startContainerProcess()
             else -> {
-                // Backward compatible plain start: run the container when the
-                // environment is present, otherwise stay foreground-idle.
-                if (File(filesDir, "ubuntu_rootfs").exists()) {
-                    startContainerProcess()
-                } else {
-                    updateNotification("Preparing…")
+                // Backward compatible plain start (and START_STICKY restart
+                // after process death): run the container when the environment
+                // is present, resume an interrupted download when partials
+                // exist, otherwise stay foreground-idle.
+                val root = File(filesDir, "ubuntu_rootfs")
+                when {
+                    File(root, "bin/sh").exists() -> startContainerProcess()
+                    hasPartialDownload() -> {
+                        AssetExtractor.logShared(this, "Resuming interrupted install after restart")
+                        startInstall()
+                    }
+                    else -> updateNotification("Preparing…")
                 }
             }
         }
         return START_STICKY
     }
 
+    private fun hasPartialDownload(): Boolean {
+        return try {
+            val dir = File(filesDir, "container")
+            dir.listFiles()?.any { f ->
+                f.isFile && (f.name.endsWith(".part") || f.name.endsWith(".resume"))
+            } == true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private var lastInstallNotif = ""
+
+    /** Runs extraction inside the service so it survives the activity going away. */
+    private fun startInstall() {
+        if (InstallState.phase == "installing") {
+            AssetExtractor.logShared(this, "Install requested while already installing; ignoring")
+            return
+        }
+        if (File(filesDir, "ubuntu_rootfs/bin/sh").exists()) {
+            startContainerProcess()
+            return
+        }
+        InstallState.resetForInstall()
+        updateNotification("Installing environment…")
+        lastInstallNotif = ""
+        thread {
+            try {
+                AssetExtractor(this).setProgressListener(object : InstallProgress {
+                    override fun onProgress(percent: Int, stage: String, detail: String) {
+                        InstallState.percent = percent
+                        InstallState.stage = stage
+                        InstallState.detail = detail
+                        val text = "Installing… $percent% — $stage"
+                        if (text != lastInstallNotif) {
+                            lastInstallNotif = text
+                            updateNotification(text)
+                        }
+                    }
+
+                    override fun onStep(step: Int) {
+                        InstallState.step = step
+                    }
+
+                    override fun onError(message: String, detail: String) {
+                        InstallState.phase = "failed"
+                        InstallState.error = message
+                        InstallState.errorDetail = detail
+                        updateNotification("Install failed")
+                    }
+
+                    override fun onDone() {
+                        // Extraction complete. Do NOT start the container here:
+                        // the activity auto-launches on sight of "extracted"
+                        // through its existing probe/reload flow.
+                        InstallState.phase = "extracted"
+                        InstallState.step = 3
+                        InstallState.percent = 100
+                        InstallState.stage = "Extraction complete — starting container…"
+                        updateNotification("Starting container…")
+                    }
+                }).extractAssets()
+            } catch (t: Throwable) {
+                InstallState.phase = "failed"
+                InstallState.error = "Install crashed"
+                InstallState.errorDetail = t.toString()
+                AssetExtractor.logShared(this, "ERROR: service install failed | $t\n${t.stackTraceToString()}")
+                updateNotification("Install failed")
+            }
+        }
+    }
+
     override fun onDestroy() {
         super.onDestroy()
+        InstallState.cancelled = true
         containerProcess?.destroy()
         releaseLocks()
     }
@@ -184,6 +263,9 @@ class ContainerService : Service() {
 
     /** Stop the container process and fully shut the service down. */
     private fun shutdown(reason: String) {
+        // Abort an in-flight install download promptly; the resume sidecar
+        // keeps finished chunks for the next attempt.
+        InstallState.cancelled = true
         try {
             containerProcess?.destroy()
         } catch (e: Exception) {
