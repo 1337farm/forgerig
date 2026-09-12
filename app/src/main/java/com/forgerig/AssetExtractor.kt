@@ -1,5 +1,7 @@
 package com.forgerig
 
+import androidx.annotation.RequiresApi
+
 import android.content.ContentValues
 import android.content.Context
 import android.os.Build
@@ -190,6 +192,7 @@ class AssetExtractor(private val context: Context) {
             }
         }
 
+        @RequiresApi(Build.VERSION_CODES.Q)
         private fun resolveLogUri(resolver: android.content.ContentResolver, fileName: String): android.net.Uri? {
             val existing = resolver.query(
                 MediaStore.Downloads.EXTERNAL_CONTENT_URI,
@@ -476,7 +479,7 @@ class AssetExtractor(private val context: Context) {
                             } else {
                                 8
                             }
-                            val detail = String.format("%d files (%s)", done, entry.name)
+                            val detail = String.format(Locale.US, "%d files (%s)", done, entry.name)
                             progress.onProgress(percent, "Unpacking container files…", detail)
                             if (done % 500 == 0) {
                                 log("PROGRESS [$percent%] Unpacking container files… - $detail")

@@ -1,5 +1,6 @@
 package com.forgerig
 
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -118,8 +119,15 @@ class ContainerService : Service() {
         }
     }
 
+    @SuppressLint("MissingPermission", "NotificationPermission")
     private fun notifyMessage(title: String, message: String, id: Int) {
         try {
+            // POST_NOTIFICATIONS is a runtime permission on Android 13+; posting
+            // without it is a no-op (and a lint violation). Skip quietly unless
+            // notification posting is actually allowed.
+            if (!NotificationManagerCompat.from(this).areNotificationsEnabled()) {
+                return
+            }
             val notification = NotificationCompat.Builder(this, "container_service_channel")
                 .setContentTitle(title)
                 .setContentText(message)
@@ -132,8 +140,12 @@ class ContainerService : Service() {
         }
     }
 
+    @SuppressLint("MissingPermission", "NotificationPermission")
     private fun updateNotification(status: String) {
         try {
+            if (!NotificationManagerCompat.from(this).areNotificationsEnabled()) {
+                return
+            }
             val notification = NotificationCompat.Builder(this, "container_service_channel")
                 .setContentTitle("ForgeRig")
                 .setContentText(status)
