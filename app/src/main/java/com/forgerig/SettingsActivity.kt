@@ -1,5 +1,6 @@
 package com.forgerig
 
+import android.content.Intent
 import android.content.res.ColorStateList
 import android.os.Bundle
 import android.view.Gravity
@@ -103,6 +104,25 @@ class SettingsActivity : AppCompatActivity() {
         }, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = dp(20) })
+
+        root.addView(Button(this).apply {
+            text = "Stop container"
+            setBackgroundColor(0xFF7f1d1d.toInt())
+            setTextColor(0xFFFFFFFF.toInt())
+            setOnClickListener {
+                try {
+                    val stop = Intent(this@SettingsActivity, ContainerService::class.java)
+                        .setAction(ContainerService.ACTION_STOP)
+                    startService(stop)
+                } catch (e: Exception) {
+                    AssetExtractor.logShared(this@SettingsActivity, "ERROR: stop container failed | $e")
+                }
+                Toast.makeText(this@SettingsActivity, "Container stop requested.", Toast.LENGTH_SHORT).show()
+                finish()
+            }
+        }, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(12) })
 
         root.addView(TextView(this).apply {
             text = "The API key is encrypted with the Android keystore and only injected into the container at launch — it never reaches the model through chat."

@@ -246,27 +246,89 @@ fn cached_is_valid(entry: &LeanEntry, path: &Path) -> bool {
 }
 
 /// Blocking streaming download with size + sha256 verification.
+///
+/// Resumes across process death: bytes already present in `<dest>.part` are
+/// kept, the hasher is re-seeded from them, and the request carries
+/// `Range: bytes=<existing>-`. A final size + sha256 check still guards the
+/// assembled file, so a corrupt resume can never ship.
 fn download_verify(entry: &LeanEntry, dest: &Path) -> Result<(), LeanError> {
-    let resp = ureq::get(&entry.url).call().map_err(|e| LeanError::Download(e.to_string()))?;
-    let status = resp.status();
-    if status != 200 {
-        return Err(LeanError::Download(format!("HTTP {status} from {}", entry.url)));
+    let part = PathBuf::from(format!("{}.part", dest.display()));
+    let mut existing: u64 = 0;
+    if let Ok(meta) = std::fs::metadata(&part) {
+        if entry.size == 0 || meta.len() <= entry.size {
+            existing = meta.len();
+        } else {
+            let _ = std::fs::remove_file(&part);
+        }
     }
-    download_stream(resp.into_reader(), dest, entry)
+    let range = format!("bytes={existing}-");
+    let mut req = ureq::get(&entry.url);
+    if existing > 0 {
+        req = req.set("Range", &range);
+        eprintln!("lean download: resuming at {existing}/{} bytes", entry.size);
+    }
+    let resp = req.call().map_err(|e| LeanError::Download(e.to_string()))?;
+    match resp.status() {
+        206 if existing > 0 => {
+            let _progress = DownloadProgress::start(entry.size);
+            // Re-seed the hasher from the kept prefix so the final sha covers
+            // the whole file, then append the remainder.
+            let mut hasher = Sha256::new();
+            let mut f = std::fs::File::open(&part).map_err(|e| LeanError::Download(e.to_string()))?;
+            let mut buf = [0u8; 128 * 1024];
+            let mut hashed: u64 = 0;
+            loop {
+                let n = f.read(&mut buf).map_err(|e| LeanError::Download(e.to_string()))?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                hashed += n as u64;
+            }
+            let file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&part)
+                .map_err(|e| LeanError::Download(e.to_string()))?;
+            stream_into(resp.into_reader(), file, hasher, hashed, entry, &part)?;
+        }
+        200 => {
+            if existing > 0 {
+                eprintln!("lean download: server ignored Range, restarting from 0");
+                let _ = std::fs::remove_file(&part);
+            }
+            download_stream(resp.into_reader(), dest, entry)?;
+            return Ok(());
+        }
+        416 => {
+            let _ = std::fs::remove_file(&part);
+            return Err(LeanError::Download(format!("HTTP 416 for {}", entry.url)));
+        }
+        status => {
+            return Err(LeanError::Download(format!("HTTP {status} from {}", entry.url)));
+        }
+    }
+    if std::fs::rename(&part, dest).is_err() {
+        std::fs::copy(&part, dest).map_err(|e| LeanError::Download(e.to_string()))?;
+        let _ = std::fs::remove_file(&part);
+    }
+    Ok(())
 }
 
-/// Stream a verified payload into `dest`, updating the shared progress
-/// atomics (`DownloadProgress` guard + `LEAN_DOWNLOADED`) as bytes land.
-/// Split out of `download_verify` so a unit test can feed an in-memory
-/// reader and assert the counters the progress bar reads.
-fn download_stream<R: Read>(mut reader: R, dest: &Path, entry: &LeanEntry) -> Result<(), LeanError> {
-    let mut file = std::fs::File::create(dest).map_err(|e| LeanError::Download(e.to_string()))?;
-    let mut hasher = Sha256::new();
+/// Stream a verified payload into an already-opened `file`, updating the
+/// shared progress atomics as bytes land. `total` is the byte count already
+/// accounted for (0 for fresh downloads, the kept prefix when resuming);
+/// `cleanup` is removed on size/sha mismatch.
+fn stream_into<R: Read>(
+    mut reader: R,
+    mut file: std::fs::File,
+    mut hasher: Sha256,
+    mut total: u64,
+    entry: &LeanEntry,
+    cleanup: &Path,
+) -> Result<(), LeanError> {
     let mut buf = [0u8; 128 * 1024];
-    let mut total = 0u64;
-    let mut last_logged = 0u64;
-    let _progress = DownloadProgress::start(entry.size);
-    eprintln!("lean download: started ({} bytes)", entry.size);
+    let mut last_logged = total;
+    LEAN_DOWNLOADED.store(total, Ordering::Relaxed);
     loop {
         let n = reader.read(&mut buf).map_err(|e| LeanError::Download(e.to_string()))?;
         if n == 0 {
@@ -284,15 +346,27 @@ fn download_stream<R: Read>(mut reader: R, dest: &Path, entry: &LeanEntry) -> Re
     file.flush().ok();
     drop(file);
     if entry.size > 0 && total != entry.size {
-        let _ = std::fs::remove_file(dest);
+        let _ = std::fs::remove_file(cleanup);
         return Err(LeanError::Size(entry.size, total));
     }
     let hex = hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>();
     if !entry.sha256.is_empty() && hex != entry.sha256 {
-        let _ = std::fs::remove_file(dest);
+        let _ = std::fs::remove_file(cleanup);
         return Err(LeanError::Checksum(entry.sha256.clone(), hex));
     }
     Ok(())
+}
+
+/// Stream a verified payload into `dest`, updating the shared progress
+/// atomics (`DownloadProgress` guard + `LEAN_DOWNLOADED`) as bytes land.
+/// Split out of `download_verify` so a unit test can feed an in-memory
+/// reader and assert the counters the progress bar reads.
+fn download_stream<R: Read>(reader: R, dest: &Path, entry: &LeanEntry) -> Result<(), LeanError> {
+    let file = std::fs::File::create(dest).map_err(|e| LeanError::Download(e.to_string()))?;
+    let hasher = Sha256::new();
+    let _progress = DownloadProgress::start(entry.size);
+    eprintln!("lean download: started ({} bytes)", entry.size);
+    stream_into(reader, file, hasher, 0, entry, dest)
 }
 
 /// Extract a verified Lean archive into the guest's /usr/local. The archive is

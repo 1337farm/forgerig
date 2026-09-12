@@ -397,6 +397,10 @@ class MainActivity : AppCompatActivity() {
             error = ""
             errorDetail = ""
 
+            // Show the foreground notification the moment install is pressed;
+            // the service idles in install mode until extraction completes.
+            startInstallService()
+
             AssetExtractor(context)
                 .setProgressListener(object : InstallProgress {
                     override fun onProgress(percent: Int, stage: String, detail: String) {
@@ -413,6 +417,7 @@ class MainActivity : AppCompatActivity() {
                         phase = "failed"
                         error = message
                         errorDetail = detail
+                        stopContainerService()
                     }
 
                     override fun onDone() {
@@ -452,13 +457,35 @@ class MainActivity : AppCompatActivity() {
             launchContainerAndWait()
         }
 
-        private fun startContainerInternal() {
-            val serviceIntent = Intent(context, ContainerService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(serviceIntent)
-            } else {
-                context.startService(serviceIntent)
+        private fun startServiceAction(action: String) {
+            try {
+                val serviceIntent = Intent(context, ContainerService::class.java).setAction(action)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(serviceIntent)
+                } else {
+                    context.startService(serviceIntent)
+                }
+            } catch (e: Exception) {
+                AssetExtractor.logShared(context, "ERROR: service action $action failed | $e")
             }
+        }
+
+        private fun startContainerInternal() {
+            startServiceAction(ContainerService.ACTION_START_CONTAINER)
+        }
+
+        private fun startInstallService() {
+            startServiceAction(ContainerService.ACTION_INSTALL)
+        }
+
+        private fun stopContainerService() {
+            startServiceAction(ContainerService.ACTION_STOP)
+        }
+
+        /** App-side stop hook (used by Settings): kills the container + service. */
+        @JavascriptInterface
+        fun stopContainer() {
+            stopContainerService()
         }
 
         private fun launchContainerAndWait() {
@@ -481,6 +508,7 @@ class MainActivity : AppCompatActivity() {
                     phase = "failed"
                     error = "Could not start container service"
                     errorDetail = e.toString()
+                    stopContainerService()
                     return@thread
                 }
                 step = 4
@@ -537,6 +565,7 @@ class MainActivity : AppCompatActivity() {
                     errorDetail = "Timed out after $maxAttempts attempts probing " +
                         "http://127.0.0.1:${MainActivity.allocatedPort}/. The service started but " +
                         "nothing serves HTTP. See Downloads/${AssetExtractor.sharedLogFileName()} for details."
+                    stopContainerService()
                 }
             }
         }

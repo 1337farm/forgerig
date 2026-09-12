@@ -80,6 +80,15 @@ A branch cut from an old `main` will be CONFLICTING by the time you push.
   and the daemon sets a guest `PATH=/usr/local/sbin:...:/bin` + `HOME=/root`
   per proot invocation (the host PATH is meaningless inside the guest).
   Both must ride along with any proot upgrade.
+- The foreground notification is the container's control surface: tap opens
+  the app, Open/Stop actions ride every rebuild, it is ongoing (not
+  dismissible) while the service runs, and Stop kills the container +
+  service (also under Settings → Stop container). Install starts the service
+  in install mode first so the notification exists from the first press.
+- Downloads resume: rootfs chunks track a `.resume` sidecar and failed runs
+  keep `.part` (the final SHA still guards every assembly); the daemon
+  resumes the Lean archive via `Range` into `.part`. Never delete partials
+  on transient failure — only on SHA mismatch.
 - `AssetExtractor` download-first fetches `ubuntu-rootfs.bin` from
   `container-latest` (magic-sniffing zstd/gzip), then falls back to a bundled
   asset for old fat APKs. Keep `ROOTFS_CANDIDATES`, `prepare-assets.sh`,
