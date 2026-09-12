@@ -34,17 +34,20 @@ const LEAN_ARCHIVE_GUEST: &str = "/tmp/lean.tar.zst";
 /// Published alongside the rootfs on `container-latest`.
 const MANIFEST_URL: &str =
     "https://github.com/1337farm/forgerig/releases/download/container-latest/container-manifest.json";
-/// Single `lean` run cap.
-const LEAN_TIMEOUT: Duration = Duration::from_secs(300);
+/// Single `lean` run cap (typechecks are slow: runtime load + checking).
+const LEAN_TIMEOUT: Duration = Duration::from_secs(600);
 /// Network retries for the large Lean archive download.
 const LEAN_DOWNLOAD_ATTEMPTS: u32 = 3;
 /// Unpacking the ~550MB archive (1.5GB unpacked) under proot can be slow.
 const LEAN_EXTRACT_TIMEOUT: Duration = Duration::from_secs(900);
-/// Hard cap for a single `lean --version` probe. Lean's runtime initializes
-/// hundreds of MB of shared libs (libInit_shared.so, libleanshared.so, ...)
-/// through its own ELF loader; under proot's ptrace interception that is slow
-/// enough to look like a hang. Bound it so install can never stall forever.
+/// Hard cap for the install-time `lean --version` probe, kept short so install
+/// can never stall. The version banner is derived from the archive name anyway.
 const LEAN_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Page-cache preload of the big shared libs (background, post-install).
+const LEAN_PRELOAD_TIMEOUT: Duration = Duration::from_secs(150);
+/// Cap for the background warm probe (cache-warm run; long enough to finish a
+/// genuinely-slow-but-working lean invocation and capture the banner).
+const LEAN_WARM_PROBE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Live download progress, polled by the UI via `lean_status`.
 static LEAN_DOWNLOADING: AtomicBool = AtomicBool::new(false);
@@ -55,6 +58,9 @@ static LEAN_LAST_MESSAGE: Mutex<String> = Mutex::new(String::new());
 /// Cursor to the version banner captured at install (or derived from the
 /// archive headline). status() does NOT re-run lean to read it.
 static LEAN_VERSION: Mutex<Option<String>> = Mutex::new(None);
+/// Whether the background warm-up (page-cache preload + warm probe) has been
+/// kicked off this process.
+static LEAN_WARMED: AtomicBool = AtomicBool::new(false);
 
 /// RAII guard: marks the download active on creation and inactive on drop,
 ///
@@ -357,30 +363,34 @@ pub async fn extract_in_guest(archive: &Path) -> Result<(), LeanError> {
     Ok(())
 }
 
+async fn probe_lean_version() -> Option<String> {
+    probe_lean_version_limited(LEAN_PROBE_TIMEOUT).await
+}
+
 /// Run `lean --version` under a hard cap and log the timing. Lean initializes
 /// its runtime by loading hundreds of MB of shared libs through its own ELF
 /// loader; under proot's ptrace interception that is slow enough to look like
 /// a hang, so this must never run unbounded. The captured version banner is
 /// cached for status(). Returns None on timeout/failure.
-async fn probe_lean_version() -> Option<String> {
+async fn probe_lean_version_limited(timeout: Duration) -> Option<String> {
     let t = Instant::now();
     let cmd = format!("LD_LIBRARY_PATH={} {} --version", LEAN_LIB, LEAN_BIN);
-    let r = tools::run_trusted_limited(&cmd, LEAN_PROBE_TIMEOUT).await;
+    let r = tools::run_trusted_limited(&cmd, timeout).await;
     let dur = t.elapsed().as_secs_f64();
     eprintln!(
-        "lean install step 3/3: lean --version finished in {dur:.1}s (exit {:?}, timed_out={})",
-        r.exit_code, r.timed_out
+        "lean probe: lean --version finished in {dur:.1}s (exit {:?}, timed_out={}, cap={:.0}s)",
+        r.exit_code, r.timed_out, timeout.as_secs_f64()
     );
     if r.timed_out {
         eprintln!(
-            "lean install step 3/3: lean --version exceeded {:.0}s — proot overhead loading ~500MB of shared libs is suspected",
-            LEAN_PROBE_TIMEOUT.as_secs_f64()
+            "lean probe: lean --version exceeded {:.0}s — proot overhead loading ~500MB of shared libs is suspected",
+            timeout.as_secs_f64()
         );
         return None;
     }
     if !r.stdout.trim().is_empty() || !r.stderr.trim().is_empty() {
         eprintln!(
-            "lean install step 3/3: lean --version stdout=\"{}\" stderr=\"{}\"",
+            "lean probe: lean --version stdout=\"{}\" stderr=\"{}\"",
             r.stdout.trim(),
             r.stderr.trim()
         );
@@ -401,6 +411,27 @@ async fn probe_lean_version() -> Option<String> {
     None
 }
 
+/// Background warm-up, kicked off once per daemon process once lean is present:
+/// first populate the page cache with the big shared libs (so the runtime
+/// loader's mmaps fault in from RAM instead of cold storage — the likely bulk
+/// of the cold 60s+ cost), then run a warm `lean --version` with a generous cap
+/// to capture a real banner and measure the cache-warm cost. This tells us on
+/// the log whether the bottleneck is storage (warm run is fast) or ptrace.
+async fn warm_lean() {
+    let t = Instant::now();
+    let r = tools::run_trusted_limited(
+        "cat /usr/local/lib/lean/*.so* > /dev/null 2>&1 || true",
+        LEAN_PRELOAD_TIMEOUT,
+    )
+    .await;
+    eprintln!(
+        "lean warm: page-cache preload done in {:.1}s (exit {:?})",
+        t.elapsed().as_secs_f64(),
+        r.exit_code
+    );
+    let _ = probe_lean_version_limited(LEAN_WARM_PROBE_TIMEOUT).await;
+}
+
 /// Whether the guest has a Lean binary and its cached version banner, if any.
 ///
 /// IMPORTANT: does NOT run `lean --version` here. That probe loads hundreds
@@ -412,6 +443,13 @@ pub async fn status() -> LeanStatus {
     if check.exit_code != Some(0) {
         // test -x returns 1 for missing; keep routine polling quiet.
         return snapshot(false, None);
+    }
+    // One-time background warm-up: preloads the libs into page cache and
+    // captures a warm --version banner + timing (see warm_lean). Non-blocking.
+    if !LEAN_WARMED.swap(true, Ordering::Relaxed) {
+        tokio::spawn(async move {
+            warm_lean().await;
+        });
     }
     let version = cached_lean_version();
     snapshot(true, version)
