@@ -90,7 +90,13 @@ fun fetchManifest(context: Context): Map<String, Asset> {
         val file = assetFile(context, name)
         if (isValid(file, info)) return file
         download(name, info, file, onProgress)
-        if (!isValid(file, info)) throw IllegalStateException("download failed sha256 for $name")
+        if (!isValid(file, info)) {
+            // Corrupt assembly (not a resume candidate): drop part + sidecar
+            // so the next attempt starts clean instead of looping on bad bytes.
+            try { File(file.path + ".part").delete() } catch (e: Exception) { }
+            deleteResume(file)
+            throw IllegalStateException("download failed sha256 for $name")
+        }
         return file
     }
 
@@ -110,6 +116,44 @@ fun fetchManifest(context: Context): Map<String, Asset> {
         return md.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
     }
 
+    // Resume sidecar: "$name|$size|$sha256" on line 1, comma-separated finished
+    // chunk indices on line 2. Deliberately hand-rolled (not org.json) so the
+    // download path stays usable from plain JVM unit tests.
+    private fun readResume(name: String, info: Asset, out: File): MutableSet<Int> {
+        val done = mutableSetOf<Int>()
+        try {
+            val lines = File(out.path + ".resume").readLines()
+            if (lines.size < 2) return done
+            val head = lines[0].split('|')
+            if (head.size != 3 || head[0] != name ||
+                head[1] != info.size.toString() || head[2] != info.sha256
+            ) return done
+            val nChunks = ((info.size + CHUNK - 1) / CHUNK).toInt().coerceAtLeast(1)
+            lines[1].split(',').forEach { token ->
+                val idx = token.trim().toIntOrNull() ?: return@forEach
+                if (idx in 0 until nChunks) done.add(idx)
+            }
+        } catch (e: Exception) {
+        }
+        return done
+    }
+
+    private fun saveResume(name: String, info: Asset, out: File, done: Set<Int>) {
+        try {
+            File(out.path + ".resume").writeText(
+                "$name|${info.size}|${info.sha256}\n${done.sorted().joinToString(",")}"
+            )
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun deleteResume(out: File) {
+        try {
+            File(out.path + ".resume").delete()
+        } catch (e: Exception) {
+        }
+    }
+
     internal fun download(
         name: String,
         info: Asset,
@@ -121,15 +165,32 @@ fun fetchManifest(context: Context): Map<String, Asset> {
         val part = File(out.path + ".part")
         val nChunks = ((info.size + CHUNK - 1) / CHUNK).toInt().coerceAtLeast(1)
         Log.i(TAG, "Downloading $name (${info.size} bytes, $nChunks chunks)")
+        fun chunkLen(i: Int): Long = min(CHUNK, info.size - i * CHUNK).coerceAtLeast(0L)
+
+        // Resume: keep finished chunks across process death/force-close. The
+        // sidecar records them; the final SHA check still guards the assembly,
+        // so a corrupt resume can never ship.
+        val done = readResume(name, info, out)
+        if (!part.exists() || part.length() != info.size) {
+            part.delete()
+            done.clear()
+            deleteResume(out)
+            RandomAccessFile(part, "rw").apply { setLength(info.size); close() }
+        }
+        if (done.isNotEmpty()) {
+            Log.i(TAG, "Resuming $name: ${done.size}/$nChunks chunks already present")
+        }
 
         val pool = Executors.newFixedThreadPool(PARALLEL)
-        val latch = CountDownLatch(nChunks)
-        val raf = RandomAccessFile(part, "rw").apply { setLength(info.size) }
+        val pending = (0 until nChunks).filter { it !in done }
+        val latch = CountDownLatch(pending.size)
+        val raf = RandomAccessFile(part, "rw")
         val failures = java.util.Collections.synchronizedList(mutableListOf<String>())
-        val written = java.util.concurrent.atomic.AtomicLong(0L)
-        var lastReportedPct = -1
+        val written = java.util.concurrent.atomic.AtomicLong(done.sumOf { chunkLen(it) })
+        var lastReportedPct = ((written.get() * 100) / info.size).toInt().coerceIn(-1, 100)
+        val resumeLock = Any()
 
-        for (i in 0 until nChunks) {
+        for (i in pending) {
             val start = i * CHUNK
             val end = min(info.size - 1, start + CHUNK - 1)
             pool.execute {
@@ -176,6 +237,10 @@ fun fetchManifest(context: Context): Map<String, Asset> {
                                 }
                             }
                             completed = true
+                            synchronized(resumeLock) {
+                                done.add(i)
+                                saveResume(name, info, out, done)
+                            }
                         } catch (e: Exception) {
                             lastError = e
                             if (attempt < MAX_CHUNK_ATTEMPTS) {
@@ -201,13 +266,16 @@ fun fetchManifest(context: Context): Map<String, Asset> {
         pool.shutdown()
 
         if (failures.isNotEmpty()) {
-            part.delete()
-            throw IllegalStateException("download of $name failed: ${failures.joinToString("; ")}")
+            synchronized(resumeLock) { saveResume(name, info, out, done) }
+            throw IllegalStateException(
+                "download of $name failed (${done.size}/$nChunks chunks kept — resume on retry): ${failures.joinToString("; ")}"
+            )
         }
         if (!part.renameTo(out)) {
             part.copyTo(out, overwrite = true)
             part.delete()
         }
+        deleteResume(out)
         onProgress?.invoke(info.size)
     }
 }
