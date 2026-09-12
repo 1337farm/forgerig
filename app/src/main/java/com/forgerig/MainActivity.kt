@@ -116,6 +116,7 @@ class MainActivity : AppCompatActivity() {
                         </style>
                         <script>
                             var installState = null;
+                            var autoLaunched = false;
 
                             var reloading = false;
                             var FALLBACK_LABELS = ['Prepare runtime', 'Unpack container files', 'Finalize environment', 'Start container service', 'Connect to daemon'];
@@ -136,6 +137,15 @@ class MainActivity : AppCompatActivity() {
                                     var raw = window.NativeHost.getInstallState();
                                     if (raw) {
                                         try { installState = JSON.parse(raw); } catch (e) {}
+                                    }
+                                    // Reopening after a completed install: the daemon isn't
+                                    // running yet, so auto-start the container instead of
+                                    // forcing the user to reinstall. Only once.
+                                    if (!autoLaunched && installState && installState.phase === 'idle' &&
+                                        typeof window.NativeHost.isInstalled === 'function' &&
+                                        window.NativeHost.isInstalled()) {
+                                        autoLaunched = true;
+                                        window.NativeHost.launchExisting();
                                     }
                                 }
                                 renderInstall();
@@ -410,6 +420,36 @@ class MainActivity : AppCompatActivity() {
                     }
                 })
                 .extractAssets()
+        }
+
+        /** True once the Ubuntu rootfs has been extracted (environment installed). */
+        @JavascriptInterface
+        fun isInstalled(): Boolean {
+            return try {
+                val sh = File(context.filesDir, "ubuntu_rootfs/bin/sh")
+                sh.exists()
+            } catch (e: Exception) {
+                false
+            }
+        }
+
+        /**
+         * Reopen path: the environment is already installed, so skip extraction and
+         * just (re)start the container service + wait for the daemon. Reuses the same
+         * `phase == "installing"` probe loop so its status/ready/failed handling applies.
+         */
+        @JavascriptInterface
+        fun launchExisting() {
+            if (phase == "installing" || phase == "launching") {
+                return
+            }
+            phase = "installing"
+            step = 3
+            stage = "Starting container service…"
+            detail = ""
+            error = ""
+            errorDetail = ""
+            launchContainerAndWait()
         }
 
         private fun startContainerInternal() {
