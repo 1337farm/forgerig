@@ -52,11 +52,9 @@ static LEAN_DOWNLOADED: AtomicU64 = AtomicU64::new(0);
 static LEAN_TOTAL: AtomicU64 = AtomicU64::new(0);
 static LEAN_PROVISIONING: AtomicBool = AtomicBool::new(false);
 static LEAN_LAST_MESSAGE: Mutex<String> = Mutex::new(String::new());
-/// Cursor to the version banner captured by the last successful `lean --version`
-/// probe (install step 3). status() does NOT re-run lean to read it.
+/// Cursor to the version banner captured at install (or derived from the
+/// archive headline). status() does NOT re-run lean to read it.
 static LEAN_VERSION: Mutex<Option<String>> = Mutex::new(None);
-/// Whether a detached bounded version probe has been kicked off this process.
-static LEAN_PROBED: AtomicBool = AtomicBool::new(false);
 
 /// RAII guard: marks the download active on creation and inactive on drop,
 ///
@@ -415,16 +413,7 @@ pub async fn status() -> LeanStatus {
         // test -x returns 1 for missing; keep routine polling quiet.
         return snapshot(false, None);
     }
-    let version = LEAN_VERSION.lock().ok().and_then(|v| v.clone());
-    if version.is_none() && !LEAN_PROBED.swap(true, Ordering::Relaxed) {
-        // Lean is present but we've yet to capture its version: fire one
-        // detached, BOUNDED probe (logs the timing — see probe_lean_version)
-        // so the WebView gets a banner without blocking status polling on the
-        // slow runtime init.
-        tokio::spawn(async move {
-            let _ = probe_lean_version().await;
-        });
-    }
+    let version = cached_lean_version();
     snapshot(true, version)
 }
 
@@ -507,12 +496,50 @@ async fn provision_inner() -> Result<String, LeanError> {
         }
     }
     extract_in_guest(&dest).await?;
+    // The version is known from the manifest headline without ever running
+    // `lean` — running it to print a banner is far too slow under proot.
+    if let Some(ver) = lean_version_from_name(&entry.name) {
+        if let Ok(mut cached) = LEAN_VERSION.lock() {
+            *cached = Some(ver);
+        }
+    }
     Ok(format!(
         "Lean installed: {} ({} MB from {})",
         entry.name,
         entry.size / (1024 * 1024),
         manifest_url().rsplit('/').next().unwrap_or(entry.name.as_str())
     ))
+}
+
+/// Derive the Lean version from the upstream archive headline, e.g.
+/// `lean-4.34.0-rc2-linux_aarch64.tar.zst` -> `4.34.0-rc2`. Avoids running
+/// `lean --version`, which loads the whole runtime and takes >60s under proot.
+fn lean_version_from_name(name: &str) -> Option<String> {
+    name.strip_prefix("lean-")
+        .and_then(|s| s.strip_suffix("-linux_aarch64.tar.zst"))
+        .map(|s| s.to_string())
+}
+
+/// Best-effort version without executing lean: prefer the banner cached at
+/// install, else read the archive headline in the cache dir. Never blocks on
+/// lean itself.
+fn cached_lean_version() -> Option<String> {
+    if let Ok(v) = LEAN_VERSION.lock() {
+        if let Some(ver) = v.clone() {
+            return Some(ver);
+        }
+    }
+    // Fall back to the archive filename in the shared cache dir (CONTAINER_CACHE).
+    let cache = cache_dir();
+    if let Ok(entries) = std::fs::read_dir(&cache) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if let Some(ver) = lean_version_from_name(&name) {
+                return Some(ver);
+            }
+        }
+    }
+    None
 }
 
 /// Run `lean` on a file already written into the guest workspace.
@@ -643,5 +670,18 @@ mod tests {
         assert!(!LEAN_DOWNLOADING.load(Ordering::Relaxed));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn version_derived_from_archive_name_without_running_lean() {
+        assert_eq!(
+            lean_version_from_name("lean-4.34.0-rc2-linux_aarch64.tar.zst").as_deref(),
+            Some("4.34.0-rc2")
+        );
+        assert_eq!(
+            lean_version_from_name("lean-4.33.1-linux_aarch64.tar.zst").as_deref(),
+            Some("4.33.1")
+        );
+        assert_eq!(lean_version_from_name("ubuntu-rootfs.bin"), None);
     }
 }

@@ -295,7 +295,7 @@ async fn serve_http(mut stream: TcpStream) {
           leanBtn.style.display='none';
           if (!leanTimer) leanTimer=setInterval(pollTick, POLL_MS);
         } else if (r && r.ready) {
-          leanStatus.textContent='Lean: ready ('+(r.version||'?')+')'; leanBtn.style.display='none';
+          leanStatus.textContent = (r && r.version) ? ('Lean: ready ('+r.version+')') : 'Lean: installed (version unknown)'; leanBtn.style.display='none';
         } else {
           leanStatus.textContent='Lean: '+((r && r.message) ? r.message : 'not installed'); leanBtn.disabled=false; leanBtn.style.display='';
         }
