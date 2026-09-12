@@ -268,7 +268,7 @@ async fn serve_http(mut stream: TcpStream) {
 <pre id="out">Ready.</pre>
 <script>
   var ws=null, label=document.getElementById('status'), out=document.getElementById('out'), prov=document.getElementById('provider');
-  var pending=null, reqId=0, leanTimer=null, leanPollId=0, leanWasProvisioning=false;
+  var pending=null, reqId=0, leanTimer=null, leanPollId=0, leanWasProvisioning=false, POLL_MS=500;
   function connect(){
     label.textContent='Connecting…';
     ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/');
@@ -289,12 +289,18 @@ async fn serve_http(mut stream: TcpStream) {
         out.textContent=t||'(no output)';
       } else if (pending==='lean_status') {
         updateLeanBar(r);
-        if (r && r.ready) { leanStatus.textContent='Lean: ready ('+(r.version||'?')+')'; leanBtn.style.display='none'; }
-        else { leanStatus.textContent='Lean: '+((r && r.message) ? r.message : 'not installed'); leanBtn.disabled=false; leanBtn.style.display=''; }
+        if (r && (r.provisioning || r.downloading)) {
+          // Still working: keep the button hidden and the poll driving updates;
+          // never flip to 'not installed' / re-show the button mid-download.
+          leanBtn.style.display='none';
+          if (!leanTimer) leanTimer=setInterval(pollTick, POLL_MS);
+        } else if (r && r.ready) {
+          leanStatus.textContent='Lean: ready ('+(r.version||'?')+')'; leanBtn.style.display='none';
+        } else {
+          leanStatus.textContent='Lean: '+((r && r.message) ? r.message : 'not installed'); leanBtn.disabled=false; leanBtn.style.display='';
+        }
       } else if (pending==='lean_provision') {
-        leanStatus.textContent='Lean: '+(r && r.message ? r.message : 'done');
-        leanBtn.disabled=true;
-        setTimeout(refreshLean, 1500);
+        leanBtn.style.display='none';
       } else { out.textContent=typeof r==='string' ? r : JSON.stringify(r,null,2); }
       pending=null;
     };
@@ -327,7 +333,7 @@ async fn serve_http(mut stream: TcpStream) {
     if (r && (r.provisioning || r.downloading)) {
       lb.style.display='none';
       leanWasProvisioning=!!r.provisioning;
-      if (!leanTimer) leanTimer=setInterval(pollTick, 1000);
+      if (!leanTimer) leanTimer=setInterval(pollTick, POLL_MS);
       return;
     }
     if (leanTimer) { clearInterval(leanTimer); leanTimer=null; }
@@ -345,7 +351,7 @@ async fn serve_http(mut stream: TcpStream) {
     ws.send(JSON.stringify({jsonrpc:'2.0',method:'lean_provision',params:{},id:reqId}));
     if (leanTimer) clearInterval(leanTimer);
     leanWasProvisioning=true;
-    leanTimer=setInterval(pollTick, 1000);
+    leanTimer=setInterval(pollTick, POLL_MS);
   }
   function send(method, params){
     if (!ws || ws.readyState!==1) { out.textContent='Not connected to daemon yet.'; return; }
