@@ -41,7 +41,10 @@ class ContainerService : Service() {
         acquireLocks()
         // Foreground immediately so the notification exists from the moment
         // install is pressed; the container itself starts on ACTION_START_CONTAINER.
-        startForeground(NOTIF_ID, buildNotification("Preparing…"))
+        // Must go through startForegroundService(): it creates the notification
+        // channel first — startForeground() on an unregistered channel throws
+        // Bad notification for startForeground and kills the process.
+        startForegroundService()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
