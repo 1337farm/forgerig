@@ -1,6 +1,16 @@
 # ForgeRig
 
+[![Build](https://github.com/1337farm/forgerig/actions/workflows/android.yml/badge.svg)](https://github.com/1337farm/forgerig/actions/workflows/android.yml)
+
+**[Download the latest APK](https://github.com/1337farm/forgerig/releases/tag/latest)** (arm64-v8a, Android 8.0+)
+
 ForgeRig is a standalone ARM64 Linux engine providing an isolated Linux userland on unrooted Android devices.
+
+## Install
+
+Download the latest APK from the [Releases](https://github.com/1337farm/forgerig/releases/tag/latest) page and sideload it (you may need to allow "install from unknown sources").
+
+Requirements: Android 8.0+ (API 26+), 64-bit ARM device (arm64-v8a).
 
 ## Features
 
