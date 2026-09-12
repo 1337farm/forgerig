@@ -116,6 +116,16 @@ class ContainerService : Service() {
         }
     }
 
+    // FLAG_IMMUTABLE only exists on API 31+. Referencing it directly kills
+    // the process with NoSuchFieldError on older devices the moment the
+    // service starts, so gate it (lint honors the version guard).
+    private fun mutableFlag(): Int =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            PendingIntent.FLAG_IMMUTABLE
+        } else {
+            0
+        }
+
     private fun openPendingIntent(): PendingIntent {
         val open = Intent(this, MainActivity::class.java).apply {
             action = Intent.ACTION_MAIN
@@ -124,7 +134,7 @@ class ContainerService : Service() {
         }
         return PendingIntent.getActivity(
             this, REQ_OPEN, open,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            PendingIntent.FLAG_UPDATE_CURRENT or mutableFlag()
         )
     }
 
@@ -132,7 +142,7 @@ class ContainerService : Service() {
         val stop = Intent(this, ContainerService::class.java).setAction(ACTION_STOP)
         return PendingIntent.getService(
             this, REQ_STOP, stop,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            PendingIntent.FLAG_UPDATE_CURRENT or mutableFlag()
         )
     }
 
