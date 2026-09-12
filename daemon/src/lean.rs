@@ -13,7 +13,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
@@ -34,12 +34,17 @@ const LEAN_ARCHIVE_GUEST: &str = "/tmp/lean.tar.zst";
 /// Published alongside the rootfs on `container-latest`.
 const MANIFEST_URL: &str =
     "https://github.com/1337farm/forgerig/releases/download/container-latest/container-manifest.json";
-/// A fresh download + extract can exceed the trusted-shell 600s budget.
-const PROVISION_TIMEOUT: Duration = Duration::from_secs(1800);
 /// Single `lean` run cap.
 const LEAN_TIMEOUT: Duration = Duration::from_secs(300);
 /// Network retries for the large Lean archive download.
 const LEAN_DOWNLOAD_ATTEMPTS: u32 = 3;
+/// Unpacking the ~550MB archive (1.5GB unpacked) under proot can be slow.
+const LEAN_EXTRACT_TIMEOUT: Duration = Duration::from_secs(900);
+/// Hard cap for a single `lean --version` probe. Lean's runtime initializes
+/// hundreds of MB of shared libs (libInit_shared.so, libleanshared.so, ...)
+/// through its own ELF loader; under proot's ptrace interception that is slow
+/// enough to look like a hang. Bound it so install can never stall forever.
+const LEAN_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Live download progress, polled by the UI via `lean_status`.
 static LEAN_DOWNLOADING: AtomicBool = AtomicBool::new(false);
@@ -47,6 +52,11 @@ static LEAN_DOWNLOADED: AtomicU64 = AtomicU64::new(0);
 static LEAN_TOTAL: AtomicU64 = AtomicU64::new(0);
 static LEAN_PROVISIONING: AtomicBool = AtomicBool::new(false);
 static LEAN_LAST_MESSAGE: Mutex<String> = Mutex::new(String::new());
+/// Cursor to the version banner captured by the last successful `lean --version`
+/// probe (install step 3). status() does NOT re-run lean to read it.
+static LEAN_VERSION: Mutex<Option<String>> = Mutex::new(None);
+/// Whether a detached bounded version probe has been kicked off this process.
+static LEAN_PROBED: AtomicBool = AtomicBool::new(false);
 
 /// RAII guard: marks the download active on creation and inactive on drop,
 ///
@@ -284,59 +294,136 @@ fn download_stream<R: Read>(mut reader: R, dest: &Path, entry: &LeanEntry) -> Re
 /// Extract a verified Lean archive into the guest's /usr/local. The archive is
 /// bound into the guest (no rootfs copy) and unpacked with guest tools (zstd +
 /// GNU tar are part of the debootstrap include list).
+///
+/// The work is split into named, timed steps so the install log shows exactly
+/// where time goes — previously `lean --version` ran as the tail of one big
+/// pipeline and, because it can take minutes under proot, the whole install
+/// looked stuck at "extracting" for 30 minutes.
 pub async fn extract_in_guest(archive: &Path) -> Result<(), LeanError> {
     let guest = archive
         .to_str()
         .ok_or_else(|| LeanError::Install("archive path is not UTF-8".to_string()))?
         .to_string();
     let bind = format!("{}:{}", guest, LEAN_ARCHIVE_GUEST);
+
+    // ---- Step 1/3: unpack ----
+    eprintln!("lean install step 1/3: unpacking archive into /usr/local");
+    let t0 = Instant::now();
     let cmd = format!(
-        "mkdir -p /usr/local/bin && zstd -d -c {} | tar -x --strip-components=1 -C /usr/local && (ldconfig {} || true) && LD_LIBRARY_PATH={} {} --version",
-        LEAN_ARCHIVE_GUEST, LEAN_LIB, LEAN_LIB, LEAN_BIN
+        "mkdir -p /usr/local/bin && zstd -d -c {} | tar -x --strip-components=1 -C /usr/local",
+        LEAN_ARCHIVE_GUEST
     );
-    eprintln!("lean provision: extracting into guest /usr/local (unpacking archive)");
-    let r = tools::run_trusted_binds_limited(&cmd, &[bind], PROVISION_TIMEOUT).await;
+    let r = tools::run_trusted_binds_limited(&cmd, &[bind], LEAN_EXTRACT_TIMEOUT).await;
     if r.timed_out {
-        eprintln!("lean provision: extraction timed out");
-        return Err(LeanError::Install("extraction timed out".to_string()));
+        return Err(LeanError::Install(format!(
+            "step 1/3 unpack timed out after {:.0}s",
+            LEAN_EXTRACT_TIMEOUT.as_secs_f64()
+        )));
     }
     if r.exit_code != Some(0) {
         return Err(LeanError::Install(format!(
-            "extract failed (exit {:?})\n-- stderr --\n{}\n-- stdout --\n{}",
-            r.exit_code, r.stderr, r.stdout
+            "step 1/3 unpack failed (exit {:?}) after {:.1}s\n-- stderr --\n{}",
+            r.exit_code,
+            t0.elapsed().as_secs_f64(),
+            r.stderr.trim()
         )));
     }
+    eprintln!("lean install step 1/3: unpacked in {:.1}s", t0.elapsed().as_secs_f64());
+
+    // ---- Step 2/3: ldconfig so the loader finds libInit_shared.so etc. ----
+    eprintln!("lean install step 2/3: running ldconfig");
+    let t1 = Instant::now();
+    let r = tools::run_trusted_limited(
+        &format!("ldconfig {} 2>/dev/null || true", LEAN_LIB),
+        Duration::from_secs(120),
+    )
+    .await;
+    eprintln!(
+        "lean install step 2/3: ldconfig done in {:.1}s (exit {:?})",
+        t1.elapsed().as_secs_f64(),
+        r.exit_code
+    );
+
+    // ---- Step 3/3: bounded `lean --version` probe (named) ----
+    // Diagnostic: show what lean will have to load, so a slow probe is
+    // explained by the actual shared-lib sizes on disk.
+    let r3 = tools::run_trusted_limited(
+        &format!("ls -la {LEAN_BIN} 2>/dev/null; ls -l {LEAN_LIB} 2>/dev/null"),
+        Duration::from_secs(30),
+    )
+    .await;
+    if !r3.stdout.trim().is_empty() {
+        eprintln!("lean install step 3/3: extracted lean tree:\n{}", r3.stdout.trim());
+    }
+    probe_lean_version().await;
     Ok(())
 }
 
-/// Whether the guest can run `lean` and its version banner, if any.
-pub async fn status() -> LeanStatus {
-    // The Lean libs live in /usr/local/lib/lean (not on the loader's default
-    // path), so the probe carries LD_LIBRARY_PATH explicitly.
-    let check = tools::run_trusted_limited(
-        &format!("LD_LIBRARY_PATH={} {} --version", LEAN_LIB, LEAN_BIN),
-        LEAN_TIMEOUT,
-    )
-    .await;
-    if check.exit_code != Some(0) {
-        // Exit 127 is the expected "Lean is not installed yet" probe result.
-        // Keep routine status polling quiet; unexpected failures still log.
-        if check.exit_code != Some(127) {
-            eprintln!(
-                "lean status: check failed (exit {:?}) stderr={}",
-                check.exit_code,
-                check.stderr.trim()
-            );
+/// Run `lean --version` under a hard cap and log the timing. Lean initializes
+/// its runtime by loading hundreds of MB of shared libs through its own ELF
+/// loader; under proot's ptrace interception that is slow enough to look like
+/// a hang, so this must never run unbounded. The captured version banner is
+/// cached for status(). Returns None on timeout/failure.
+async fn probe_lean_version() -> Option<String> {
+    let t = Instant::now();
+    let cmd = format!("LD_LIBRARY_PATH={} {} --version", LEAN_LIB, LEAN_BIN);
+    let r = tools::run_trusted_limited(&cmd, LEAN_PROBE_TIMEOUT).await;
+    let dur = t.elapsed().as_secs_f64();
+    eprintln!(
+        "lean install step 3/3: lean --version finished in {dur:.1}s (exit {:?}, timed_out={})",
+        r.exit_code, r.timed_out
+    );
+    if r.timed_out {
+        eprintln!(
+            "lean install step 3/3: lean --version exceeded {:.0}s — proot overhead loading ~500MB of shared libs is suspected",
+            LEAN_PROBE_TIMEOUT.as_secs_f64()
+        );
+        return None;
+    }
+    if !r.stdout.trim().is_empty() || !r.stderr.trim().is_empty() {
+        eprintln!(
+            "lean install step 3/3: lean --version stdout=\"{}\" stderr=\"{}\"",
+            r.stdout.trim(),
+            r.stderr.trim()
+        );
+    }
+    if r.exit_code == Some(0) {
+        let v = format!("{}\n{}", r.stdout, r.stderr);
+        let version = v
+            .lines()
+            .find(|l| l.contains("Lean (version"))
+            .map(|l| l.trim().to_string());
+        if let Some(v) = version.as_ref() {
+            if let Ok(mut cached) = LEAN_VERSION.lock() {
+                *cached = Some(v.clone());
+            }
         }
+        return version;
+    }
+    None
+}
+
+/// Whether the guest has a Lean binary and its cached version banner, if any.
+///
+/// IMPORTANT: does NOT run `lean --version` here. That probe loads hundreds
+/// of MB of shared libs and took >300s (timed out) under proot on device —
+/// running it on every status poll made every check hang. Readiness is a cheap
+/// `test -x`; the version is whatever the bounded install probe captured.
+pub async fn status() -> LeanStatus {
+    let check = tools::run_trusted_limited(&format!("test -x {}", LEAN_BIN), Duration::from_secs(30)).await;
+    if check.exit_code != Some(0) {
+        // test -x returns 1 for missing; keep routine polling quiet.
         return snapshot(false, None);
     }
-    let v = format!("{}\n{}", check.stdout, check.stderr);
-    let version = v
-        .lines()
-        .find(|l| l.contains("Lean (version"))
-        .map(|l| l.to_string());
-    if version.is_none() {
-        eprintln!("lean status: version banner not found");
+    let version = LEAN_VERSION.lock().ok().and_then(|v| v.clone());
+    if version.is_none() && !LEAN_PROBED.swap(true, Ordering::Relaxed) {
+        // Lean is present but we've yet to capture its version: fire one
+        // detached, BOUNDED probe (logs the timing — see probe_lean_version)
+        // so the WebView gets a banner without blocking status polling on the
+        // slow runtime init.
+        tokio::spawn(async move {
+            let _ = probe_lean_version().await;
+        });
     }
     snapshot(true, version)
 }
@@ -344,14 +431,20 @@ pub async fn status() -> LeanStatus {
 /// Download (if needed) + verify + extract the Lean toolchain. Returns a
 /// human-readable report; never panics.
 pub async fn provision() -> String {
-    if let Some(ver) = status().await.version {
+    // Gate on binary presence (status() is a cheap test -x, NOT a lean run):
+    // the version banner may be uncached (probe timed out), so keying on it
+    // would reinstall a working toolchain every time.
+    if status().await.ready {
+        let ver = status().await.version.unwrap_or_else(|| "unknown version".to_string());
         println!("lean provision: already installed ({ver})");
         return format!("Lean already installed ({ver})");
     }
     println!("lean provision: starting download + install");
     match provision_inner().await {
         Ok(msg) => {
-            let ver = status().await.version.unwrap_or_else(|| "unknown version".to_string());
+            // One bounded probe populates the cached banner before this reads it,
+            // but tolerate it being uncached if the probe was slow/timed out.
+            let ver = LEAN_VERSION.lock().ok().and_then(|v| v.clone()).unwrap_or_else(|| "unknown version".to_string());
             println!("{} ({})", msg, ver);
             format!("{msg} ({ver})")
         }
