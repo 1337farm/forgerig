@@ -37,6 +37,7 @@ class ContainerService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        AssetExtractor.installCrashHandler(this)
         acquireLocks()
         // Foreground immediately so the notification exists from the moment
         // install is pressed; the container itself starts on ACTION_START_CONTAINER.

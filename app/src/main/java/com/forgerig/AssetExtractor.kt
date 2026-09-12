@@ -37,6 +37,35 @@ class AssetExtractor(private val context: Context) {
             "ubuntu-rootfs.tar.gz",
             "ubuntu-rootfs.tar"
         )
+        @Volatile
+        private var crashHandlerInstalled = false
+
+        /**
+         * Last-resort crash reporting: route every uncaught exception/Error on
+         * ANY thread (UI, JS bridge, service, worker) into the shared log file
+         * before the process dies, then chain to the previous handler so the
+         * system still handles the crash normally. Without this, crashes like
+         * the install-press NoSuchFieldError leave zero trace in our log.
+         */
+        fun installCrashHandler(context: Context) {
+            if (crashHandlerInstalled) return
+            crashHandlerInstalled = true
+            val appContext = context.applicationContext
+            val previous = Thread.getDefaultUncaughtExceptionHandler()
+            Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+                try {
+                    val trace = "CRASH on thread ${thread.name} | $throwable\n${throwable.stackTraceToString()}"
+                    Log.e(TAG, trace)
+                    logShared(appContext, "ERROR: $trace")
+                } catch (_: Throwable) {
+                } finally {
+                    try {
+                        previous?.uncaughtException(thread, throwable)
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+        }
 
         fun gitSha(): String {
             return try {
