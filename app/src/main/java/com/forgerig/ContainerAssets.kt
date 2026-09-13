@@ -276,6 +276,12 @@ fun fetchManifest(context: Context): Map<String, Asset> {
                 "download of $name failed (${done.size}/$nChunks chunks kept — resume on retry): ${failures.joinToString("; ")}"
             )
         }
+        if (!part.exists()) {
+            // The .part vanished mid-run (a second install thread deleted it):
+            // keep the sidecar and fail loudly instead of a cryptic copy error.
+            synchronized(resumeLock) { saveResume(name, info, out, done) }
+            throw IllegalStateException("download of $name lost its .part mid-run — resume on retry")
+        }
         if (!part.renameTo(out)) {
             part.copyTo(out, overwrite = true)
             part.delete()

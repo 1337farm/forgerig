@@ -86,15 +86,14 @@ class ContainerService : Service() {
 
     /** Runs extraction inside the service so it survives the activity going away. */
     private fun startInstall() {
-        if (InstallState.phase == "installing") {
-            AssetExtractor.logShared(this, "Install requested while already installing; ignoring")
-            return
-        }
         if (File(filesDir, "ubuntu_rootfs/bin/sh").exists()) {
             startContainerProcess()
             return
         }
-        InstallState.resetForInstall()
+        if (!InstallState.tryBeginInstall()) {
+            AssetExtractor.logShared(this, "Install requested while already installing; ignoring")
+            return
+        }
         updateNotification("Installing environment…")
         lastInstallNotif = ""
         thread {
