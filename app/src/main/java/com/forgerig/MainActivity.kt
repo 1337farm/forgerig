@@ -478,13 +478,14 @@ class MainActivity : AppCompatActivity() {
 
         @JavascriptInterface
         fun installNow() {
-            // Claim FIRST, before touching any local fields: the service is the
-            // runner, and our fields are just a mirror. Claiming after
-            // pollInstall's auto-launch is exactly what raced here.
-            if (!InstallState.tryBeginInstall()) {
-                AssetExtractor.logShared(context, "Install requested while already installing; ignoring")
-                return
-            }
+            // The service is the SINGLE owner of the install claim: its
+            // startInstall() atomically claims via tryBeginInstall() and starts
+            // the one extraction thread. Claiming here first seizes the claim,
+            // so the service's startInstall() then sees "already installing"
+            // (reclaimIfStale only fires after 10 idle minutes) and never
+            // starts — the stuck "already installing" on every fresh install.
+            // Our fields are only a UI mirror; the service dedupes repeat
+            // ACTION_INSTALLs through the same claim.
             phase = "installing"
             percent = 0
             step = 0
