@@ -207,6 +207,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "openssl-sys",
+ "reqwest",
  "rig-core",
  "rusqlite",
  "schemars",

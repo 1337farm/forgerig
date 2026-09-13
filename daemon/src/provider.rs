@@ -8,9 +8,11 @@
 //! Free-first model defaults are chosen per provider and every model is
 //! overridable via env.
 
-use rig::completion::Prompt;
-use rig::extractor::Extractor;
-use rig::providers::{gemini, openai};
+use rig::agent::AgentBuilder;
+use rig::completion::{self, CompletionModel, CompletionRequest, CompletionResponse, ModelChoice, Prompt};
+use rig::extractor::{Extractor, ExtractorBuilder};
+use rig::providers::gemini;
+use serde_json::json;
 
 use crate::memory::EvaluationResult;
 use crate::lean::LeanExecutor;
@@ -133,13 +135,172 @@ pub struct Backend {
 
 enum BackendKind {
     Compat {
-        agent: rig::agent::Agent<openai::CompletionModel>,
-        eval: Extractor<openai::CompletionModel, EvaluationResult>,
+        agent: rig::agent::Agent<LoggedOpenAiModel>,
+        eval: Extractor<LoggedOpenAiModel, EvaluationResult>,
     },
     Gemini {
         agent: rig::agent::Agent<gemini::completion::CompletionModel>,
         eval: Extractor<gemini::completion::CompletionModel, EvaluationResult>,
     },
+}
+
+/// OpenAI-chat-completions completion model that owns its HTTP request. This
+/// replaces rig's `openai::Client::from_url` for the compat path so we can:
+///
+/// 1. Bound every request with a real connect/read timeout — rig's client has
+///    none, so a stale keep-alive socket (the classic "first prompt works,
+///    second hangs") blocked until our coarse outer cap (300s) kicked in.
+/// 2. Log the full request payload, response payload, HTTP status, and any
+///    server error body to the shared install log for on-device debugging.
+///
+/// The API key is only ever sent in the Authorization header and is never
+/// logged.
+#[derive(Clone)]
+struct LoggedOpenAiModel {
+    http: reqwest::Client,
+    base_url: String,
+    api_key: String,
+    model: String,
+}
+
+impl LoggedOpenAiModel {
+    fn new(http: reqwest::Client, base_url: String, api_key: String, model: String) -> Self {
+        Self { http, base_url, api_key, model }
+    }
+}
+
+impl CompletionModel for LoggedOpenAiModel {
+    type Response = serde_json::Value;
+
+    async fn completion(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<CompletionResponse<serde_json::Value>, completion::CompletionError> {
+        let mut messages = vec![];
+        if let Some(preamble) = &request.preamble {
+            messages.push(json!({ "role": "system", "content": preamble }));
+        }
+        for m in &request.chat_history {
+            messages.push(json!({ "role": m.role, "content": m.content }));
+        }
+        // rig's prompt_with_context() is pub(crate); reproduce it here. Our
+        // agents never attach documents, so this is normally just `request.prompt`.
+        let user_content = if request.documents.is_empty() {
+            request.prompt.clone()
+        } else {
+            let docs = request
+                .documents
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join("");
+            format!("<attachments>\n{}</attachments>\n\n{}", docs, request.prompt)
+        };
+        messages.push(json!({ "role": "user", "content": user_content }));
+
+        let mut body = serde_json::Map::new();
+        body.insert("model".into(), json!(self.model));
+        body.insert("messages".into(), json!(messages));
+        if let Some(t) = request.temperature {
+            body.insert("temperature".into(), json!(t));
+        }
+        if let Some(mt) = request.max_tokens {
+            body.insert("max_tokens".into(), json!(mt));
+        }
+        if !request.tools.is_empty() {
+            let tools: Vec<serde_json::Value> = request
+                .tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters,
+                        }
+                    })
+                })
+                .collect();
+            body.insert("tools".into(), json!(tools));
+            body.insert("tool_choice".into(), json!("auto"));
+        }
+        if let Some(extra) = request.additional_params {
+            if let Some(obj) = extra.as_object() {
+                for (k, v) in obj {
+                    body.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        let body = serde_json::Value::Object(body);
+
+        let url = format!("{}/v1/chat/completions", self.base_url.trim_end_matches('/'));
+        let request_json = serde_json::to_string(&body).map_err(completion::CompletionError::JsonError)?;
+        eprintln!("chat http: -> POST {url} (model={})", self.model);
+        eprintln!("chat http: request {request_json}");
+
+        let t0 = std::time::Instant::now();
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(completion::CompletionError::HttpError)?;
+        let status = resp.status();
+        let elapsed = t0.elapsed();
+        let text = resp.text().await.map_err(completion::CompletionError::HttpError)?;
+        eprintln!("chat http: <- {status} in {:.2}s", elapsed.as_secs_f64());
+        if !status.is_success() {
+            eprintln!("chat http: server error body: {text}");
+            return Err(completion::CompletionError::ProviderError(text));
+        }
+        eprintln!("chat http: response {text}");
+
+        let v: serde_json::Value = serde_json::from_str(&text).map_err(completion::CompletionError::JsonError)?;
+        let choices = v
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .ok_or_else(|| completion::CompletionError::ResponseError("response had no choices".into()))?;
+        let first = choices
+            .first()
+            .ok_or_else(|| completion::CompletionError::ResponseError("response had empty choices".into()))?;
+        let message = first.get("message");
+
+        if let Some(content) = message.and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
+            if !content.is_empty() {
+                return Ok(CompletionResponse {
+                    choice: ModelChoice::Message(content.to_string()),
+                    raw_response: v,
+                });
+            }
+        }
+        if let Some(calls) = message.and_then(|m| m.get("tool_calls")).and_then(|t| t.as_array()) {
+            if let Some(call) = calls.first() {
+                let name = call
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .ok_or_else(|| completion::CompletionError::ResponseError("tool call missing name".into()))?
+                    .to_string();
+                let args = call.get("function").and_then(|f| f.get("arguments")).cloned().unwrap_or(json!({}));
+                let args = match args {
+                    serde_json::Value::String(s) => {
+                        serde_json::from_str::<serde_json::Value>(&s).unwrap_or(json!({}))
+                    }
+                    other => other,
+                };
+                return Ok(CompletionResponse {
+                    choice: ModelChoice::ToolCall(name, args),
+                    raw_response: v,
+                });
+            }
+        }
+        Err(completion::CompletionError::ResponseError(
+            "response did not contain a message or tool call".into(),
+        ))
+    }
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -184,16 +345,23 @@ impl Backend {
         } else {
             let base = base_url.as_deref().unwrap_or("https://api.openai.com");
             eprintln!("provider={} base_url={} model={} eval_model={}", provider.name(), base, chat_model, eval_model);
-            let client = openai::Client::from_url(&key, base);
-            let agent = client
-                .agent(&chat_model)
+            // Own the HTTP client so we can set connect/read timeouts and log
+            // full payloads (see LoggedOpenAiModel).
+            let http = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(15))
+                .timeout(std::time::Duration::from_secs(180))
+                .build()
+                .expect("reqwest client should build");
+            let chat = LoggedOpenAiModel::new(http.clone(), base.to_string(), key.clone(), chat_model.clone());
+            let agent = AgentBuilder::new(chat)
                 .preamble(SYSTEM_PREAMBLE)
                 .temperature(0.7)
                 .tool(BashExecutor::default())
                 .tool(WasmTransformer::default())
                 .tool(LeanExecutor::default())
                 .build();
-            let eval = client.extractor::<EvaluationResult>(&eval_model).build();
+            let eval_model_impl = LoggedOpenAiModel::new(http, base.to_string(), key.clone(), eval_model.clone());
+            let eval: Extractor<LoggedOpenAiModel, EvaluationResult> = ExtractorBuilder::new(eval_model_impl).build();
             BackendKind::Compat { agent, eval }
         };
 
@@ -201,10 +369,9 @@ impl Backend {
     }
 
     pub async fn chat(&self, prompt: &str) -> Result<String, String> {
-        // rig builds its reqwest client with no timeout, so a stalled upstream
-        // (cold model load, dropped connection) would otherwise leave the UI
-        // stuck on "Thinking…" forever. Bound every completion; a 5-minute cap
-        // comfortably covers slow first-token cold starts.
+        // The compat model bounds its HTTP request with a 15s connect + 180s
+        // read timeout (see LoggedOpenAiModel); this outer cap is a coarse
+        // safety net for the whole agent prompt, including a possible tool call.
         let fut = match &self.kind {
             BackendKind::Compat { agent, .. } => futures_util::future::Either::Left(agent.prompt(prompt)),
             BackendKind::Gemini { agent, .. } => futures_util::future::Either::Right(agent.prompt(prompt)),
