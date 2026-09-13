@@ -1,0 +1,12 @@
+# .babysitrc values for forgerig (KEY=VALUE, sourced by babysit-pr.sh
+# from 1337farm/pr-babysitter; install: curl -fsSL
+# https://raw.githubusercontent.com/1337farm/pr-babysitter/v1/babysit-pr.sh).
+# CLI flags (--artifact=… etc.) override these.
+# Verified against device truth: release APKs are forgerig-release-<sha>.apk,
+# install logs are forgerig-install-release-<sha>.log.txt. Prune runs only in
+# --apk output dirs (script downloads only), so these globs cannot touch strays.
+APK_ARTIFACT="ForgeRig-Release-APK"
+MAIN_WORKFLOW="android.yml"
+RELEASE_TAG="latest"
+APK_GLOB="forgerig-*.apk"
+LOG_GLOB="forgerig-install-*.log*"
