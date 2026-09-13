@@ -3,8 +3,13 @@
 # https://raw.githubusercontent.com/1337farm/pr-babysitter/v1/babysit-pr.sh).
 # CLI flags (--artifact=… etc.) override these.
 # Verified against device truth: release APKs are forgerig-release-<sha>.apk,
-# install logs are forgerig-install-release-<sha>.log.txt. Prune runs only in
-# --apk output dirs (script downloads only), so these globs cannot touch strays.
+# install logs are forgerig-install-release-<sha>.log.txt. Prune is FLAT
+# single-level (verified 2026-09-13 on scratch data): keeps newest 1 APK +
+# newest 2 logs, top level only — NO forgerig-*/ subdir recursion, NO
+# emptied-dir removal (the deleted repo scripts/babysit-pr.sh had both).
+# Removal failures warn loudly but exit stays 0. Prune runs only in --apk
+# output dirs (script downloads only), so these globs cannot touch strays.
+# Do NOT --prune real Downloads: nested forgerig-prNN/ APKs survive.
 APK_ARTIFACT="ForgeRig-Release-APK"
 MAIN_WORKFLOW="android.yml"
 RELEASE_TAG="latest"
