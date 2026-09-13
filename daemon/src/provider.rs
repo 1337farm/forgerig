@@ -286,14 +286,6 @@ impl CompletionModel for LoggedOpenAiModel {
             .ok_or_else(|| completion::CompletionError::ResponseError("response had empty choices".into()))?;
         let message = first.get("message");
 
-        if let Some(content) = message.and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
-            if !content.is_empty() {
-                return Ok(CompletionResponse {
-                    choice: ModelChoice::Message(content.to_string()),
-                    raw_response: v,
-                });
-            }
-        }
         if let Some(calls) = message.and_then(|m| m.get("tool_calls")).and_then(|t| t.as_array()) {
             if let Some(call) = calls.first() {
                 let name = call
@@ -311,6 +303,19 @@ impl CompletionModel for LoggedOpenAiModel {
                 };
                 return Ok(CompletionResponse {
                     choice: ModelChoice::ToolCall(name, args),
+                    raw_response: v,
+                });
+            }
+        }
+        // Fall back to a text message, ignoring leading/trailing whitespace.
+        // Reasoning models (deepseek-v4-flash etc.) return a whitespace-only
+        // "content" next to tool_calls — the tool call above must win, else a
+        // follow-up that triggers a tool answers with a blank 2-char reply.
+        if let Some(content) = message.and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
+            let content = content.trim();
+            if !content.is_empty() {
+                return Ok(CompletionResponse {
+                    choice: ModelChoice::Message(content.to_string()),
                     raw_response: v,
                 });
             }
