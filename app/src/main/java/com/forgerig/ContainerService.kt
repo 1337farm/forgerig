@@ -29,10 +29,14 @@ class ContainerService : Service() {
         const val ACTION_INSTALL = "com.forgerig.action.INSTALL"
         const val ACTION_START_CONTAINER = "com.forgerig.action.START_CONTAINER"
         const val ACTION_STOP = "com.forgerig.action.STOP"
+        /** Broadcast when the service stops so activities finish too (full shutdown). */
+        const val ACTION_FINISH_APP = "com.forgerig.action.FINISH_APP"
         private const val NOTIF_ID = 1
         private const val REQ_OPEN = 100
         private const val REQ_STOP = 101
         private const val CHANNEL_ID = "container_service_channel"
+        /** An install claim with no progress this long is orphaned: reclaimable. */
+        private const val STALE_INSTALL_MS = 10 * 60 * 1000L
     }
 
     override fun onCreate() {
@@ -90,7 +94,7 @@ class ContainerService : Service() {
             startContainerProcess()
             return
         }
-        if (!InstallState.tryBeginInstall()) {
+        if (!InstallState.tryBeginInstall() && !InstallState.reclaimIfStale(STALE_INSTALL_MS)) {
             AssetExtractor.logShared(this, "Install requested while already installing; ignoring")
             return
         }
@@ -103,6 +107,7 @@ class ContainerService : Service() {
                         InstallState.percent = percent
                         InstallState.stage = stage
                         InstallState.detail = detail
+                        InstallState.lastProgressAt = System.currentTimeMillis()
                         val text = "Installing… $percent% — $stage"
                         if (text != lastInstallNotif) {
                             lastInstallNotif = text
@@ -112,6 +117,7 @@ class ContainerService : Service() {
 
                     override fun onStep(step: Int) {
                         InstallState.step = step
+                        InstallState.lastProgressAt = System.currentTimeMillis()
                     }
 
                     override fun onError(message: String, detail: String) {
@@ -276,6 +282,11 @@ class ContainerService : Service() {
         writeStatus("stopped:$reason")
         AssetExtractor.logShared(this, "Container stopped: $reason")
         try {
+            sendBroadcast(Intent(ACTION_FINISH_APP).setPackage(packageName))
+        } catch (e: Exception) {
+            AssetExtractor.logShared(this, "ERROR: finish broadcast failed | $e")
+        }
+        try {
             stopForeground(Service.STOP_FOREGROUND_REMOVE)
         } catch (e: Exception) {
             AssetExtractor.logShared(this, "ERROR: stopForeground failed | $e")
@@ -287,7 +298,8 @@ class ContainerService : Service() {
 
     private fun writeStatus(text: String) {
         try {
-            statusFile().writeText(text)
+            // The rootfs dir may not exist yet on a fresh install.
+            statusFile().apply { parentFile?.mkdirs() }.writeText(text)
         } catch (e: Exception) {
             AssetExtractor.logShared(this, "ERROR: writeStatus failed | $e")
         }

@@ -1,10 +1,15 @@
 package com.forgerig
 
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.webkit.JavascriptInterface
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.appcompat.app.AppCompatDelegate
@@ -37,10 +42,31 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var webView: WebView
 
+    // Stop from the notification must shut the whole app, not just the
+    // service: the service broadcasts this and every activity finishes.
+    private val finishReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == ContainerService.ACTION_FINISH_APP) {
+                finish()
+            }
+        }
+    }
+
+    private fun registerFinishReceiver() {
+        // RECEIVER_NOT_EXPORTED is a compile-time constant (inlined), so this
+        // 3-arg call is safe back to minSdk; the flag is ignored pre-33.
+        registerReceiver(
+            finishReceiver,
+            IntentFilter(ContainerService.ACTION_FINISH_APP),
+            Context.RECEIVER_NOT_EXPORTED
+        )
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         AssetExtractor.installCrashHandler(this)
         AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_YES)
         super.onCreate(savedInstanceState)
+        registerFinishReceiver()
         setContentView(R.layout.activity_main)
 
         // POST_NOTIFICATIONS is a runtime permission on Android 13+. The
@@ -75,6 +101,25 @@ class MainActivity : AppCompatActivity() {
     }
 
     inner class CustomWebViewClient : WebViewClient() {
+        // Serve bundled art (splash) without touching WebView file-access
+        // settings: forgerig.local/* resolves to app assets here.
+        override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+            try {
+                val url = request?.url
+                if (url != null && url.host == "forgerig.local") {
+                    val name = url.pathSegments.lastOrNull()
+                    if (name == "splash.jpeg") {
+                        val stream = view?.context?.assets?.open("splash.jpeg")
+                        if (stream != null) {
+                            return WebResourceResponse("image/jpeg", null, stream)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+            }
+            return super.shouldInterceptRequest(view, request)
+        }
+
         override fun shouldOverrideUrlLoading(view: WebView?, request: android.webkit.WebResourceRequest?): Boolean {
             val url = request?.url
             if (url != null && url.scheme == "forgerig") {
@@ -118,6 +163,7 @@ class MainActivity : AppCompatActivity() {
                             #splash .logo { font-size: 26px; font-weight: bold; color: #e6e6e6; letter-spacing: 1px; }
                             #splash .sub { margin: 12px 0 4px; font-size: 13px; color: #8a8f9a; }
                             #splash .spin { width: 34px; height: 34px; margin: 14px auto 0; border-radius: 50%; border: 3px solid #2a2f3a; border-top-color: #3498db; animation: spin 0.9s linear infinite; }
+                            #splash img { width: 100%; max-width: 380px; border-radius: 12px; border: 1px solid #333; }
                             @keyframes spin { to { transform: rotate(360deg); } }
                         </style>
                         <script>
@@ -346,7 +392,7 @@ class MainActivity : AppCompatActivity() {
                     <body>
                         <div class="message">
                             <h2 id="title">ForgeRig</h2>
-                            <div id="splash"><div class="logo">ForgeRig</div><div class="spin"></div><p class="sub" id="splash-text">Starting…</p></div>
+                            <div id="splash"><img src="https://forgerig.local/splash.jpeg" alt="ForgeRig"/><div class="spin"></div><p class="sub" id="splash-text">Starting…</p></div>
                             <p class="step-count" id="step-count"></p>
                             <ol class="steps" id="steps"></ol>
                             <div class="progress-track" id="progress-track"><div class="progress-fill" id="progress-fill"></div></div>
@@ -616,6 +662,14 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+    }
+
+    override fun onDestroy() {
+        try {
+            unregisterReceiver(finishReceiver)
+        } catch (e: Exception) {
+        }
+        super.onDestroy()
     }
 
     override fun onNewIntent(intent: Intent) {
