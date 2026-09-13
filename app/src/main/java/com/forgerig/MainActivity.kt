@@ -429,10 +429,9 @@ class MainActivity : AppCompatActivity() {
 
         @JavascriptInterface
         fun installNow() {
-            if (InstallState.phase == "installing") {
+            if (!InstallState.tryBeginInstall()) {
                 return
             }
-            InstallState.resetForInstall()
             phase = "installing"
             percent = 0
             step = 0

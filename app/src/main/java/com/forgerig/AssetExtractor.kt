@@ -56,6 +56,19 @@ object InstallState {
         errorDetail = ""
         cancelled = false
     }
+
+    /**
+     * Atomically claim the install runner role. The phase check + reset must
+     * be one critical section, otherwise two rapid taps (or an activity
+     * recreation racing the service) start two extract threads on the same
+     * .part file and corrupt each other's download.
+     */
+    @Synchronized
+    fun tryBeginInstall(): Boolean {
+        if (phase == "installing") return false
+        resetForInstall()
+        return true
+    }
 }
 
 class AssetExtractor(private val context: Context) {
@@ -335,6 +348,10 @@ class AssetExtractor(private val context: Context) {
         // Online-first: fetch the swappable container payload (slim, upgradable
         // APK). Fall back to the bundled asset so full/offline APKs still work.
         try {
+            // The manifest fetch is network-bound with nothing on screen yet;
+            // say so immediately or a DNS stall looks like a hung install.
+            progress.onProgress(2, "Downloading container payload…", "Contacting release server…")
+            log("Contacting release server for container-manifest.json…")
             val manifest = ContainerAssets.fetchManifest(context)
             val mib = manifest[ROOTFS_ASSET]?.size ?: 0L
             val file = ContainerAssets.ensure(context, ROOTFS_ASSET, manifest) { bytes ->
