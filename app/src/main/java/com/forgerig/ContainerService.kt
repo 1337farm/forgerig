@@ -15,6 +15,7 @@ import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import java.io.File
+import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
 class ContainerService : Service() {
@@ -24,11 +25,16 @@ class ContainerService : Service() {
     private var containerProcess: Process? = null
     @Volatile
     private var containerStarted = false
+    /** Bumped on every (re)launch; stale launch threads are ignored on exit. */
+    @Volatile
+    private var daemonGeneration = 0
 
     companion object {
         const val ACTION_INSTALL = "com.forgerig.action.INSTALL"
         const val ACTION_START_CONTAINER = "com.forgerig.action.START_CONTAINER"
         const val ACTION_STOP = "com.forgerig.action.STOP"
+        /** Relaunch the daemon with freshly-read settings (no activity finish). */
+        const val ACTION_RESTART = "com.forgerig.action.RESTART"
         /** Broadcast when the service stops so activities finish too (full shutdown). */
         const val ACTION_FINISH_APP = "com.forgerig.action.FINISH_APP"
         private const val NOTIF_ID = 1
@@ -56,6 +62,7 @@ class ContainerService : Service() {
             ACTION_STOP -> shutdown("stop requested")
             ACTION_INSTALL -> startInstall()
             ACTION_START_CONTAINER -> startContainerProcess()
+            ACTION_RESTART -> restartContainer("settings changed")
             else -> {
                 // Backward compatible plain start (and START_STICKY restart
                 // after process death): run the container when the environment
@@ -347,6 +354,7 @@ class ContainerService : Service() {
             return
         }
         containerStarted = true
+        val gen = ++daemonGeneration
         // Mark the current run first: MainActivity deletes the stale file
         // before starting us, but the probe may read in between, so claim it
         // here too. Only exit:/missing:/exec-denied: fail the probe.
@@ -428,8 +436,10 @@ class ContainerService : Service() {
 
                 AssetExtractor.logShared(this, "Launching daemon (port=${MainActivity.allocatedPort}, proot=${prootBin.absolutePath})")
                 val process = pb.start()
-                containerProcess = process
-                updateNotification("Container running")
+                if (gen == daemonGeneration) {
+                    containerProcess = process
+                    updateNotification("Container running")
+                }
 
                 process.inputStream.bufferedReader().use { reader ->
                     var line = reader.readLine()
@@ -439,18 +449,74 @@ class ContainerService : Service() {
                     }
                 }
                 val code = process.waitFor()
-                containerProcess = null
-                containerStarted = false
-                AssetExtractor.logShared(this, "daemon exited with code $code")
-                writeStatus("exit:$code")
-                updateNotification("Container stopped (exit $code)")
+                if (gen == daemonGeneration) {
+                    containerProcess = null
+                    containerStarted = false
+                    AssetExtractor.logShared(this, "daemon exited with code $code")
+                    writeStatus("exit:$code")
+                    updateNotification("Container stopped (exit $code)")
+                }
             } catch (e: Exception) {
-                containerProcess = null
-                containerStarted = false
-                AssetExtractor.logShared(this, "ERROR: container process failed | $e")
-                writeStatus("exit:error:${e.message}")
-                updateNotification("Container error: ${e.message}")
+                if (gen == daemonGeneration) {
+                    containerProcess = null
+                    containerStarted = false
+                    AssetExtractor.logShared(this, "ERROR: container process failed | $e")
+                    writeStatus("exit:error:${e.message}")
+                    updateNotification("Container error: ${e.message}")
+                }
             }
+        }
+    }
+
+    /**
+     * Reload enabled: relaunch the daemon so it picks up freshly-saved settings
+     * (the daemon's env is fixed at exec time). This does NOT finish activities
+     * or stop the service — the WebView just reconnects to the new daemon.
+     * Old process state is generation-guarded so the drained old thread can't
+     * clobber the new launch, and we wait (bounded) for the old daemon to
+     * release the TCP port before rebinding.
+     */
+    private fun restartContainer(reason: String) {
+        if (!File(filesDir, "ubuntu_rootfs/bin/sh").exists()) {
+            AssetExtractor.logShared(this, "restart requested but environment not installed; ignoring ($reason)")
+            notifyMessage("ForgeRig", "Environment not installed yet — install first.", 2)
+            return
+        }
+        AssetExtractor.logShared(this, "Restarting container: $reason")
+        daemonGeneration++
+        containerStarted = false
+        val old = containerProcess
+        containerProcess = null
+        if (old != null) {
+            try {
+                old.destroy()
+            } catch (e: Exception) {
+                AssetExtractor.logShared(this, "ERROR: destroy old daemon failed | $e")
+            }
+        }
+        writeStatus("restarting")
+        updateNotification("Restarting container…")
+        thread {
+            if (old != null) {
+                var exited = false
+                val deadline = System.currentTimeMillis() + 10_000L
+                while (!exited && System.currentTimeMillis() < deadline) {
+                    try {
+                        exited = old.waitFor(500, TimeUnit.MILLISECONDS)
+                    } catch (e: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        break
+                    }
+                }
+                if (!exited) {
+                    try {
+                        old.destroyForcibly()
+                    } catch (e: Exception) {
+                        AssetExtractor.logShared(this, "ERROR: destroyForcibly old daemon failed | $e")
+                    }
+                }
+            }
+            startContainerProcess()
         }
     }
 }
