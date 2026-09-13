@@ -47,7 +47,10 @@ class MainActivity : AppCompatActivity() {
     private val finishReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == ContainerService.ACTION_FINISH_APP) {
-                finish()
+                // Full shutdown from the notification: finish this activity AND
+                // remove the whole task so nothing (settings back-stack,
+                // recents entry) lingers to reopen into.
+                finishAffinity()
             }
         }
     }
@@ -475,7 +478,11 @@ class MainActivity : AppCompatActivity() {
 
         @JavascriptInterface
         fun installNow() {
+            // Claim FIRST, before touching any local fields: the service is the
+            // runner, and our fields are just a mirror. Claiming after
+            // pollInstall's auto-launch is exactly what raced here.
             if (!InstallState.tryBeginInstall()) {
+                AssetExtractor.logShared(context, "Install requested while already installing; ignoring")
                 return
             }
             phase = "installing"
@@ -509,10 +516,11 @@ class MainActivity : AppCompatActivity() {
          */
         @JavascriptInterface
         fun launchExisting() {
-            if (InstallState.phase == "installing") {
+            // Single-owner: a tap racing this method must not double-launch.
+            if (!InstallState.tryBeginInstall()) {
+                AssetExtractor.logShared(context, "launchExisting ignored: claim already held")
                 return
             }
-            InstallState.phase = "installing"
             phase = "installing"
             InstallState.step = 3
             step = 3

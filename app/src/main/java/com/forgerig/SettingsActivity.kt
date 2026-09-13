@@ -36,7 +36,7 @@ class SettingsActivity : AppCompatActivity() {
     private val finishReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == ContainerService.ACTION_FINISH_APP) {
-                finish()
+                finishAffinity()
             }
         }
     }

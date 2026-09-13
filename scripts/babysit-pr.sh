@@ -17,8 +17,9 @@
 # With --latest-apk, after the merge the script waits for main's android.yml
 # run on the merge commit (the post-merge dispatch rebuild), downloads the
 # republished `latest`-release APK into dir (default ./apk-out), then prunes
-# that dir: keeps only the newest forgerig-*.apk and the newest 3
-# forgerig-install-*.log*, deleting the rest as stale.
+# that dir: keeps only the newest forgerig-*.apk and the newest 2
+# forgerig-install-*.log*, deleting the rest as stale. Pruning only ever
+# touches forgerig-* filenames; nothing else in the dir is a candidate.
 #
 # With --prune=dir, skips CI entirely and just prunes dir immediately
 # (same keep rules). Useful for cleaning the device Downloads folder.
@@ -43,6 +44,7 @@ WANT_LATEST=0
 LATEST_DIR="./apk-out"
 WANT_PRUNE=0
 PRUNE_DIR=""
+PRUNE_AFTER_FETCH=1
 for arg in "$@"; do
     case "$arg" in
         --apk) WANT_APK=1 ;;
@@ -50,10 +52,11 @@ for arg in "$@"; do
         --latest-apk) WANT_LATEST=1 ;;
         --latest-apk=*) WANT_LATEST=1; LATEST_DIR="${arg#--latest-apk=}" ;;
         --prune=*) WANT_PRUNE=1; PRUNE_DIR="${arg#--prune=}" ;;
+        --no-prune) PRUNE_AFTER_FETCH=0 ;;
         *) if [ -z "$PR" ]; then PR="$arg";
            elif [ "$INTERVAL" = "90" ]; then INTERVAL="$arg";
            elif [ "$MAX_POLLS" = "40" ]; then MAX_POLLS="$arg";
-           else echo "usage: $0 <PR> [interval_sec] [max_polls] [--apk[=dir]] [--latest-apk[=dir]] [--prune=dir]" >&2; exit 3; fi ;;
+           else echo "usage: $0 <PR> [interval_sec] [max_polls] [--apk[=dir]] [--latest-apk[=dir]] [--prune=dir] [--no-prune]" >&2; exit 3; fi ;;
     esac
 done
 if [ "$WANT_PRUNE" = "1" ]; then
@@ -110,6 +113,9 @@ if [ "$WANT_APK" = "1" ]; then
     if gh run download "$run_id" -n "$APK_ARTIFACT" -D "$APK_DIR" 2>&1 | tail -1; then
         echo "babysit: APK downloaded to $APK_DIR:"
         ls -lh "$APK_DIR"
+        if [ "$PRUNE_AFTER_FETCH" = "1" ]; then
+            prune_downloads "$APK_DIR"
+        fi
     else
         echo "babysit: APK download failed for run $run_id." >&2
         exit 3
@@ -118,7 +124,7 @@ fi
 
 # Remove stale siblings in a download dir. APKs live loose or one level down
 # (forgerig-prNN/ dirs left by --apk fetches), so scan both; keep only the
-# newest forgerig-*.apk and the newest 3 forgerig-install-*.log*. Removal
+# newest forgerig-*.apk and the newest 2 forgerig-install-*.log*. Removal
 # failures are reported loudly (never silently swallowed) but do not fail
 # the run — the download is the deliverable.
 prune_downloads() {
@@ -142,7 +148,7 @@ prune_downloads() {
     i=0
     while IFS= read -r f; do
         i=$((i + 1))
-        if [ "$i" -gt 3 ]; then
+        if [ "$i" -gt 2 ]; then
             echo "babysit: removing stale log: $f"
             rm -f "$f" || { echo "babysit: WARNING: could not remove $f" >&2; failed=1; }
         fi
