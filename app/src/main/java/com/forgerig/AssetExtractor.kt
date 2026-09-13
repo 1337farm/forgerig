@@ -45,6 +45,8 @@ object InstallState {
     @Volatile var step: Int = -1
     /** Set by Stop; the chunk loop aborts promptly on it. */
     @Volatile var cancelled: Boolean = false
+    /** Last time any install progress was recorded (service onProgress/onStep). */
+    @Volatile var lastProgressAt: Long = 0L
 
     fun resetForInstall() {
         phase = "installing"
@@ -55,6 +57,7 @@ object InstallState {
         error = ""
         errorDetail = ""
         cancelled = false
+        lastProgressAt = System.currentTimeMillis()
     }
 
     /**
@@ -66,6 +69,19 @@ object InstallState {
     @Synchronized
     fun tryBeginInstall(): Boolean {
         if (phase == "installing") return false
+        resetForInstall()
+        return true
+    }
+
+    /**
+     * Reclaim a claim whose owner died without resetting (e.g. process kill
+     * between threads left phase stuck at installing): only when no progress
+     * has been recorded for [idleMs]. Returns true when reclaimed.
+     */
+    @Synchronized
+    fun reclaimIfStale(idleMs: Long): Boolean {
+        if (phase != "installing") return false
+        if (System.currentTimeMillis() - lastProgressAt < idleMs) return false
         resetForInstall()
         return true
     }

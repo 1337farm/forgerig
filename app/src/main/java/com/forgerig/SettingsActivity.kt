@@ -1,6 +1,9 @@
 package com.forgerig
 
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.res.ColorStateList
 import android.os.Bundle
 import android.view.Gravity
@@ -30,9 +33,28 @@ class SettingsActivity : AppCompatActivity() {
         "custom - any OpenAI-compatible endpoint" to "custom",
     )
 
+    private val finishReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == ContainerService.ACTION_FINISH_APP) {
+                finish()
+            }
+        }
+    }
+
+    private fun registerFinishReceiver() {
+        // RECEIVER_NOT_EXPORTED is a compile-time constant (inlined), so this
+        // 3-arg call is safe back to minSdk; the flag is ignored pre-33.
+        registerReceiver(
+            finishReceiver,
+            IntentFilter(ContainerService.ACTION_FINISH_APP),
+            Context.RECEIVER_NOT_EXPORTED
+        )
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_YES)
         super.onCreate(savedInstanceState)
+        registerFinishReceiver()
         val current = SettingsStore.load(this)
 
         val root = LinearLayout(this).apply {
@@ -136,6 +158,14 @@ class SettingsActivity : AppCompatActivity() {
             setBackgroundColor(0xFF1b1f27.toInt())
             addView(root)
         })
+    }
+
+    override fun onDestroy() {
+        try {
+            unregisterReceiver(finishReceiver)
+        } catch (e: Exception) {
+        }
+        super.onDestroy()
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()

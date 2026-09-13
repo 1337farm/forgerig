@@ -20,6 +20,9 @@
 # that dir: keeps only the newest forgerig-*.apk and the newest 3
 # forgerig-install-*.log*, deleting the rest as stale.
 #
+# With --prune=dir, skips CI entirely and just prunes dir immediately
+# (same keep rules). Useful for cleaning the device Downloads folder.
+#
 # Exit codes:
 #   0  all checks pass, or PR merged (+ APK fetched with --apk/--latest-apk)
 #   1  a check failed, or the main run failed
@@ -38,23 +41,34 @@ WANT_APK=0
 APK_DIR="./apk-out"
 WANT_LATEST=0
 LATEST_DIR="./apk-out"
+WANT_PRUNE=0
+PRUNE_DIR=""
 for arg in "$@"; do
     case "$arg" in
         --apk) WANT_APK=1 ;;
         --apk=*) WANT_APK=1; APK_DIR="${arg#--apk=}" ;;
         --latest-apk) WANT_LATEST=1 ;;
         --latest-apk=*) WANT_LATEST=1; LATEST_DIR="${arg#--latest-apk=}" ;;
+        --prune=*) WANT_PRUNE=1; PRUNE_DIR="${arg#--prune=}" ;;
         *) if [ -z "$PR" ]; then PR="$arg";
            elif [ "$INTERVAL" = "90" ]; then INTERVAL="$arg";
            elif [ "$MAX_POLLS" = "40" ]; then MAX_POLLS="$arg";
-           else echo "usage: $0 <PR> [interval_sec] [max_polls] [--apk[=dir]] [--latest-apk[=dir]]" >&2; exit 3; fi ;;
+           else echo "usage: $0 <PR> [interval_sec] [max_polls] [--apk[=dir]] [--latest-apk[=dir]] [--prune=dir]" >&2; exit 3; fi ;;
     esac
 done
-[ -n "$PR" ] || { echo "usage: $0 <PR> [interval_sec] [max_polls] [--apk[=dir]] [--latest-apk[=dir]]" >&2; exit 3; }
+if [ "$WANT_PRUNE" = "1" ]; then
+    [ -n "$PRUNE_DIR" ] || { echo "usage: $0 --prune=dir" >&2; exit 3; }
+    [ -d "$PRUNE_DIR" ] || { echo "babysit: not a directory: $PRUNE_DIR" >&2; exit 3; }
+    PRUNE_ONLY=1
+else
+    PRUNE_ONLY=0
+    [ -n "$PR" ] || { echo "usage: $0 <PR> [interval_sec] [max_polls] [--apk[=dir]] [--latest-apk[=dir]] [--prune=dir]" >&2; exit 3; }
+fi
 command -v gh >/dev/null || { echo "babysit: gh CLI not found" >&2; exit 3; }
 
 APK_ARTIFACT="ForgeRig-Release-APK"
 
+if [ "$PRUNE_ONLY" = "0" ]; then
 n=0
 while [ "$n" -lt "$MAX_POLLS" ]; do
     n=$((n + 1))
@@ -87,6 +101,7 @@ while [ "$n" -lt "$MAX_POLLS" ]; do
     fi
     sleep "$INTERVAL"
 done
+fi
 
 if [ "$WANT_APK" = "1" ]; then
     run_id="$(gh pr checks "$PR" 2>/dev/null | grep -oP 'runs/\K[0-9]+' | head -1)"
@@ -177,4 +192,8 @@ if [ "$WANT_LATEST" = "1" ]; then
     echo "babysit: latest APK downloaded to $LATEST_DIR:"
     ls -lh "$LATEST_DIR"
     prune_downloads "$LATEST_DIR"
+fi
+
+if [ "$WANT_PRUNE" = "1" ]; then
+    prune_downloads "$PRUNE_DIR"
 fi
