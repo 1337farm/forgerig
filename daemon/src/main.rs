@@ -78,8 +78,10 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
             match prompt {
                 Some(p) if !p.trim().is_empty() => {
                     let full = build_context(memory, &p).await;
+                    eprintln!("chat: request (prompt_len={})", full.len());
                     match backend.chat(&full).await {
                         Ok(completion) => {
+                            eprintln!("chat: completion (len={})", completion.len());
                             if let Err(e) = memory.log_trace(&p, &completion).await {
                                 eprintln!("Failed to log trace to memory: {}", e);
                             }
@@ -104,7 +106,7 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
                             });
                             ok(json!(completion), req.id)
                         }
-                        Err(e) => err(-32603, format!("Agent error: {}", e), req.id),
+                        Err(e) => { eprintln!("chat: error: {}", e); err(-32603, format!("Agent error: {}", e), req.id) }
                     }
                 }
                 _ => err(-32602, "Missing 'prompt' in params".into(), req.id),

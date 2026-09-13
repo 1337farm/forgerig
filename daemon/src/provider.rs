@@ -22,6 +22,9 @@ You are an autonomous orchestrator daemon running in a Linux userland inside an 
 Android app. You have tools to run bash, transform WASM, and type-check Lean \
 theorem-prover sources. Be concise and action-oriented.";
 
+/// Upper bound on a single chat completion (rig's HTTP client has no timeout).
+const CHAT_TIMEOUT_SECS: u64 = 300;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Provider {
     OpenAi,
@@ -85,7 +88,7 @@ impl Provider {
         match self {
             Provider::OpenAi => "gpt-4o-mini",
             Provider::OpenRouter => "meta-llama/llama-3.3-70b-instruct:free",
-            Provider::Nvidia => "meta/llama-3.3-70b-instruct",
+            Provider::Nvidia => "nvidia/llama-3.1-nemotron-70b-instruct",
             Provider::Groq => "llama-3.3-70b-versatile",
             Provider::DeepSeek => "deepseek-chat",
             Provider::Mistral => "mistral-small-latest",
@@ -97,7 +100,7 @@ impl Provider {
 
     fn default_eval_model(self) -> &'static str {
         match self {
-            Provider::Nvidia => "meta/llama-3.1-8b-instruct",
+            Provider::Nvidia => "nvidia/llama-3.1-nemotron-51b-instruct",
             Provider::Groq => "llama-3.1-8b-instant",
             Provider::Gemini => "gemini-2.5-flash",
             Provider::Ollama => "llama3.1:8b",
@@ -197,9 +200,17 @@ impl Backend {
     }
 
     pub async fn chat(&self, prompt: &str) -> Result<String, String> {
-        match &self.kind {
-            BackendKind::Compat { agent, .. } => agent.prompt(prompt).await.map_err(|e| e.to_string()),
-            BackendKind::Gemini { agent, .. } => agent.prompt(prompt).await.map_err(|e| e.to_string()),
+        // rig builds its reqwest client with no timeout, so a stalled upstream
+        // (cold model load, dropped connection) would otherwise leave the UI
+        // stuck on "Thinking…" forever. Bound every completion; a 5-minute cap
+        // comfortably covers slow first-token cold starts.
+        let fut = match &self.kind {
+            BackendKind::Compat { agent, .. } => futures_util::future::Either::Left(agent.prompt(prompt)),
+            BackendKind::Gemini { agent, .. } => futures_util::future::Either::Right(agent.prompt(prompt)),
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(CHAT_TIMEOUT_SECS), fut).await {
+            Ok(res) => res.map_err(|e| e.to_string()),
+            Err(_) => Err(format!("chat timed out after {}s", CHAT_TIMEOUT_SECS)),
         }
     }
 
