@@ -188,6 +188,7 @@ impl Backend {
             let agent = client
                 .agent(&chat_model)
                 .preamble(SYSTEM_PREAMBLE)
+                .temperature(0.7)
                 .tool(BashExecutor::default())
                 .tool(WasmTransformer::default())
                 .tool(LeanExecutor::default())
