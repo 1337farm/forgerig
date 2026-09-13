@@ -8,10 +8,10 @@
 //! Free-first model defaults are chosen per provider and every model is
 //! overridable via env.
 
-use rig::agent::AgentBuilder;
 use rig::completion::{self, CompletionModel, CompletionRequest, CompletionResponse, ModelChoice, Prompt};
 use rig::extractor::{Extractor, ExtractorBuilder};
 use rig::providers::gemini;
+use rig::tool::{Tool, ToolSet};
 use serde_json::json;
 
 use crate::memory::EvaluationResult;
@@ -26,6 +26,9 @@ theorem-prover sources. Be concise and action-oriented.";
 
 /// Upper bound on a single chat completion (rig's HTTP client has no timeout).
 const CHAT_TIMEOUT_SECS: u64 = 300;
+
+/// Hard cap on the number of tool→reply rounds before we stop rather than loop.
+const MAX_TOOL_TURNS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Provider {
@@ -135,13 +138,23 @@ pub struct Backend {
 
 enum BackendKind {
     Compat {
-        agent: rig::agent::Agent<LoggedOpenAiModel>,
+        model: LoggedOpenAiModel,
+        tools: ToolSet,
+        tool_defs: Vec<serde_json::Value>,
         eval: Extractor<LoggedOpenAiModel, EvaluationResult>,
     },
     Gemini {
         agent: rig::agent::Agent<gemini::completion::CompletionModel>,
         eval: Extractor<gemini::completion::CompletionModel, EvaluationResult>,
     },
+}
+
+/// A single tool invocation requested by the model (id + name + raw JSON args).
+#[derive(Debug, Clone)]
+struct ToolCallMsg {
+    id: String,
+    name: String,
+    arguments: String,
 }
 
 /// OpenAI-chat-completions completion model that owns its HTTP request. This
@@ -166,6 +179,98 @@ struct LoggedOpenAiModel {
 impl LoggedOpenAiModel {
     fn new(http: reqwest::Client, base_url: String, api_key: String, model: String) -> Self {
         Self { http, base_url, api_key, model }
+    }
+
+    /// One POST to /v1/chat/completions with full logging and parsed JSON.
+    async fn post_chat(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, completion::CompletionError> {
+        let url = format!("{}/v1/chat/completions", self.base_url.trim_end_matches('/'));
+        let request_json = serde_json::to_string(body).map_err(completion::CompletionError::JsonError)?;
+        eprintln!("chat http: -> POST {url} (model={})", self.model);
+        eprintln!("chat http: request {request_json}");
+
+        let t0 = std::time::Instant::now();
+        let send_result = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.api_key)
+            // Force a fresh connection per request. The shared reqwest pool
+            // otherwise reuses a keep-alive socket that NVIDIA's load balancer
+            // may have half-closed, which hangs the *second* call until our
+            // timeout ("operation timed out") — the classic first-works-
+            // second-hangs symptom.
+            .header("Connection", "close")
+            .json(body)
+            .send()
+            .await;
+        let resp = match send_result {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("chat http: send failed after {:.2}s: {e}", t0.elapsed().as_secs_f64());
+                return Err(completion::CompletionError::HttpError(e));
+            }
+        };
+        let status = resp.status();
+        eprintln!("chat http: <- {status} (headers in {:.2}s)", t0.elapsed().as_secs_f64());
+        let text = match resp.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("chat http: body read failed after {:.2}s: {e}", t0.elapsed().as_secs_f64());
+                return Err(completion::CompletionError::HttpError(e));
+            }
+        };
+        eprintln!("chat http: body done in {:.2}s ({} bytes)", t0.elapsed().as_secs_f64(), text.len());
+        if !status.is_success() {
+            eprintln!("chat http: server error body: {text}");
+            return Err(completion::CompletionError::ProviderError(text));
+        }
+        eprintln!("chat http: response {text}");
+        serde_json::from_str(&text).map_err(completion::CompletionError::JsonError)
+    }
+
+    /// Parse an OpenAI chat-completions response into (trimmed text, tool calls).
+    fn parse_turn(
+        v: &serde_json::Value,
+    ) -> Result<(Option<String>, Vec<ToolCallMsg>), completion::CompletionError> {
+        let choices = v
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .ok_or_else(|| completion::CompletionError::ResponseError("response had no choices".into()))?;
+        let first = choices
+            .first()
+            .ok_or_else(|| completion::CompletionError::ResponseError("response had empty choices".into()))?;
+        let message = first.get("message");
+
+        let mut tool_calls = vec![];
+        if let Some(calls) = message.and_then(|m| m.get("tool_calls")).and_then(|t| t.as_array()) {
+            for call in calls {
+                let id = call.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+                let f = call.get("function");
+                let name = f
+                    .and_then(|x| x.get("name"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let arguments = f
+                    .and_then(|x| x.get("arguments"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("{}")
+                    .to_string();
+                tool_calls.push(ToolCallMsg { id, name, arguments });
+            }
+        }
+
+        // Reasoning models can return whitespace-only content next to tool_calls;
+        // callers decide precedence. Trim so blank text yields None.
+        let content = message
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        Ok((content, tool_calls))
     }
 }
 
@@ -233,92 +338,24 @@ impl CompletionModel for LoggedOpenAiModel {
             }
         }
         let body = serde_json::Value::Object(body);
+        let v = self.post_chat(&body).await?;
 
-        let url = format!("{}/v1/chat/completions", self.base_url.trim_end_matches('/'));
-        let request_json = serde_json::to_string(&body).map_err(completion::CompletionError::JsonError)?;
-        eprintln!("chat http: -> POST {url} (model={})", self.model);
-        eprintln!("chat http: request {request_json}");
-
-        let t0 = std::time::Instant::now();
-        let send_result = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            // Force a fresh connection per request. The shared reqwest pool
-            // otherwise reuses a keep-alive socket that NVIDIA's load balancer
-            // may have half-closed, which hangs the *second* call until our
-            // timeout ("operation timed out") — the classic first-works-
-            // second-hangs symptom.
-            .header("Connection", "close")
-            .json(&body)
-            .send()
-            .await;
-        let resp = match send_result {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("chat http: send failed after {:.2}s: {e}", t0.elapsed().as_secs_f64());
-                return Err(completion::CompletionError::HttpError(e));
-            }
-        };
-        let status = resp.status();
-        eprintln!("chat http: <- {status} (headers in {:.2}s)", t0.elapsed().as_secs_f64());
-        let text = match resp.text().await {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("chat http: body read failed after {:.2}s: {e}", t0.elapsed().as_secs_f64());
-                return Err(completion::CompletionError::HttpError(e));
-            }
-        };
-        eprintln!("chat http: body done in {:.2}s ({} bytes)", t0.elapsed().as_secs_f64(), text.len());
-        if !status.is_success() {
-            eprintln!("chat http: server error body: {text}");
-            return Err(completion::CompletionError::ProviderError(text));
+        let (content, mut tool_calls) = Self::parse_turn(&v)?;
+        // Single-shot consumer (rig's Extractor): a submit tool call wins, else
+        // the text. Prefer the tool call even if content is also present.
+        if let Some(call) = tool_calls.drain(..).next() {
+            let args = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                .unwrap_or_else(|_| json!({}));
+            return Ok(CompletionResponse {
+                choice: ModelChoice::ToolCall(call.name, args),
+                raw_response: v,
+            });
         }
-        eprintln!("chat http: response {text}");
-
-        let v: serde_json::Value = serde_json::from_str(&text).map_err(completion::CompletionError::JsonError)?;
-        let choices = v
-            .get("choices")
-            .and_then(|c| c.as_array())
-            .ok_or_else(|| completion::CompletionError::ResponseError("response had no choices".into()))?;
-        let first = choices
-            .first()
-            .ok_or_else(|| completion::CompletionError::ResponseError("response had empty choices".into()))?;
-        let message = first.get("message");
-
-        if let Some(calls) = message.and_then(|m| m.get("tool_calls")).and_then(|t| t.as_array()) {
-            if let Some(call) = calls.first() {
-                let name = call
-                    .get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(|n| n.as_str())
-                    .ok_or_else(|| completion::CompletionError::ResponseError("tool call missing name".into()))?
-                    .to_string();
-                let args = call.get("function").and_then(|f| f.get("arguments")).cloned().unwrap_or(json!({}));
-                let args = match args {
-                    serde_json::Value::String(s) => {
-                        serde_json::from_str::<serde_json::Value>(&s).unwrap_or(json!({}))
-                    }
-                    other => other,
-                };
-                return Ok(CompletionResponse {
-                    choice: ModelChoice::ToolCall(name, args),
-                    raw_response: v,
-                });
-            }
-        }
-        // Fall back to a text message, ignoring leading/trailing whitespace.
-        // Reasoning models (deepseek-v4-flash etc.) return a whitespace-only
-        // "content" next to tool_calls — the tool call above must win, else a
-        // follow-up that triggers a tool answers with a blank 2-char reply.
-        if let Some(content) = message.and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
-            let content = content.trim();
-            if !content.is_empty() {
-                return Ok(CompletionResponse {
-                    choice: ModelChoice::Message(content.to_string()),
-                    raw_response: v,
-                });
-            }
+        if let Some(content) = content {
+            return Ok(CompletionResponse {
+                choice: ModelChoice::Message(content),
+                raw_response: v,
+            });
         }
         Err(completion::CompletionError::ResponseError(
             "response did not contain a message or tool call".into(),
@@ -342,8 +379,59 @@ fn resolve_key(provider: Provider) -> String {
     }
 }
 
+async fn run_agent_loop(
+    model: &LoggedOpenAiModel,
+    tools: &ToolSet,
+    tool_defs: &[serde_json::Value],
+    prompt: &str,
+) -> Result<String, completion::CompletionError> {
+    let mut messages: Vec<serde_json::Value> = vec![
+        json!({ "role": "system", "content": SYSTEM_PREAMBLE }),
+        json!({ "role": "user", "content": prompt }),
+    ];
+    for turn in 0..MAX_TOOL_TURNS {
+        let mut body = serde_json::Map::new();
+        body.insert("model".into(), json!(model.model));
+        body.insert("messages".into(), json!(messages));
+        body.insert("temperature".into(), json!(0.7));
+        if !tool_defs.is_empty() {
+            body.insert("tools".into(), json!(tool_defs));
+            body.insert("tool_choice".into(), json!("auto"));
+        }
+        let v = model.post_chat(&serde_json::Value::Object(body)).await?;
+        let (content, tool_calls) = LoggedOpenAiModel::parse_turn(&v)?;
+
+        if tool_calls.is_empty() {
+            return Ok(content.unwrap_or_default());
+        }
+
+        // Keep the model's assistant message (with its tool_calls) verbatim.
+        if let Some(message) = v
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|c| c.first())
+            .and_then(|m| m.get("message"))
+        {
+            messages.push(message.clone());
+        }
+        // Run every requested tool and feed each result back for the next turn.
+        for tc in &tool_calls {
+            let result = match tools.call(&tc.name, tc.arguments.clone()).await {
+                Ok(r) => r,
+                Err(e) => format!("tool error: {e}"),
+            };
+            eprintln!("chat tool: {} -> {:.240}", tc.name, result);
+            messages.push(json!({ "role": "tool", "tool_call_id": tc.id, "content": result }));
+        }
+        eprintln!("chat tool: ran {} tool call(s) on turn {turn}, asking the model to answer", tool_calls.len());
+    }
+    Err(completion::CompletionError::ResponseError(format!(
+        "agent did not finish within {MAX_TOOL_TURNS} tool turns"
+    )))
+}
+
 impl Backend {
-    pub fn resolve() -> Backend {
+    pub async fn resolve() -> Backend {
         let provider = Provider::from_env();
         let key = resolve_key(provider);
         let key_present = !key.is_empty() && key != "dummy-key";
@@ -375,32 +463,57 @@ impl Backend {
                 .timeout(std::time::Duration::from_secs(180))
                 .build()
                 .expect("reqwest client should build");
-            let chat = LoggedOpenAiModel::new(http.clone(), base.to_string(), key.clone(), chat_model.clone());
-            let agent = AgentBuilder::new(chat)
-                .preamble(SYSTEM_PREAMBLE)
-                .temperature(0.7)
-                .tool(BashExecutor::default())
-                .tool(WasmTransformer::default())
-                .tool(LeanExecutor::default())
-                .build();
-            let eval_model_impl = LoggedOpenAiModel::new(http, base.to_string(), key.clone(), eval_model.clone());
-            let eval: Extractor<LoggedOpenAiModel, EvaluationResult> = ExtractorBuilder::new(eval_model_impl).build();
-            BackendKind::Compat { agent, eval }
+            let model = LoggedOpenAiModel::new(http.clone(), base.to_string(), key.clone(), chat_model.clone());
+            let eval: Extractor<LoggedOpenAiModel, EvaluationResult> =
+                ExtractorBuilder::new(LoggedOpenAiModel::new(http, base.to_string(), key.clone(), eval_model.clone()))
+                    .build();
+
+            let mut tools = ToolSet::default();
+            tools.add_tool(BashExecutor::default());
+            tools.add_tool(WasmTransformer::default());
+            tools.add_tool(LeanExecutor::default());
+
+            let bash_def = BashExecutor::default().definition(String::new()).await;
+            let wasm_def = WasmTransformer::default().definition(String::new()).await;
+            let lean_def = LeanExecutor::default().definition(String::new()).await;
+            let tool_defs: Vec<serde_json::Value> = [bash_def, wasm_def, lean_def]
+                .into_iter()
+                .map(|d| {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": d.name.clone(),
+                            "description": d.description.clone(),
+                            "parameters": d.parameters.clone(),
+                        }
+                    })
+                })
+                .collect();
+
+            BackendKind::Compat { model, tools, tool_defs, eval }
         };
 
         Backend { kind, key_present, provider, chat_model }
     }
 
     pub async fn chat(&self, prompt: &str) -> Result<String, String> {
-        // The compat model bounds its HTTP request with a 15s connect + 180s
-        // read timeout (see LoggedOpenAiModel); this outer cap is a coarse
-        // safety net for the whole agent prompt, including a possible tool call.
+        // The compat model bounds each HTTP round-trip with a 15s connect +
+        // 180s read timeout (see LoggedOpenAiModel); this outer cap bounds the
+        // whole tool loop (up to MAX_TOOL_TURNS round-trips).
         let fut = match &self.kind {
-            BackendKind::Compat { agent, .. } => futures_util::future::Either::Left(agent.prompt(prompt)),
-            BackendKind::Gemini { agent, .. } => futures_util::future::Either::Right(agent.prompt(prompt)),
+            BackendKind::Compat { model, tools, tool_defs, .. } => {
+                futures_util::future::Either::Left(async move {
+                    run_agent_loop(model, tools, tool_defs, prompt).await.map_err(|e| e.to_string())
+                })
+            }
+            BackendKind::Gemini { agent, .. } => {
+                futures_util::future::Either::Right(async move {
+                    agent.prompt(prompt).await.map_err(|e| e.to_string())
+                })
+            }
         };
         match tokio::time::timeout(std::time::Duration::from_secs(CHAT_TIMEOUT_SECS), fut).await {
-            Ok(res) => res.map_err(|e| e.to_string()),
+            Ok(res) => res,
             Err(_) => Err(format!("chat timed out after {}s", CHAT_TIMEOUT_SECS)),
         }
     }
