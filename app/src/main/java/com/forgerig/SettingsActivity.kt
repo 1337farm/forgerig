@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.res.ColorStateList
+import android.os.Build
 import android.os.Bundle
 import android.view.Gravity
 import android.view.ViewGroup
@@ -120,7 +121,19 @@ class SettingsActivity : AppCompatActivity() {
                         apiKey = keyEdit.text.toString(),
                     ),
                 )
-                Toast.makeText(this@SettingsActivity, "Saved. Restart the container to apply.", Toast.LENGTH_LONG).show()
+                try {
+                    val restart = Intent(this@SettingsActivity, ContainerService::class.java)
+                        .setAction(ContainerService.ACTION_RESTART)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        this@SettingsActivity.startForegroundService(restart)
+                    } else {
+                        this@SettingsActivity.startService(restart)
+                    }
+                    Toast.makeText(this@SettingsActivity, "Saved — restarting container with new settings…", Toast.LENGTH_LONG).show()
+                } catch (e: Exception) {
+                    AssetExtractor.logShared(this@SettingsActivity, "ERROR: restart container failed | $e")
+                    Toast.makeText(this@SettingsActivity, "Saved — restart the container to apply.", Toast.LENGTH_LONG).show()
+                }
                 finish()
             }
         }, LinearLayout.LayoutParams(

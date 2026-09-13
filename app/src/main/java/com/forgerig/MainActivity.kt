@@ -202,16 +202,22 @@ class MainActivity : AppCompatActivity() {
                                     // partial download files resumes the install.
                                     // Re-entry guards live on the native side
                                     // (shared state), so repeated ticks are no-ops.
-                                    if (installState && typeof window.NativeHost.isInstalled === 'function') {
-                                        if ((installState.phase === 'idle' && window.NativeHost.isInstalled()) ||
-                                            installState.phase === 'extracted') {
-                                            window.NativeHost.launchExisting();
-                                        } else if (installState.phase === 'idle' &&
-                                            typeof window.NativeHost.hasPartialDownload === 'function' &&
-                                            window.NativeHost.hasPartialDownload()) {
-                                            window.NativeHost.installNow();
-                                        }
+if (installState && typeof window.NativeHost.isInstalled === 'function') {
+                                    var inst = window.NativeHost.isInstalled();
+                                    if (inst && (installState.phase === 'idle' ||
+                                        installState.phase === 'extracted' ||
+                                        installState.phase === 'stopped')) {
+                                        // Installed env whose driver isn't running (fresh
+                                        // open, just-finished extraction, or a prior Stop
+                                        // left phase "stopped") — relaunch, don't show
+                                        // the install screen.
+                                        window.NativeHost.launchExisting();
+                                    } else if (installState.phase === 'idle' &&
+                                        typeof window.NativeHost.hasPartialDownload === 'function' &&
+                                        window.NativeHost.hasPartialDownload()) {
+                                        window.NativeHost.installNow();
                                     }
+                                }
                                 }
                                 renderInstall();
                                 setTimeout(pollInstall, 300);

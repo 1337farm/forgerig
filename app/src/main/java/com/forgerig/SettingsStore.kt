@@ -59,6 +59,9 @@ object SettingsStore {
             .putString("evalModel", s.evalModel.trim())
             .putString("baseUrl", s.baseUrl.trim())
             .putString("apiKey", s.apiKey.trim())
-            .apply()
+            // commit() (not apply()): the settings are read back synchronously by
+            // ContainerService the moment we trigger a container restart, so the
+            // new values must already be flushed to disk.
+            .commit()
     }
 }
