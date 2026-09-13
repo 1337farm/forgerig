@@ -266,11 +266,13 @@ class ContainerService : Service() {
         startForeground(NOTIF_ID, buildNotification("Preparing…"))
     }
 
-    /** Stop the container process and fully shut the service down. */
+    /** Stop the container process and fully shut the service + app down. */
     private fun shutdown(reason: String) {
         // Abort an in-flight install download promptly; the resume sidecar
         // keeps finished chunks for the next attempt.
         InstallState.cancelled = true
+        InstallState.phase = "stopped"
+        InstallState.stage = "Stopped"
         try {
             containerProcess?.destroy()
         } catch (e: Exception) {
