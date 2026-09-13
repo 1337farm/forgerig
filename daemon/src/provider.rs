@@ -240,18 +240,36 @@ impl CompletionModel for LoggedOpenAiModel {
         eprintln!("chat http: request {request_json}");
 
         let t0 = std::time::Instant::now();
-        let resp = self
+        let send_result = self
             .http
             .post(&url)
             .bearer_auth(&self.api_key)
+            // Force a fresh connection per request. The shared reqwest pool
+            // otherwise reuses a keep-alive socket that NVIDIA's load balancer
+            // may have half-closed, which hangs the *second* call until our
+            // timeout ("operation timed out") — the classic first-works-
+            // second-hangs symptom.
+            .header("Connection", "close")
             .json(&body)
             .send()
-            .await
-            .map_err(completion::CompletionError::HttpError)?;
+            .await;
+        let resp = match send_result {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("chat http: send failed after {:.2}s: {e}", t0.elapsed().as_secs_f64());
+                return Err(completion::CompletionError::HttpError(e));
+            }
+        };
         let status = resp.status();
-        let elapsed = t0.elapsed();
-        let text = resp.text().await.map_err(completion::CompletionError::HttpError)?;
-        eprintln!("chat http: <- {status} in {:.2}s", elapsed.as_secs_f64());
+        eprintln!("chat http: <- {status} (headers in {:.2}s)", t0.elapsed().as_secs_f64());
+        let text = match resp.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("chat http: body read failed after {:.2}s: {e}", t0.elapsed().as_secs_f64());
+                return Err(completion::CompletionError::HttpError(e));
+            }
+        };
+        eprintln!("chat http: body done in {:.2}s ({} bytes)", t0.elapsed().as_secs_f64(), text.len());
         if !status.is_success() {
             eprintln!("chat http: server error body: {text}");
             return Err(completion::CompletionError::ProviderError(text));
