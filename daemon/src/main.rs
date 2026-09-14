@@ -296,6 +296,10 @@ async fn serve_http(mut stream: TcpStream) {
           // never flip to 'not installed' / re-show the button mid-download.
           leanBtn.style.display='none';
           if (!leanTimer) leanTimer=setInterval(pollTick, POLL_MS);
+        } else if (r && r.warming) {
+          leanStatus.textContent='Lean: warming up runtime… '+(r.warm_elapsed||0)+'s';
+          leanBtn.style.display='none';
+          if (!leanTimer) leanTimer=setInterval(pollTick, POLL_MS);
         } else if (r && r.ready) {
           leanStatus.textContent = (r && r.version) ? ('Lean: ready ('+r.version+')') : 'Lean: installed (version unknown)'; leanBtn.style.display='none';
         } else {
@@ -322,7 +326,13 @@ async fn serve_http(mut stream: TcpStream) {
   function updateLeanBar(r){
     var bar=document.getElementById('leanBar'), fill=document.getElementById('leanFill');
     if (!bar || !fill) return;
-    if (r && r.downloading && r.total>0) {
+    if (r && r.warming) {
+      // Runtime warm-up is opaque (no byte progress), so show a time-based bar
+      // filling against the warm cap.
+      bar.style.display='block';
+      var pct = (r.warm_timeout>0) ? Math.min(100, Math.floor(r.warm_elapsed*100/r.warm_timeout)) : 0;
+      fill.style.width=pct+'%'; fill.textContent='Warming up Lean runtime… '+(r.warm_elapsed||0)+'s';
+    } else if (r && r.downloading && r.total>0) {
       var pct=Math.floor(r.downloaded*100/r.total);
       bar.style.display='block'; fill.style.width=pct+'%'; fill.textContent=pct+'%';
     } else if (r && !r.ready && (r.downloading || r.provisioning)) {
@@ -332,7 +342,7 @@ async fn serve_http(mut stream: TcpStream) {
   function onLeanPoll(r){
     updateLeanBar(r);
     var lb=document.getElementById('leanBtn');
-    if (r && (r.provisioning || r.downloading)) {
+    if (r && (r.provisioning || r.downloading || r.warming)) {
       lb.style.display='none';
       leanWasProvisioning=!!r.provisioning;
       if (!leanTimer) leanTimer=setInterval(pollTick, POLL_MS);
