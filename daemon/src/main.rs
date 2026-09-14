@@ -281,161 +281,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Serve a small landing page so `http://127.0.0.1:$PORT` in the app's WebView
 /// renders the orchestrator UI instead of a connection error. The page then
 /// opens the WebSocket on the same port for JSON-RPC (chat, exec, status).
+fn page_html() -> String {
+    include_str!("../web/index.html")
+        .replace("/*@MARKDOWN_JS@*/", include_str!("../web/markdown.js"))
+        .replace("/*@STATE_JS@*/", include_str!("../web/state.js"))
+        .replace("/*@APP_JS@*/", include_str!("../web/app.js"))
+}
+
 async fn serve_http(mut stream: TcpStream) {
-    let body = r#"<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="color-scheme" content="dark">
-<title>ForgeRig</title>
-<style>
-  body { font-family: sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; background: #0f1115; color: #e6e6e6; }
-  h1 { font-size: 1.4rem; }
-  #status { color: #7cf787; font-size: .9rem; }
-  #provider { color: #8ab4f8; font-size: .8rem; font-family: monospace; }
-  input, pre { width: 100%; box-sizing: border-box; }
-  input { padding: .6rem; margin: .5rem 0; font-size: 1rem; background: #1b1f27; color: #e6e6e6; border: 1px solid #333; border-radius: 6px; }
-  pre { background: #1b1f27; border-radius: 6px; padding: .8rem; white-space: pre-wrap; word-break: break-word; min-height: 4rem; }
-  .hint { color: #777; font-size: .75rem; margin-top: .25rem; }
-</style>
-</head>
-<body>
-<div style="display:flex; justify-content:space-between; align-items:center;">
-<h1 style="margin:0;">ForgeRig</h1>
-<button id="settingsBtn" onclick="openSettings()" style="background:#333;color:#e6e6e6;border:1px solid #555;border-radius:6px;padding:.4rem .7rem;cursor:pointer;">⚙ Settings</button>
-</div>
-<p id="status">Connecting…</p>
-<p id="provider"></p>
-<div>
-  <input id="prompt" placeholder="Ask, or type !command to run in the container…" autofocus>
-  <div class="hint">Messages starting with ! run directly in the container and never reach the model — put auth tokens/secrets here. Use !lean <dst>/<file> after installing the Lean toolchain below.</div>
-</div>
-<div style="margin-top:.6rem;font-size:.8rem;">
-  <span id="leanStatus" style="color:#e6c07b;">Lean: —</span>
-  <button id="leanBtn" onclick="provisionLean()" style="background:#333;color:#e6e6e6;border:1px solid #555;border-radius:6px;padding:.3rem .8rem;cursor:pointer;margin-left:.5rem;">Download &amp; install Lean (~550 MB)</button>
-</div>
-<div id="leanBar" style="display:none;margin:.4rem 0;height:16px;background:#1b1f27;border:1px solid #555;border-radius:8px;overflow:hidden;max-width:420px;"><div id="leanFill" style="height:100%;width:0;background:#3498db;color:#fff;font-size:.65rem;line-height:16px;text-align:center;white-space:nowrap;">0%</div></div>
-<pre id="out">Ready.</pre>
-<script>
-  var ws=null, label=document.getElementById('status'), out=document.getElementById('out'), prov=document.getElementById('provider');
-  var pending=null, reqId=0, leanTimer=null, leanPollId=0, leanWasProvisioning=false, POLL_MS=500;
-  function connect(){
-    label.textContent='Connecting…';
-    ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/');
-    ws.onopen=function(){ label.textContent='Connected to ForgeRig daemon'; send('status',{}); refreshLean(); pollTick(); };
-    ws.onclose=function(){ label.textContent='Disconnected — retrying…'; setTimeout(connect,1000); };
-    ws.onmessage=function(e){
-      var d; try { d=JSON.parse(e.data); } catch(_) { return; }
-      if (d.error) { out.textContent='Error: '+d.error.message; return; }
-      if (leanPollId && d.id===leanPollId) { leanPollId=0; onLeanPoll(d.result); return; }
-      var r=d.result;
-      var leanStatus=document.getElementById('leanStatus'), leanBtn=document.getElementById('leanBtn');
-      if (pending==='status') { prov.textContent='Provider: '+(r && r.provider ? r.provider : 'unknown'); }
-      else if (pending==='exec') {
-        var t='';
-        if (r && r.stdout) t+=r.stdout;
-        if (r && r.stderr) t+='\n[stderr]\n'+r.stderr;
-        if (r && (r.exit_code!==0 || r.timed_out)) t+='\n[exit '+r.exit_code+(r.timed_out?' timed out':'')+']';
-        out.textContent=t||'(no output)';
-      } else if (pending==='lean_status') {
-        updateLeanBar(r);
-        if (r && (r.provisioning || r.downloading)) {
-          // Still working: keep the button hidden and the poll driving updates;
-          // never flip to 'not installed' / re-show the button mid-download.
-          leanBtn.style.display='none';
-          if (!leanTimer) leanTimer=setInterval(pollTick, POLL_MS);
-        } else if (r && r.warming) {
-          leanStatus.textContent='Lean: warming up runtime… '+(r.warm_elapsed||0)+'s';
-          leanBtn.style.display='none';
-          if (!leanTimer) leanTimer=setInterval(pollTick, POLL_MS);
-        } else if (r && r.ready) {
-          leanStatus.textContent = (r && r.version) ? ('Lean: ready ('+r.version+')') : 'Lean: installed (version unknown)'; leanBtn.style.display='none';
-        } else {
-          leanStatus.textContent='Lean: '+((r && r.message) ? r.message : 'not installed'); leanBtn.disabled=false; leanBtn.style.display='';
-        }
-      } else if (pending==='lean_provision') {
-        leanBtn.style.display='none';
-      } else { out.textContent=typeof r==='string' ? r : JSON.stringify(r,null,2); }
-      pending=null;
-    };
-  }
-  function refreshLean(){
-    if (ws && ws.readyState===1) {
-      ws.send(JSON.stringify({jsonrpc:'2.0',method:'lean_status',params:{},id:++reqId}));
-      pending='lean_status';
-    }
-  }
-  function pollTick(){
-    if (ws && ws.readyState===1) {
-      leanPollId=++reqId;
-      ws.send(JSON.stringify({jsonrpc:'2.0',method:'lean_progress',params:{},id:leanPollId}));
-    }
-  }
-  function updateLeanBar(r){
-    var bar=document.getElementById('leanBar'), fill=document.getElementById('leanFill');
-    if (!bar || !fill) return;
-    if (r && r.warming) {
-      // Runtime warm-up is opaque (no byte progress), so show a time-based bar
-      // filling against the warm cap.
-      bar.style.display='block';
-      var pct = (r.warm_timeout>0) ? Math.min(100, Math.floor(r.warm_elapsed*100/r.warm_timeout)) : 0;
-      fill.style.width=pct+'%'; fill.textContent='Warming up Lean runtime… '+(r.warm_elapsed||0)+'s';
-    } else if (r && r.downloading && r.total>0) {
-      var pct=Math.floor(r.downloaded*100/r.total);
-      bar.style.display='block'; fill.style.width=pct+'%'; fill.textContent=pct+'%';
-    } else if (r && !r.ready && (r.downloading || r.provisioning)) {
-      bar.style.display='block'; fill.style.width='100%'; fill.textContent='working…';
-    } else { bar.style.display='none'; }
-  }
-  function onLeanPoll(r){
-    updateLeanBar(r);
-    var lb=document.getElementById('leanBtn');
-    if (r && (r.provisioning || r.downloading || r.warming)) {
-      lb.style.display='none';
-      leanWasProvisioning=!!r.provisioning;
-      if (!leanTimer) leanTimer=setInterval(pollTick, POLL_MS);
-      return;
-    }
-    if (leanTimer) { clearInterval(leanTimer); leanTimer=null; }
-    leanWasProvisioning=false;
-    refreshLean();
-  }
-  function provisionLean(){
-    if (!ws || ws.readyState!==1) { out.textContent='Not connected to daemon yet.'; return; }
-    var leanStatus=document.getElementById('leanStatus'), leanBtn=document.getElementById('leanBtn');
-    var bar=document.getElementById('leanBar'), fill=document.getElementById('leanFill');
-    leanStatus.textContent='Lean: downloading + installing (~550 MB, may take several minutes)…';
-    leanBtn.style.display='none';
-    bar.style.display='block'; fill.style.width='100%'; fill.textContent='starting…';
-    pending='lean_provision'; reqId++;
-    ws.send(JSON.stringify({jsonrpc:'2.0',method:'lean_provision',params:{},id:reqId}));
-    if (leanTimer) clearInterval(leanTimer);
-    leanWasProvisioning=true;
-    leanTimer=setInterval(pollTick, POLL_MS);
-  }
-  function send(method, params){
-    if (!ws || ws.readyState!==1) { out.textContent='Not connected to daemon yet.'; return; }
-    pending=method; reqId++;
-    ws.send(JSON.stringify({jsonrpc:'2.0',method:method,params:params,id:reqId}));
-    if (method!=='status') out.textContent=method==='chat'?'Thinking…':'Running…';
-  }
-  function openSettings(){
-    if (window.NativeHost) { try { window.NativeHost.openSettings(); } catch(e){} }
-    else { out.textContent='Configure provider settings in the ForgeRig app.'; }
-  }
-  document.getElementById('prompt').addEventListener('keydown',function(e){
-    if (e.key!=='Enter') return;
-    var p=document.getElementById('prompt').value;
-    if (!p) return;
-    document.getElementById('prompt').value='';
-    if (p.charAt(0)==='!') send('exec',{command:p.slice(1).trim()});
-    else send('chat',{prompt:p});
-  });
-  connect();
-</script>
-</body>
-</html>"#;
+    let body = page_html();
 
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -444,4 +298,22 @@ async fn serve_http(mut stream: TcpStream) {
     );
     let _ = stream.write_all(response.as_bytes()).await;
     let _ = stream.shutdown().await;
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn served_page_inlines_all_frontend_js() {
+        let html = super::page_html();
+        // Placeholders must be fully replaced.
+        assert!(!html.contains("/*@"));
+        // Markup, state, and app wiring must be present.
+        assert!(html.contains("id=\"tab-list\""));
+        assert!(html.contains("id=\"composer\""));
+        assert!(html.contains("id=\"send-btn\""));
+        assert!(html.contains("function render"));
+        assert!(html.contains("function visibleTurns"));
+        assert!(html.contains("function forkRawIndex"));
+        assert!(html.contains("function sendMessage"));
+    }
 }
