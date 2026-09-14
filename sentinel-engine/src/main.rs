@@ -1,17 +1,20 @@
 //! Benchmark / verification binary for the sentinel engine.
 //!
 //! Builds a synthetic corpus, checks the transforms, and reports scan
-//! throughput for parallel processing. Primarily a sanity harness; the actual
-//! correctness guarantees live in the unit tests in lib.rs.
+//! and reports scan throughput for parallel processing.
+//! Primarily a sanity harness; the actual correctness
+//! guarantees live in the unit tests in lib.rs.
 //!
 //! Usage:
 //!   cargo run --release -- [OPTIONS]
-//!   --files N          Number of synthetic files (default: 100000)
-//!   --chunk-size N     Scan chunk size in bytes (default: 2097152)
-//!   --threads N        Thread count (default: available parallelism)
-//!   --verify           Verify correctness during benchmark
-//!   --transforms       Benchmark transforms (tab_zip, block_span)
-//!   --help             Show this help message
+//!   --files N                 Number of synthetic files (default: 100000)
+//!   --file-type <rs|md|xml>   File type for content generation (default: rs)
+//!   --all-types               Run benchmarks for all file types (rs, md, xml)
+//!   --chunk-size N            Scan chunk size in bytes (default: 2097152)
+//!   --threads N               Thread count (default: available parallelism)
+//!   --verify                  Verify correctness during benchmark
+//!   --transforms              Benchmark transforms (tab_zip, block_span)
+//!   --help                    Show this help message
 
 use sentinel_engine::*;
 use std::env;
@@ -24,9 +27,9 @@ fn print_usage() {
     eprintln!("  --all-types               Run benchmarks for all file types (rs, md, xml)");
     eprintln!("  --chunk-size N            Scan chunk size in bytes (default: 2097152)");
     eprintln!("  --threads N               Thread count (default: available parallelism)");
-    eprintln!("  --verify                   Verify correctness during benchmark");
-    eprintln!("  --transforms               Benchmark transforms (tab_zip, block_span)");
-    eprintln!("  --help                     Show this help message");
+    eprintln!("  --verify                  Verify correctness during benchmark");
+    eprintln!("  --transforms              Benchmark transforms (tab_zip, block_span)");
+    eprintln!("  --help                    Show this help message");
 }
 
 fn parse_args() -> (usize, usize, usize, bool, bool, String, bool) {
@@ -113,10 +116,7 @@ fn synthetic(files: usize, file_type: &str) -> Vec<u8> {
             "xml" | "xmlext" => {
                 payload.extend_from_slice(format!("\u{00A7}config/{}.xml\n", i).as_bytes());
                 payload.extend_from_slice(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-                payload.extend_from_slice(b"<project>\n  <name>ExampleProject</name>\n  <version>1.0.0</version>\n  <dependencies>\n    <dependency>\n      <name>serde</name>\n      <version>1.0</version>\n    </dependency>\n  </dependencies>\n  <features>\n    <feature name=\"compression\" />\n    <feature name=\"networking\" />\n  </features>\n</project>\n");
-                payload.extend_from_slice(b"<!-- diff block --\n");
-                payload.extend_from_slice(b"<!-- <name>ExampleProject</name> -->\n");
-                payload.extend_from_slice(b"<!-- <name>ExampleProjectNew</name> -->\n");
+                payload.extend_from_slice(b"<project>\n  <name>ExampleProject</name>\n  <version>1.0.0</version>\n  <dependencies>\n    <dependency>\n      <name>serde</name>\n      <version>1.0</version>\n    </dependency>\n  </dependencies>\n  <features>\n      <feature name=\"compression\" />\n      <feature name=\"networking\" />\n  </features>\n</project>\n");
             }
             _ => {
                 payload.extend_from_slice(format!("\u{00A7}src/mod{}.rs\n", i).as_bytes());
@@ -131,7 +131,11 @@ fn synthetic(files: usize, file_type: &str) -> Vec<u8> {
 fn main() {
     let (files, chunk_size, thread_count, verify, transforms, file_type, all_types) = parse_args();
 
-    let types: Vec<&str> = if all_types { vec!["rs", "md", "xml"] } else { vec![&file_type] };
+    let types: Vec<&str> = if all_types {
+        vec!["rs", "md", "xml"]
+    } else {
+        vec![&file_type]
+    };
 
     for ft in &types {
         println!("=== Sentinel Engine Benchmark ({}) ===", ft);
@@ -200,7 +204,9 @@ fn main() {
             let mut ok = true;
             for r in &records {
                 let zipped = tab_zip(r.body);
-                if zipped.len() > r.body.len() { ok = false; }
+                if zipped.len() > r.body.len() {
+                    ok = false;
+                }
                 let _ = diff_to_block_span(std::str::from_utf8(r.body).unwrap_or(""));
             }
             println!("verify: {}", if ok { "PASS" } else { "FAIL" });
