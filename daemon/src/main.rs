@@ -14,6 +14,7 @@ mod wasm;
 mod memory;
 mod provider;
 mod lean;
+mod sessions;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct RpcRequest {
@@ -39,21 +40,23 @@ struct RpcError {
     message: String,
 }
 
-async fn build_context(memory: &Arc<MemoryEngine>, prompt: &str) -> String {
-    match memory.get_macro_memories(5).await {
-        Ok(mems) if !mems.is_empty() => {
+async fn system_message_with_memory(memory: &Arc<MemoryEngine>) -> Value {
+    let mut sys = provider::system_message();
+    if let Ok(mems) = memory.get_macro_memories(5).await {
+        if !mems.is_empty() {
             let body = mems
-                .into_iter()
-                .map(|(m, c)| format!("## {}\n{}", m, c))
+                .iter()
+                .map(|(m, c)| format!("## {m}\n{c}"))
                 .collect::<Vec<_>>()
                 .join("\n\n");
-            format!("### Architectural memory (prior milestones)\n{}\n\n### Current task\n{}", body, prompt)
+            let base = sys.get("content").and_then(|c| c.as_str()).unwrap_or_default();
+            sys["content"] = json!(format!("{base}\n\n### Project memory (permanent)\n{body}"));
         }
-        _ => prompt.to_string(),
     }
+    sys
 }
 
-async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &Arc<MemoryEngine>) -> RpcResponse {
+async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &Arc<MemoryEngine>, sessions: &Arc<sessions::SessionManager>) -> RpcResponse {
     fn ok(result: Value, id: Option<Value>) -> RpcResponse {
         RpcResponse { jsonrpc: "2.0".into(), result: Some(result), error: None, id }
     }
@@ -75,18 +78,30 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
         }
         "chat" => {
             let prompt = req.params.as_ref().and_then(|p| p.get("prompt").and_then(|p| p.as_str())).map(|s| s.to_string());
+            let session_id = req.params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str()).map(|s| s.to_string());
             match prompt {
                 Some(p) if !p.trim().is_empty() => {
-                    let full = build_context(memory, &p).await;
-                    eprintln!("chat: request (prompt_len={})", full.len());
-                    match backend.chat(&full).await {
+                    // Reuse an existing session's cached thread, or start a new one.
+                    let sid = match session_id.filter(|s| sessions.exists(s)) {
+                        Some(id) => id,
+                        None => sessions.create(system_message_with_memory(memory).await).id,
+                    };
+                    let mut messages = sessions.get(&sid).map(|s| s.messages).unwrap_or_else(|| vec![provider::system_message()]);
+                    // Keep the session's system message synced with the latest
+                    // permanent project memory (spans sessions/projects).
+                    if let Some(first) = messages.first_mut() {
+                        *first = system_message_with_memory(memory).await;
+                    }
+                    eprintln!("chat: session={sid} prompt_len={}", p.len());
+                    match backend.chat_session(&mut messages, &p).await {
                         Ok(completion) => {
                             eprintln!("chat: completion (len={})", completion.len());
-                            if let Err(e) = memory.log_trace(&p, &completion).await {
-                                eprintln!("Failed to log trace to memory: {}", e);
-                            }
-                            // Periodically evaluate traces (every 5th) to detect
-                            // milestones and prune noise; runs detached.
+                            let _ = memory.log_trace(&p, &completion).await;
+                            // Persist the extended thread as the reusable session cache.
+                            sessions.set_messages(&sid, messages);
+                            // Detached: every 5th trace, evaluate recent traces for
+                            // milestones (prune noise + record macro memory). Never
+                            // blocks the reply.
                             let backend2 = Arc::clone(backend);
                             let memory2 = Arc::clone(memory);
                             tokio::spawn(async move {
@@ -104,13 +119,37 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
                                     }
                                 }
                             });
-                            ok(json!(completion), req.id)
+                            ok(json!({ "reply": completion, "session_id": sid }), req.id)
                         }
                         Err(e) => { eprintln!("chat: error: {}", e); err(-32603, format!("Agent error: {}", e), req.id) }
                     }
                 }
                 _ => err(-32602, "Missing 'prompt' in params".into(), req.id),
             }
+        }
+        "session_list" => ok(json!(sessions.list()), req.id),
+        "session_create" => {
+            let s = sessions.create(provider::system_message());
+            ok(json!({ "id": s.id, "title": s.title, "messages": s.messages }), req.id)
+        }
+        "session_history" => {
+            let id = req.params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str()).unwrap_or_default();
+            match sessions.get(id) {
+                Some(s) => ok(json!({ "id": s.id, "title": s.title, "messages": s.messages }), req.id),
+                None => err(-32602, format!("unknown session '{id}'"), req.id),
+            }
+        }
+        "session_fork" => {
+            let id = req.params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
+            let index = req.params.as_ref().and_then(|p| p.get("message_index")).and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+            match sessions.fork(&id, index) {
+                Some(f) => ok(json!({ "id": f.id, "title": f.title, "messages": f.messages }), req.id),
+                None => err(-32602, format!("cannot fork unknown session '{id}'"), req.id),
+            }
+        }
+        "session_delete" => {
+            let id = req.params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
+            ok(json!({ "deleted": sessions.delete(&id) }), req.id)
         }
         "lean_status" => {
             let st = lean::status().await;
@@ -164,6 +203,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let backend = Arc::new(provider::Backend::resolve().await);
     let memory_engine = Arc::new(MemoryEngine::new("oss_memory.db").await?);
+    let sessions = Arc::new(sessions::SessionManager::new());
     println!("Listening on: {} ({})", addr, backend.describe());
 
     let listener = TcpListener::bind(&addr).await?;
@@ -171,6 +211,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Ok((stream, _)) = listener.accept().await {
         let backend = Arc::clone(&backend);
         let memory = Arc::clone(&memory_engine);
+        let sessions = Arc::clone(&sessions);
 
         tokio::spawn(async move {
             // Peek (without consuming) to decide whether this is a WebSocket
@@ -199,27 +240,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             println!("New WebSocket connection");
 
-            let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+            let (ws_sender, mut ws_receiver) = ws_stream.split();
+            let ws_sender = std::sync::Arc::new(tokio::sync::Mutex::new(ws_sender));
 
+            // Handle each incoming request concurrently so a long chat can't
+            // block lean_status/progress polls or another session's chat.
             while let Some(msg) = ws_receiver.next().await {
                 if let Ok(msg) = msg {
                     if msg.is_text() {
-                        let text = msg.to_text().unwrap();
-                        let response = match serde_json::from_str::<RpcRequest>(text) {
-                            Ok(req) => handle_rpc(req, &backend, &memory).await,
-                            Err(_) => RpcResponse {
-                                jsonrpc: "2.0".into(),
-                                result: None,
-                                error: Some(RpcError { code: -32700, message: "Parse error".into() }),
-                                id: None,
-                            },
-                        };
-
-                        let response_str = serde_json::to_string(&response).unwrap();
-                        if let Err(e) = ws_sender.send(tokio_tungstenite::tungstenite::Message::Text(response_str)).await {
-                            eprintln!("Error sending message: {}", e);
-                            break;
-                        }
+                        let text = msg.to_text().unwrap().to_string();
+                        let backend = Arc::clone(&backend);
+                        let memory = Arc::clone(&memory);
+                        let sessions = Arc::clone(&sessions);
+                        let sender = Arc::clone(&ws_sender);
+                        tokio::spawn(async move {
+                            let response = match serde_json::from_str::<RpcRequest>(&text) {
+                                Ok(req) => handle_rpc(req, &backend, &memory, &sessions).await,
+                                Err(_) => RpcResponse {
+                                    jsonrpc: "2.0".into(),
+                                    result: None,
+                                    error: Some(RpcError { code: -32700, message: "Parse error".into() }),
+                                    id: None,
+                                },
+                            };
+                            let response_str = serde_json::to_string(&response).unwrap();
+                            let mut sink = sender.lock().await;
+                            if let Err(e) = sink.send(tokio_tungstenite::tungstenite::Message::Text(response_str)).await {
+                                eprintln!("Error sending message: {}", e);
+                            }
+                        });
                     }
                 }
             }
