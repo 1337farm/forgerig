@@ -61,6 +61,10 @@ static LEAN_VERSION: Mutex<Option<String>> = Mutex::new(None);
 /// Whether the background warm-up (page-cache preload + warm probe) has been
 /// kicked off this process.
 static LEAN_WARMED: AtomicBool = AtomicBool::new(false);
+/// Whether the runtime warm-up is currently in flight (drives the UI bar).
+static LEAN_WARMING: AtomicBool = AtomicBool::new(false);
+/// Epoch millis when the current warm-up started (for elapsed-time display).
+static LEAN_WARM_STARTED_MS: AtomicU64 = AtomicU64::new(0);
 
 /// RAII guard: marks the download active on creation and inactive on drop,
 ///
@@ -110,9 +114,36 @@ pub struct LeanStatus {
     pub provisioning: bool,
     #[serde(default)]
     pub message: Option<String>,
+    /// True while the runtime is warming up (page-cache preload + warm probe).
+    #[serde(default)]
+    pub warming: bool,
+    /// Seconds elapsed since the warm-up started (time-based, not byte-based).
+    #[serde(default)]
+    pub warm_elapsed: u64,
+    /// Warm-up cap in seconds (elapsed is measured against this). 0 = unknown.
+    #[serde(default)]
+    pub warm_timeout: u64,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn snapshot(ready: bool, version: Option<String>) -> LeanStatus {
+    let warming = LEAN_WARMING.load(Ordering::Relaxed);
+    let warm_elapsed = if warming {
+        let started = LEAN_WARM_STARTED_MS.load(Ordering::Relaxed);
+        if started > 0 {
+            now_ms().saturating_sub(started) / 1000
+        } else {
+            0
+        }
+    } else {
+        0
+    };
     LeanStatus {
         ready,
         version,
@@ -125,6 +156,9 @@ fn snapshot(ready: bool, version: Option<String>) -> LeanStatus {
             .ok()
             .map(|m| m.clone())
             .filter(|m| !m.is_empty()),
+        warming,
+        warm_elapsed,
+        warm_timeout: LEAN_WARM_PROBE_TIMEOUT.as_secs(),
     }
 }
 
@@ -520,9 +554,14 @@ pub async fn status() -> LeanStatus {
     }
     // One-time background warm-up: preloads the libs into page cache and
     // captures a warm --version banner + timing (see warm_lean). Non-blocking.
+    // Mark the warm state synchronously so the first snapshot already shows
+    // the progress bar (the spawned task may not have run yet).
     if !LEAN_WARMED.swap(true, Ordering::Relaxed) {
+        LEAN_WARMING.store(true, Ordering::Relaxed);
+        LEAN_WARM_STARTED_MS.store(now_ms(), Ordering::Relaxed);
         tokio::spawn(async move {
             warm_lean().await;
+            LEAN_WARMING.store(false, Ordering::Relaxed);
         });
     }
     let version = cached_lean_version();
