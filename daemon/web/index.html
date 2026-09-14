@@ -1,0 +1,149 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="color-scheme" content="dark">
+<title>ForgeRig</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: -apple-system, system-ui, sans-serif;
+    background: #0f1115; color: #e6e6e6;
+    display: flex; flex-direction: column; height: 100vh; overflow: hidden;
+  }
+  header {
+    padding: .5rem .8rem; border-bottom: 1px solid #1f2330;
+    flex-shrink: 0;
+  }
+  .row { display: flex; align-items: center; gap: .5rem; }
+  .row.between { justify-content: space-between; }
+  h1 { font-size: 1.1rem; margin: 0; font-weight: 600; }
+  #status { color: #7cf787; font-size: .78rem; }
+  #provider { color: #8ab4f8; font-size: .72rem; font-family: monospace; word-break: break-all; }
+  button { cursor: pointer; }
+  #settings-btn, #lean-btn {
+    background: #333; color: #e6e6e6; border: 1px solid #555; border-radius: 6px;
+    padding: .35rem .6rem; font-size: .78rem;
+  }
+  #lean-status { color: #e6c07b; font-size: .78rem; }
+  #lean-bar {
+    display: none; margin: .35rem 0 0; height: 10px; background: #1b1f27;
+    border: 1px solid #333; border-radius: 6px; overflow: hidden;
+  }
+  #lean-fill {
+    height: 100%; width: 0; background: #3498db; color: #fff;
+    font-size: .55rem; line-height: 10px; text-align: center; white-space: nowrap;
+  }
+  #tabs {
+    display: flex; gap: .3rem; padding: .4rem .6rem 0;
+    overflow-x: auto; flex-shrink: 0; border-bottom: 1px solid #1f2330; background: #0b0d12;
+  }
+  .tab {
+    display: flex; align-items: center; gap: .2rem; flex: 0 0 auto;
+    background: #1b1f27; border: 1px solid #2a2f3a; border-radius: 8px 8px 0 0;
+    padding: 0; overflow: hidden;
+  }
+  .tab.active { background: #243447; border-bottom-color: #243447; }
+  .tab-label {
+    background: transparent; border: 0; color: #c7cdd8; padding: .4rem .55rem;
+    font-size: .8rem; max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .tab-close {
+    background: transparent; border: 0; color: #777; padding: 0 .35rem; font-size: .9rem;
+  }
+  .tab-close:hover { color: #ff7b72; }
+  #new-session {
+    flex: 0 0 auto; background: #1f6feb; border: 1px solid #2f81f7; color: #fff;
+    border-radius: 8px; padding: .35rem .6rem; font-size: .8rem;
+  }
+  #messages {
+    flex: 1 1 auto; overflow-y: auto; padding: .8rem .6rem 1rem;
+  }
+  .msg { max-width: 88%; margin: .5rem 0; display: flex; flex-direction: column; }
+  .msg.user { align-self: flex-end; align-items: flex-end; margin-left: auto; }
+  .msg.assistant { align-self: flex-start; align-items: flex-start; margin-right: auto; }
+  .msg .author { font-size: .68rem; color: #8c93a3; margin: 0 .2rem .15rem; }
+  .msg .body {
+    padding: .5rem .65rem; border-radius: 12px; font-size: .9rem; line-height: 1.45;
+    overflow-wrap: break-word; word-break: break-word;
+  }
+  .msg.user .body { background: #1f4d8f; color: #fff; border-top-right-radius: 4px; }
+  .msg.assistant .body { background: #1b1f27; border: 1px solid #2a2f3a; border-top-left-radius: 4px; }
+  .msg.pending .body { color: #8c93a3; font-style: italic; }
+  .msg .body p { margin: .25rem 0; }
+  .msg .body p:first-child { margin-top: 0; }
+  .msg .body p:last-child { margin-bottom: 0; }
+  .msg .body h1, .msg .body h2, .msg .body h3, .msg .body h4, .msg .body h5, .msg .body h6 {
+    margin: .6rem 0 .3rem; line-height: 1.2; font-weight: 600;
+  }
+  .msg .body h1 { font-size: 1.2rem; }
+  .msg .body h2 { font-size: 1.08rem; }
+  .msg .body h3 { font-size: 1rem; }
+  .msg .body ul, .msg .body ol { margin: .3rem 0; padding-left: 1.3rem; }
+  .msg .body li { margin: .15rem 0; }
+  .msg .body code {
+    font-family: ui-monospace, monospace; background: #141821; border: 1px solid #2a2f3a;
+    border-radius: 4px; padding: 0 .3rem; font-size: .82em;
+  }
+  .msg .body pre {
+    background: #0b0d12; border: 1px solid #2a2f3a; border-radius: 8px;
+    padding: .6rem .7rem; overflow-x: auto; margin: .4rem 0;
+  }
+  .msg .body pre code { background: transparent; border: 0; padding: 0; font-size: .8rem; }
+  .msg .body blockquote { border-left: 3px solid #3b82f6; margin: .4rem 0; padding: .1rem .6rem; color: #b8c0cf; }
+  .msg .body a { color: #6cb2ff; }
+  .msg .body hr { border: 0; border-top: 1px solid #2a2f3a; margin: .6rem 0; }
+  .msg .meta { display: flex; gap: .3rem; margin-top: .2rem; }
+  .msg .meta .mini {
+    background: transparent; border: 1px solid #333; color: #8c93a3;
+    border-radius: 6px; padding: .12rem .45rem; font-size: .68rem;
+  }
+  .msg .meta .mini:hover { color: #6cb2ff; border-color: #3b82f6; }
+  footer {
+    flex-shrink: 0; padding: .55rem; border-top: 1px solid #1f2330; background: #0b0d12;
+    display: flex; gap: .45rem; align-items: flex-end;
+  }
+  #composer {
+    flex: 1 1 auto; resize: none; background: #1b1f27; color: #e6e6e6;
+    border: 1px solid #2a2f3a; border-radius: 10px; padding: .6rem; font-size: .92rem;
+    min-height: 2.5rem; max-height: 8rem; font-family: inherit; line-height: 1.4;
+  }
+  #composer:focus { outline: none; border-color: #3b82f6; }
+  #send-btn {
+    background: #1f6feb; color: #fff; border: 1px solid #2f81f7; border-radius: 10px;
+    padding: .6rem 1rem; font-size: .9rem; flex: 0 0 auto;
+  }
+  #send-btn:disabled { background: #33505f; border-color: #33505f; }
+</style>
+</head>
+<body>
+<header>
+  <div class="row between">
+    <h1>ForgeRig</h1>
+    <button id="settings-btn" onclick="window.NativeHost && NativeHost.openSettings && NativeHost.openSettings()">⚙ Settings</button>
+  </div>
+  <div class="row between"><span id="status">Connecting…</span><span id="provider"></span></div>
+  <div class="row between">
+    <span id="lean-status">Lean: —</span>
+    <button id="lean-btn">Download &amp; install Lean (~550 MB)</button>
+  </div>
+  <div id="lean-bar"><div id="lean-fill">0%</div></div>
+</header>
+
+<div id="tabs"><button id="new-session">+ New</button><div id="tab-list" style="display:flex;gap:.3rem;"></div></div>
+<main id="messages"></main>
+<footer>
+  <textarea id="composer" placeholder="Ask anything… (Enter to send, Shift+Enter for newline, !cmd runs in the container)" autofocus></textarea>
+  <button id="send-btn">Send</button>
+</footer>
+
+<script>
+/*@MARKDOWN_JS@*/
+/*@STATE_JS@*/
+/*@APP_JS@*/
+</script>
+</body>
+</html>
