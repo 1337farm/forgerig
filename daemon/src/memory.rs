@@ -111,7 +111,7 @@ impl MemoryEngine {
         Ok(())
     }
 
-    /// Chronological (oldest-first) list of prior milestones.
+    /// Chronological (oldest-first) list of prior milestones (permanent memories).
     pub async fn get_macro_memories(&self, limit: usize) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
         self.db.call(move |conn| {
             let mut stmt = conn.prepare("SELECT milestone, context FROM macro_memory ORDER BY timestamp DESC LIMIT ?")?;

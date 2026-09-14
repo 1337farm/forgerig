@@ -22,10 +22,15 @@ use crate::wasm::WasmTransformer;
 const SYSTEM_PREAMBLE: &str = "\
 You are an autonomous orchestrator daemon running in a Linux userland inside an \
 Android app. You have tools to run bash, transform WASM, and type-check Lean \
-theorem-prover sources. Be concise and action-oriented.";
+theorem-prover sources. Be concise and action-oriented. Format replies as Markdown.";
 
 /// Upper bound on a single chat completion (rig's HTTP client has no timeout).
 const CHAT_TIMEOUT_SECS: u64 = 300;
+
+/// The system message seeded into every session thread.
+pub fn system_message() -> serde_json::Value {
+    json!({ "role": "system", "content": SYSTEM_PREAMBLE })
+}
 
 /// Hard cap on the number of tool→reply rounds before we stop rather than loop.
 const MAX_TOOL_TURNS: usize = 8;
@@ -383,12 +388,11 @@ async fn run_agent_loop(
     model: &LoggedOpenAiModel,
     tools: &ToolSet,
     tool_defs: &[serde_json::Value],
+    messages: &mut Vec<serde_json::Value>,
     prompt: &str,
 ) -> Result<String, completion::CompletionError> {
-    let mut messages: Vec<serde_json::Value> = vec![
-        json!({ "role": "system", "content": SYSTEM_PREAMBLE }),
-        json!({ "role": "user", "content": prompt }),
-    ];
+    // `messages` starts as [system, ...history]; append the new user turn.
+    messages.push(json!({ "role": "user", "content": prompt }));
     for turn in 0..MAX_TOOL_TURNS {
         let mut body = serde_json::Map::new();
         body.insert("model".into(), json!(model.model));
@@ -402,6 +406,15 @@ async fn run_agent_loop(
         let (content, tool_calls) = LoggedOpenAiModel::parse_turn(&v)?;
 
         if tool_calls.is_empty() {
+            // Persist the final assistant message into the thread.
+            if let Some(message) = v
+                .get("choices")
+                .and_then(|c| c.as_array())
+                .and_then(|c| c.first())
+                .and_then(|m| m.get("message"))
+            {
+                messages.push(message.clone());
+            }
             return Ok(content.unwrap_or_default());
         }
 
@@ -496,19 +509,39 @@ impl Backend {
         Backend { kind, key_present, provider, chat_model }
     }
 
-    pub async fn chat(&self, prompt: &str) -> Result<String, String> {
+    pub async fn chat_session(
+        &self,
+        messages: &mut Vec<serde_json::Value>,
+        prompt: &str,
+    ) -> Result<String, String> {
         // The compat model bounds each HTTP round-trip with a 15s connect +
         // 180s read timeout (see LoggedOpenAiModel); this outer cap bounds the
         // whole tool loop (up to MAX_TOOL_TURNS round-trips).
         let fut = match &self.kind {
             BackendKind::Compat { model, tools, tool_defs, .. } => {
                 futures_util::future::Either::Left(async move {
-                    run_agent_loop(model, tools, tool_defs, prompt).await.map_err(|e| e.to_string())
+                    run_agent_loop(model, tools, tool_defs, messages, prompt).await.map_err(|e| e.to_string())
                 })
             }
             BackendKind::Gemini { agent, .. } => {
+                // Gemini has no exposed multi-turn history; flatten the prior
+                // user/assistant turns into a single transcript.
+                let transcript = messages
+                    .iter()
+                    .filter_map(|m| match (m.get("role").and_then(|r| r.as_str()), m.get("content").and_then(|c| c.as_str())) {
+                        (Some("user"), Some(c)) => Some(format!("User: {c}")),
+                        (Some("assistant"), Some(c)) => Some(format!("Assistant: {c}")),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 futures_util::future::Either::Right(async move {
-                    agent.prompt(prompt).await.map_err(|e| e.to_string())
+                    let full: std::borrow::Cow<'_, str> = if transcript.is_empty() {
+                        std::borrow::Cow::Borrowed(prompt)
+                    } else {
+                        std::borrow::Cow::Owned(format!("{transcript}\nUser: {prompt}"))
+                    };
+                    agent.prompt(&full).await.map_err(|e| e.to_string())
                 })
             }
         };
