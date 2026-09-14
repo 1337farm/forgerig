@@ -1,0 +1,16 @@
+[package]
+name = "sentinel_engine"
+version = "0.1.0"
+edition = "2021"
+description = "Sentinel-delimited code ingestion engine: §/¶ boundaries, Tab-Zip + block-span transforms, zero-copy records, SIMD scanning."
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+overflow-checks = false
+
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
