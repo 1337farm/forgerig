@@ -10,3 +10,4 @@ daemon/oss_memory.db
 # Generated container assets (scripts/prepare-assets.sh)
 app/src/main/jniLibs/
 app/src/main/assets/libtalloc.so.2
+sentinel-engine/target/

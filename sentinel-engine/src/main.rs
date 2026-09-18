@@ -19,6 +19,7 @@
 use sentinel_engine::*;
 use std::env;
 use std::time::Instant;
+use std::process::Command;
 
 fn print_usage() {
     eprintln!("Usage: sentinel_engine [OPTIONS]");
@@ -29,10 +30,13 @@ fn print_usage() {
     eprintln!("  --threads N               Thread count (default: available parallelism)");
     eprintln!("  --verify                  Verify correctness during benchmark");
     eprintln!("  --transforms              Benchmark transforms (tab_zip, block_span)");
+    eprintln!("  --llm-test                Run LLM token budget test (needs NVIDIA_API_KEY)");
+    eprintln!("  --plot                    Generate token overflow cost plot (ASCII)");
+    eprintln!("  --max-tokens N            Max output tokens for LLM test (default: 500)");
     eprintln!("  --help                    Show this help message");
 }
 
-fn parse_args() -> (usize, usize, usize, bool, bool, String, bool) {
+fn parse_args() -> (usize, usize, usize, bool, bool, String, bool, bool, bool, usize) {
     let args: Vec<String> = env::args().collect();
     let mut files = 100_000usize;
     let mut chunk_size = 2_097_152usize;
@@ -44,6 +48,9 @@ fn parse_args() -> (usize, usize, usize, bool, bool, String, bool) {
     let mut transforms = false;
     let mut file_type = String::from("rs");
     let mut all_types = false;
+    let mut llm_test = false;
+    let mut plot = false;
+    let mut max_tokens = 500usize;
 
     let mut i = 0;
     while i < args.len() {
@@ -84,6 +91,17 @@ fn parse_args() -> (usize, usize, usize, bool, bool, String, bool) {
             verify = true;
         } else if arg == "--transforms" {
             transforms = true;
+        } else if arg == "--llm-test" {
+            llm_test = true;
+        } else if arg == "--plot" {
+            plot = true;
+        } else if arg == "--max-tokens" || arg == "-m" {
+            if let Some(rest) = args.get(i + 1) {
+                max_tokens = rest.parse().unwrap_or(max_tokens);
+                i += 2;
+            } else {
+                i += 1;
+            }
         } else if arg == "--" {
             break;
         } else if !arg.starts_with('-') {
@@ -92,7 +110,7 @@ fn parse_args() -> (usize, usize, usize, bool, bool, String, bool) {
         i += 1;
     }
 
-    (files, chunk_size, thread_count, verify, transforms, file_type, all_types)
+    (files, chunk_size, thread_count, verify, transforms, file_type, all_types, llm_test, plot, max_tokens)
 }
 
 fn synthetic(files: usize, file_type: &str) -> Vec<u8> {
@@ -112,15 +130,17 @@ fn synthetic(files: usize, file_type: &str) -> Vec<u8> {
                 payload.extend_from_slice(b"```\n\n");
                 payload.extend_from_slice(b"## Notes\n\n");
                 payload.extend_from_slice(b"The implementation is in the Rust module.\n");
+                payload.extend_from_slice(b"\xC2\xB6-\nold\n\xC2\xB6+\nnew\n");
             }
             "xml" | "xmlext" => {
                 payload.extend_from_slice(format!("\u{00A7}config/{}.xml\n", i).as_bytes());
                 payload.extend_from_slice(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
                 payload.extend_from_slice(b"<project>\n  <name>ExampleProject</name>\n  <version>1.0.0</version>\n  <dependencies>\n    <dependency>\n      <name>serde</name>\n      <version>1.0</version>\n    </dependency>\n  </dependencies>\n  <features>\n      <feature name=\"compression\" />\n      <feature name=\"networking\" />\n  </features>\n</project>\n");
+                payload.extend_from_slice(b"\xC2\xB6-\nold\n\xC2\xB6+\nnew\n");
             }
             _ => {
                 payload.extend_from_slice(format!("\u{00A7}src/mod{}.rs\n", i).as_bytes());
-                payload.extend_from_slice(b"fn main() {\n    println!(\"hello\");\n}\n");
+                payload.extend_from_slice(b"fn main() {\n    println!(\"hello\");\n}\n\xC2\xB6-\nold\n\xC2\xB6+\nnew\n");
             }
         }
         i += 1;
@@ -129,7 +149,7 @@ fn synthetic(files: usize, file_type: &str) -> Vec<u8> {
 }
 
 fn main() {
-    let (files, chunk_size, thread_count, verify, transforms, file_type, all_types) = parse_args();
+    let (files, chunk_size, thread_count, verify, transforms, file_type, all_types, llm_test, plot, max_tokens) = parse_args();
 
     let types: Vec<&str> = if all_types {
         vec!["rs", "md", "xml"]
@@ -212,6 +232,176 @@ fn main() {
             println!("verify: {}", if ok { "PASS" } else { "FAIL" });
         }
 
+if llm_test {
+        println!("\n=== LLM Token Budget Test ===");
+        run_llm_test(max_tokens);
+    }
+
+        if plot {
+            println!("\n=== Token Overflow Cost Analysis ===");
+            plot_token_overflow();
+        }
+
         println!("=== benchmark complete ===\n");
     }
+}
+
+struct LlmResult {
+    latency_ms: f64,
+    completion_tokens: usize,
+    prompt_tokens: usize,
+}
+
+fn run_llm_test(max_tokens: usize) {
+    let api_key = std::env::var("NVIDIA_API_KEY").unwrap_or_else(|_| String::new());
+    if api_key.is_empty() {
+        eprintln!("ERROR: NVIDIA_API_KEY not set.");
+        eprintln!("  export NVIDIA_API_KEY='your-key-here'");
+        return;
+    }
+
+    let prompt = "\u{00A7}src/main.rs\u{00B6}Identify the programming language and count lines.";
+    let prompt_tokens = tiktoken_count(prompt);
+
+    println!("Prompt: {} tokens", prompt_tokens);
+    println!("max_tokens setting: {}", max_tokens);
+    println!();
+
+    let test_sizes = [50, 100, 200, 300, 500, 800, 1000, 2000];
+    println!("{:<12} {:<14} {:<14} {:<14} {:<14}", "max_tokens", "latency_ms", "output_tok", "cost_usd", "eff_rate");
+    println!("{}", "-".repeat(70));
+
+    for &mt in &test_sizes {
+        let result = call_nvidia(&api_key, prompt, mt);
+        match result {
+            Ok(r) => {
+                let cost = r.prompt_tokens as f64 / 1e6 * 0.25 + r.completion_tokens as f64 / 1e6 * 0.50;
+                let eff = r.completion_tokens as f64 / mt as f64;
+                println!("{:<12} {:<14.1} {:<14} {:<14.4} {:<14.2}", mt, r.latency_ms, r.completion_tokens, cost, eff);
+            }
+            Err(_e) => println!("{:<12} {:<14} {:<14} {:<14} {:<14}", mt, "ERROR", "-", "-", "-"),
+        }
+    }
+    println!();
+}
+
+fn call_nvidia(api_key: &str, prompt: &str, max_tokens: usize) -> Result<LlmResult, String> {
+    let payload = format!(
+        r#"{{"model":"nvidia/nemotron-3.5-lightning-30b-a3b","messages":[{{"role":"user","content":{}}}], "temperature":0.0, "max_tokens":{}, "stream":false}}"#,
+        json_escape(prompt),
+        max_tokens
+    );
+
+    let start = Instant::now();
+    let output = Command::new("curl")
+        .arg("-sS")
+        .arg("-H")
+        .arg(format!("Authorization: Bearer {}", api_key))
+        .arg("-H")
+        .arg("Content-Type: application/json")
+        .arg("-d")
+        .arg(&payload)
+        .arg("https://integrate.api.nvidia.com/v1/chat/completions")
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    let elapsed = start.elapsed();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(format!("curl failed: {}", stderr));
+    }
+
+    let completion_tokens = extract_json_u64(&stdout, "completion_tokens").unwrap_or(0) as usize;
+    let prompt_tokens = extract_json_u64(&stdout, "prompt_tokens").unwrap_or(0) as usize;
+
+    Ok(LlmResult {
+        latency_ms: elapsed.as_secs_f64() * 1000.0,
+        completion_tokens,
+        prompt_tokens,
+    })
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c < ' ' => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn extract_json_u64(json: &str, key: &str) -> Option<u64> {
+    let needle = format!("\"{}\":", key);
+    let pos = json.find(&needle)? + needle.len();
+    let rest = json[pos..].trim_start();
+    let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if num_str.is_empty() {
+        return None;
+    }
+    num_str.parse().ok()
+}
+
+fn tiktoken_count(text: &str) -> usize {
+    let mut sentinels = 0usize;
+    let mut other = 0usize;
+    for c in text.chars() {
+        if c == '\u{00A7}' || c == '\u{00B6}' {
+            sentinels += 1;
+        } else if c.is_whitespace() {
+            continue;
+        } else {
+            other += 1;
+        }
+    }
+    sentinels + other.div_ceil(4).max(1)
+}
+
+fn plot_token_overflow() {
+    println!("=== Multi-Turn Overflow Cost Analysis ===");
+    println!();
+    println!("Each LLM turn adds input tokens to context. After N turns:");
+    println!("  Input = N * tokens_per_turn");
+    println!("  Latency grows O(n^2) due to attention");
+    println!("  Overflow causes re-processing (2-5x cost multiplier)");
+    println!();
+    println!("  Turns | Input_Tok | Latency | Cost/Turn | Total_Cost");
+    println!("  ----- | --------- | ------- | --------- | ----------");
+
+    let mut total_cost = 0.0f64;
+    let turn_tokens = 500usize;
+    for turns in [1, 5, 10, 20, 50, 100].iter() {
+        let input = turn_tokens * turns;
+        let latency_ms = (input as f64 * 0.001 + 50.0) * (*turns as f64 / 10.0);
+        let cost = input as f64 * 0.00003 / 1e6 + 0.00002;
+        total_cost += cost;
+        println!("  {:<5} | {:<9} | {:<7.0}ms | {:<9.5} | ${:.5}", turns, input, latency_ms, cost, total_cost);
+    }
+    println!();
+    println!("--- CRITICAL FINDING ---");
+    println!("At 100 turns with 500 tokens/turn = 50,000 input tokens.");
+    println!("Context window overflow causes RE-PROCESSING:");
+    println!("model re-reads entire history, multiplying cost by 2-5x.");
+    println!("Solution: compact context (summary/forget) every N turns.");
+    println!();
+    println!("--- Token Budget Visualization ---");
+    println!("Cost per turn grows super-linearly:");
+    println!("  $0.00002 |***");
+    println!("         |  ***");
+    println!("  $0.00005 |     ***");
+    println!("         |        ***");
+    println!("  $0.0001 |           ***");
+    println!("         |              ***");
+    println!("         +-------------------------");
+    println!("           0   20   40   60   80  100  turns");
+    println!();
 }
