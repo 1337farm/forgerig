@@ -26,6 +26,7 @@ schemars = "0.8.22"
 # rustls by default, so no extra C libs are needed for TLS itself.
 ureq = "2.10"
 sha2 = "0.10"
+sentinel_engine = { path = "../sentinel-engine" }
 
 [features]
 # rig-core pulls reqwest with default TLS (native-tls -> openssl-sys). There
