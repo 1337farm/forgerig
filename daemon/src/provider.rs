@@ -373,6 +373,15 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).ok().filter(|v| !v.is_empty()).unwrap_or_else(|| default.to_string())
 }
 
+/// Optional per-completion output cap from Settings (blank or invalid =
+/// provider default). Read once per Backend::resolve.
+fn max_tokens_limit() -> Option<u64> {
+    std::env::var("FORGERIG_MAX_TOKENS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+}
+
 fn resolve_key(provider: Provider) -> String {
     if let Ok(k) = std::env::var("FORGERIG_API_KEY") {
         if !k.is_empty() {
@@ -399,6 +408,9 @@ async fn run_agent_loop(
         body.insert("model".into(), json!(model.model));
         body.insert("messages".into(), json!(messages));
         body.insert("temperature".into(), json!(0.7));
+        if let Some(mt) = max_tokens_limit() {
+            body.insert("max_tokens".into(), json!(mt));
+        }
         if !tool_defs.is_empty() {
             body.insert("tools".into(), json!(tool_defs));
             body.insert("tool_choice".into(), json!("auto"));
@@ -458,14 +470,17 @@ impl Backend {
 
         let kind = if provider == Provider::Gemini {
             let client = gemini::Client::new(&key);
-            let agent = client
+            let builder = client
                 .agent(&chat_model)
                 .preamble(SYSTEM_PREAMBLE)
                 .tool(BashExecutor::default())
                 .tool(WasmTransformer::default())
                 .tool(LeanExecutor::default())
-                .tool(CodeIngest::default())
-                .build();
+                .tool(CodeIngest::default());
+            let agent = match max_tokens_limit() {
+                Some(mt) => builder.max_tokens(mt).build(),
+                None => builder.build(),
+            };
             let eval = client.extractor::<EvaluationResult>(&eval_model).build();
             BackendKind::Gemini { agent, eval }
         } else {

@@ -331,6 +331,8 @@ mod tests {
         assert!(html.contains("id=\"tab-list\""));
         assert!(html.contains("id=\"composer\""));
         assert!(html.contains("id=\"send-btn\""));
+        assert!(html.contains("id=\"lean-pct\""));
+        assert!(html.contains("id=\"setup-notice\""));
         assert!(html.contains("function render"));
         assert!(html.contains("function visibleTurns"));
         assert!(html.contains("function forkRawIndex"));

@@ -6,47 +6,77 @@
 <meta name="color-scheme" content="dark">
 <title>ForgeRig</title>
 <style>
-  :root { color-scheme: dark; }
+  :root {
+    color-scheme: dark;
+    /* ForgeRig neon theme, sampled from the logo coin: magenta glow on
+       near-black violet. */
+    --bg: #0b0a12;
+    --panel: #151221;
+    --panel-2: #1c162e;
+    --line: #2c2145;
+    --accent: #d946ef;
+    --accent-soft: #a855f7;
+    --accent-deep: #9333ea;
+    --link: #e879f9;
+    --ink: #ece7f5;
+    --muted: #8c93a3;
+    --ok: #7cf787;
+    --warn: #e6c07b;
+  }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
   body {
     font-family: -apple-system, system-ui, sans-serif;
-    background: #0f1115; color: #e6e6e6;
+    background: var(--bg); color: var(--ink);
     display: flex; flex-direction: column; height: 100vh; overflow: hidden;
   }
   header {
-    padding: .5rem .8rem; border-bottom: 1px solid #1f2330;
+    padding: .5rem .8rem; border-bottom: 1px solid var(--line);
     flex-shrink: 0;
   }
   .row { display: flex; align-items: center; gap: .5rem; }
   .row.between { justify-content: space-between; }
-  h1 { font-size: 1.1rem; margin: 0; font-weight: 600; }
-  #status { color: #7cf787; font-size: .78rem; }
-  #provider { color: #8ab4f8; font-size: .72rem; font-family: monospace; word-break: break-all; }
+  h1 { font-size: 1.1rem; margin: 0; font-weight: 600; color: var(--accent); }
+  #status { color: var(--ok); font-size: .78rem; }
+  #provider { color: var(--accent-soft); font-size: .72rem; font-family: monospace; word-break: break-all; }
   button { cursor: pointer; }
   #settings-btn, #lean-btn {
-    background: #333; color: #e6e6e6; border: 1px solid #555; border-radius: 6px;
+    background: #333; color: var(--ink); border: 1px solid #555; border-radius: 6px;
     padding: .35rem .6rem; font-size: .78rem;
   }
-  #lean-status { color: #e6c07b; font-size: .78rem; }
+  #lean-status { color: var(--warn); font-size: .78rem; }
   #lean-bar {
-    display: none; margin: .35rem 0 0; height: 10px; background: #1b1f27;
-    border: 1px solid #333; border-radius: 6px; overflow: hidden;
+    display: none; margin: .35rem 0 0; height: 10px; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 6px; overflow: hidden;
+    position: relative;
   }
   #lean-fill {
-    height: 100%; width: 0; background: #3498db; color: #fff;
-    font-size: .55rem; line-height: 10px; text-align: center; white-space: nowrap;
+    height: 100%; width: 0; background: linear-gradient(90deg, var(--accent-deep), var(--accent));
+  }
+  #lean-pct {
+    position: absolute; inset: 0; display: flex; align-items: center;
+    justify-content: center; color: #fff; font-size: .55rem; line-height: 1;
+    white-space: nowrap; pointer-events: none;
+  }
+  #setup-notice {
+    display: none; margin: .35rem 0 0; padding: .45rem .6rem; font-size: .78rem;
+    background: var(--panel-2); border: 1px solid var(--accent-soft);
+    border-radius: 8px; color: var(--ink);
+  }
+  #setup-notice button {
+    background: var(--accent-deep); color: #fff; border: 1px solid var(--accent-soft);
+    border-radius: 6px; padding: .25rem .6rem; font-size: .75rem; margin-left: .4rem;
   }
   #tabs {
     display: flex; gap: .3rem; padding: .4rem .6rem 0;
-    overflow-x: auto; flex-shrink: 0; border-bottom: 1px solid #1f2330; background: #0b0d12;
+    overflow-x: auto; flex-shrink: 0; border-bottom: 1px solid var(--line); background: var(--bg);
   }
   .tab {
     display: flex; align-items: center; gap: .2rem; flex: 0 0 auto;
-    background: #1b1f27; border: 1px solid #2a2f3a; border-radius: 8px 8px 0 0;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px 8px 0 0;
     padding: 0; overflow: hidden;
   }
-  .tab.active { background: #243447; border-bottom-color: #243447; }
+  .tab.active { background: var(--panel-2); border-bottom-color: var(--panel-2); }
   .tab-label {
     background: transparent; border: 0; color: #c7cdd8; padding: .4rem .55rem;
     font-size: .8rem; max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -56,7 +86,7 @@
   }
   .tab-close:hover { color: #ff7b72; }
   #new-session {
-    flex: 0 0 auto; background: #1f6feb; border: 1px solid #2f81f7; color: #fff;
+    flex: 0 0 auto; background: var(--accent-deep); border: 1px solid var(--accent-soft); color: #fff;
     border-radius: 8px; padding: .35rem .6rem; font-size: .8rem;
   }
   #messages {
@@ -70,9 +100,9 @@
     padding: .5rem .65rem; border-radius: 12px; font-size: .9rem; line-height: 1.45;
     overflow-wrap: break-word; word-break: break-word;
   }
-  .msg.user .body { background: #1f4d8f; color: #fff; border-top-right-radius: 4px; }
-  .msg.assistant .body { background: #1b1f27; border: 1px solid #2a2f3a; border-top-left-radius: 4px; }
-  .msg.pending .body { color: #8c93a3; font-style: italic; }
+  .msg.user .body { background: var(--accent-deep); color: #fff; border-top-right-radius: 4px; }
+  .msg.assistant .body { background: var(--panel); border: 1px solid var(--line); border-top-left-radius: 4px; }
+  .msg.pending .body { color: var(--muted); font-style: italic; }
   .msg .body p { margin: .25rem 0; }
   .msg .body p:first-child { margin-top: 0; }
   .msg .body p:last-child { margin-bottom: 0; }
@@ -85,35 +115,35 @@
   .msg .body ul, .msg .body ol { margin: .3rem 0; padding-left: 1.3rem; }
   .msg .body li { margin: .15rem 0; }
   .msg .body code {
-    font-family: ui-monospace, monospace; background: #141821; border: 1px solid #2a2f3a;
+    font-family: ui-monospace, monospace; background: #141821; border: 1px solid var(--line);
     border-radius: 4px; padding: 0 .3rem; font-size: .82em;
   }
   .msg .body pre {
-    background: #0b0d12; border: 1px solid #2a2f3a; border-radius: 8px;
+    background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
     padding: .6rem .7rem; overflow-x: auto; margin: .4rem 0;
   }
   .msg .body pre code { background: transparent; border: 0; padding: 0; font-size: .8rem; }
-  .msg .body blockquote { border-left: 3px solid #3b82f6; margin: .4rem 0; padding: .1rem .6rem; color: #b8c0cf; }
-  .msg .body a { color: #6cb2ff; }
-  .msg .body hr { border: 0; border-top: 1px solid #2a2f3a; margin: .6rem 0; }
+  .msg .body blockquote { border-left: 3px solid var(--accent-soft); margin: .4rem 0; padding: .1rem .6rem; color: #b8c0cf; }
+  .msg .body a { color: var(--link); }
+  .msg .body hr { border: 0; border-top: 1px solid var(--line); margin: .6rem 0; }
   .msg .meta { display: flex; gap: .3rem; margin-top: .2rem; }
   .msg .meta .mini {
-    background: transparent; border: 1px solid #333; color: #8c93a3;
+    background: transparent; border: 1px solid var(--line); color: var(--muted);
     border-radius: 6px; padding: .12rem .45rem; font-size: .68rem;
   }
-  .msg .meta .mini:hover { color: #6cb2ff; border-color: #3b82f6; }
+  .msg .meta .mini:hover { color: var(--link); border-color: var(--accent-soft); }
   footer {
-    flex-shrink: 0; padding: .55rem; border-top: 1px solid #1f2330; background: #0b0d12;
+    flex-shrink: 0; padding: .55rem; border-top: 1px solid var(--line); background: var(--bg);
     display: flex; gap: .45rem; align-items: flex-end;
   }
   #composer {
-    flex: 1 1 auto; resize: none; background: #1b1f27; color: #e6e6e6;
-    border: 1px solid #2a2f3a; border-radius: 10px; padding: .6rem; font-size: .92rem;
-    min-height: 2.5rem; max-height: 8rem; font-family: inherit; line-height: 1.4;
+    flex: 1 1 auto; resize: none; background: var(--panel); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 10px; padding: .6rem; font-size: .92rem;
+    min-height: 3.8rem; max-height: 8rem; font-family: inherit; line-height: 1.4;
   }
-  #composer:focus { outline: none; border-color: #3b82f6; }
+  #composer:focus { outline: none; border-color: var(--accent); }
   #send-btn {
-    background: #1f6feb; color: #fff; border: 1px solid #2f81f7; border-radius: 10px;
+    background: var(--accent-deep); color: #fff; border: 1px solid var(--accent-soft); border-radius: 10px;
     padding: .6rem 1rem; font-size: .9rem; flex: 0 0 auto;
   }
   #send-btn:disabled { background: #33505f; border-color: #33505f; }
@@ -130,7 +160,8 @@
     <span id="lean-status">Lean: —</span>
     <button id="lean-btn">Download &amp; install Lean (~550 MB)</button>
   </div>
-  <div id="lean-bar"><div id="lean-fill">0%</div></div>
+  <div id="lean-bar"><div id="lean-fill"></div><div id="lean-pct">0%</div></div>
+  <div id="setup-notice"><span id="setup-notice-text"></span><button id="setup-notice-btn" onclick="window.NativeHost && NativeHost.openSettings && NativeHost.openSettings()">Open Settings</button></div>
 </header>
 
 <div id="tabs"><button id="new-session">+ New</button><div id="tab-list" style="display:flex;gap:.3rem;"></div></div>

@@ -11,6 +11,7 @@ import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -24,14 +25,45 @@ class SettingsActivity : AppCompatActivity() {
 
     private val providerOptions = listOf(
         "openai - OpenAI (gpt-4o-mini)" to "openai",
-        "openrouter - OpenRouter (free llama :free)" to "openrouter",
+        "openrouter - OpenRouter (free Llama)" to "openrouter",
         "nvidia - NVIDIA NIM (free credits)" to "nvidia",
         "groq - Groq (free tier)" to "groq",
         "deepseek - DeepSeek (cheap)" to "deepseek",
-        "mistral - Mistral (incl. leastral-1-5)" to "mistral",
+        "mistral - Mistral" to "mistral",
         "gemini - Google Gemini (free tier)" to "gemini",
         "ollama - Local LLM" to "ollama",
         "custom - any OpenAI-compatible endpoint" to "custom",
+    )
+
+    private data class ModelOption(val name: String, val free: Boolean)
+
+    private val modelCatalog: Map<String, List<ModelOption>> = mapOf(
+        "openai" to listOf(
+            ModelOption("gpt-4o-mini", false),
+            ModelOption("gpt-4o", false),
+        ),
+        "openrouter" to listOf(
+            ModelOption("meta-llama/llama-3.3-70b-instruct:free", true),
+        ),
+        "nvidia" to listOf(
+            ModelOption("nvidia/llama-3.1-nemotron-70b-instruct", true),
+        ),
+        "groq" to listOf(
+            ModelOption("llama-3.3-70b-versatile", true),
+        ),
+        "deepseek" to listOf(
+            ModelOption("deepseek-chat", false),
+        ),
+        "mistral" to listOf(
+            ModelOption("mistral-small-latest", false),
+        ),
+        "gemini" to listOf(
+            ModelOption("gemini-2.5-flash", true),
+        ),
+        "ollama" to listOf(
+            ModelOption("llama3.1:8b", true),
+        ),
+        "custom" to emptyList(),
     )
 
     private val finishReceiver = object : BroadcastReceiver() {
@@ -93,18 +125,80 @@ class SettingsActivity : AppCompatActivity() {
         }
 
         root.addView(label("Model (leave blank for provider default)"))
-        val modelEdit = editText(current.model, "e.g. leastral-1-5 or llama-3.3-70b-versatile")
+        val modelEdit = editText(current.model, "e.g. mistral-small-latest or llama-3.3-70b-versatile")
+        val freeOnlyBox = CheckBox(this).apply {
+            text = "Show free models only"
+            isChecked = true
+            setTextColor(0xFFe6e6e6.toInt())
+        }
+        root.addView(freeOnlyBox)
+        val modelFilterEdit = editText("", "Filter models by name…")
+        root.addView(modelFilterEdit)
+        val modelSpinner = Spinner(this).apply {
+            adapter = ArrayAdapter(
+                this@SettingsActivity,
+                android.R.layout.simple_spinner_dropdown_item,
+                mutableListOf<String>(),
+            )
+        }
+        root.addView(modelSpinner)
+        var refreshingModels = false
+        fun refreshModels() {
+            if (refreshingModels) return
+            refreshingModels = true
+            try {
+                val provider = providerOptions[spinner.selectedItemPosition].second
+                val query = modelFilterEdit.text.toString().trim().lowercase()
+                val names = (modelCatalog[provider] ?: emptyList())
+                    .filter { (!freeOnlyBox.isChecked || it.free) && (query.isEmpty() || it.name.lowercase().contains(query)) }
+                    .map { if (it.free) "${it.name}  (free)" else it.name }
+                    .sorted()
+                @Suppress("UNCHECKED_CAST")
+                val adapter = modelSpinner.adapter as ArrayAdapter<String>
+                adapter.clear()
+                adapter.addAll(names)
+                adapter.notifyDataSetChanged()
+                val currentIdx = names.indexOfFirst { it.removeSuffix("  (free)") == current.model }
+                if (currentIdx >= 0) modelSpinner.setSelection(currentIdx)
+            } finally {
+                refreshingModels = false
+            }
+        }
+        spinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: android.view.View?, position: Int, id: Long) = refreshModels()
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+        }
+        modelSpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: android.view.View?, position: Int, id: Long) {
+                if (refreshingModels) return
+                val item = parent?.getItemAtPosition(position) as? String ?: return
+                modelEdit.setText(item.removeSuffix("  (free)"))
+            }
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+        }
+        freeOnlyBox.setOnCheckedChangeListener { _, _ -> refreshModels() }
+        modelFilterEdit.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = refreshModels()
+            override fun afterTextChanged(s: android.text.Editable?) {}
+        })
         root.addView(label("Evaluation model (blank = same as chat)"))
         val evalEdit = editText(current.evalModel, "cheap model for background memory evaluation")
         root.addView(label("Base URL (blank = provider default; required for custom)"))
         val urlEdit = editText(current.baseUrl, "https://host/api (OpenAI-compatible)")
         root.addView(label("API key"))
         val keyEdit = editText(current.apiKey, "stored encrypted on this device")
+        root.addView(label("Max output tokens (blank = provider default)"))
+        val maxTokensEdit = editText(current.maxTokens, "e.g. 2000").apply {
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+        }
 
         root.addView(modelEdit)
         root.addView(evalEdit)
         root.addView(urlEdit)
         root.addView(keyEdit)
+        root.addView(maxTokensEdit)
+        refreshModels()
 
         root.addView(Button(this).apply {
             text = "Save"
@@ -119,6 +213,7 @@ class SettingsActivity : AppCompatActivity() {
                         evalModel = evalEdit.text.toString(),
                         baseUrl = urlEdit.text.toString(),
                         apiKey = keyEdit.text.toString(),
+                        maxTokens = maxTokensEdit.text.toString(),
                     ),
                 )
                 try {

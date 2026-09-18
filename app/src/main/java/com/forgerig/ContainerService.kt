@@ -430,6 +430,7 @@ class ContainerService : Service() {
                     if (s.evalModel.isNotEmpty()) pb.environment()["FORGERIG_EVAL_MODEL"] = s.evalModel
                     if (s.baseUrl.isNotEmpty()) pb.environment()["FORGERIG_BASE_URL"] = s.baseUrl
                     if (s.apiKey.isNotEmpty()) pb.environment()["FORGERIG_API_KEY"] = s.apiKey
+                    if (s.maxTokens.isNotEmpty()) pb.environment()["FORGERIG_MAX_TOKENS"] = s.maxTokens
                 }
                 pb.redirectErrorStream(true)
                 pb.directory(File(filesDir, "work").also { it.mkdirs() })
