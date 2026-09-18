@@ -17,6 +17,7 @@ use serde_json::json;
 use crate::memory::EvaluationResult;
 use crate::lean::LeanExecutor;
 use crate::tools::BashExecutor;
+use crate::tools::CodeIngest;
 use crate::wasm::WasmTransformer;
 
 const SYSTEM_PREAMBLE: &str = "\
@@ -463,6 +464,7 @@ impl Backend {
                 .tool(BashExecutor::default())
                 .tool(WasmTransformer::default())
                 .tool(LeanExecutor::default())
+                .tool(CodeIngest::default())
                 .build();
             let eval = client.extractor::<EvaluationResult>(&eval_model).build();
             BackendKind::Gemini { agent, eval }
@@ -485,11 +487,13 @@ impl Backend {
             tools.add_tool(BashExecutor::default());
             tools.add_tool(WasmTransformer::default());
             tools.add_tool(LeanExecutor::default());
+            tools.add_tool(CodeIngest::default());
 
             let bash_def = BashExecutor::default().definition(String::new()).await;
             let wasm_def = WasmTransformer::default().definition(String::new()).await;
             let lean_def = LeanExecutor::default().definition(String::new()).await;
-            let tool_defs: Vec<serde_json::Value> = [bash_def, wasm_def, lean_def]
+            let ingest_def = CodeIngest::default().definition(String::new()).await;
+            let tool_defs: Vec<serde_json::Value> = [bash_def, wasm_def, lean_def, ingest_def]
                 .into_iter()
                 .map(|d| {
                     json!({

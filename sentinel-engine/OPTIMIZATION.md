@@ -44,7 +44,8 @@ content...
 - Avoid bare numbers (risk of hallucination as code)
 
 ## Benchmark Results
-- 10k files: rs 0.70 GB/s scan, md 4.06 GB/s, xml 4.47 GB/s, html 2.46 GB/s
+- 100k files, 8 threads (2026-09-18, Termux/aarch64): rs 0.36 GB/s, md 1.37 GB/s, xml 1.79 GB/s scan
+- Earlier run: 10k files rs 0.70 GB/s, md 4.06 GB/s, xml 4.47 GB/s (smaller corpus, less overhead)
 - All transforms + verify: PASS
 - 13/13 tests pass
 

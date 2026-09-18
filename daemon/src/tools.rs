@@ -188,3 +188,95 @@ impl Tool for BashExecutor {
         Ok(run_sandboxed(&args.command).await)
     }
 }
+
+#[derive(Error, Debug)]
+pub enum CodeIngestError {
+    #[error("ingest failed: {0}")]
+    Failed(String),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CodeIngestArgs {
+    pub workspace_path: String,
+    #[serde(default = "default_max_files")]
+    pub max_files: usize,
+    #[serde(default = "default_true")]
+    pub use_path_table: bool,
+    #[serde(default = "default_true")]
+    pub use_dedup: bool,
+}
+
+fn default_max_files() -> usize {
+    200
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CodeIngestResult {
+    pub framed: String,
+    pub files: usize,
+    pub bytes: usize,
+    pub deduped: usize,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CodeIngest;
+
+impl Tool for CodeIngest {
+    const NAME: &'static str = "code_ingest";
+
+    type Error = CodeIngestError;
+    type Args = CodeIngestArgs;
+    type Output = CodeIngestResult;
+
+    async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
+        rig::completion::ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: "Ingest a workspace directory into sentinel-framed (§/¶) code context with path-table IDs and content-hash dedup. Returns framed text to paste into the prompt.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "workspace_path": {
+                        "type": "string",
+                        "description": "Absolute path of the workspace directory to ingest"
+                    },
+                    "max_files": {
+                        "type": "number",
+                        "description": "Max files to include (default 200)"
+                    },
+                    "use_path_table": {
+                        "type": "boolean",
+                        "description": "Emit §paths table + FILE:id refs (default true)"
+                    },
+                    "use_dedup": {
+                        "type": "boolean",
+                        "description": "Replace repeated bodies with §# hash anchors (default true)"
+                    }
+                },
+                "required": ["workspace_path"]
+            })
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let opts = crate::ingest::IngestOptions {
+            max_files: args.max_files.max(1).min(2000),
+            use_path_table: args.use_path_table,
+            use_dedup: args.use_dedup,
+            ..Default::default()
+        };
+        crate::ingest::ingest_workspace(&args.workspace_path, &opts)
+            .map(|o| CodeIngestResult {
+                framed: o.framed,
+                files: o.files,
+                bytes: o.bytes,
+                deduped: o.deduped,
+                truncated: o.truncated,
+            })
+            .map_err(CodeIngestError::Failed)
+    }
+}

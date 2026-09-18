@@ -81,12 +81,15 @@ fn parse_args() -> (usize, usize, usize, bool, bool, String, bool, bool, bool, u
         } else if arg == "--files" || arg == "-f" {
             files = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(files);
             i += 2;
+            continue;
         } else if arg == "--chunk-size" || arg == "-c" {
             chunk_size = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(chunk_size);
             i += 2;
+            continue;
         } else if arg == "--threads" || arg == "-t" {
             thread_count = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(thread_count);
             i += 2;
+            continue;
         } else if arg == "--verify" {
             verify = true;
         } else if arg == "--transforms" {
@@ -99,6 +102,7 @@ fn parse_args() -> (usize, usize, usize, bool, bool, String, bool, bool, bool, u
             if let Some(rest) = args.get(i + 1) {
                 max_tokens = rest.parse().unwrap_or(max_tokens);
                 i += 2;
+                continue;
             } else {
                 i += 1;
             }

@@ -15,6 +15,7 @@ mod memory;
 mod provider;
 mod lean;
 mod sessions;
+mod ingest;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct RpcRequest {
@@ -170,6 +171,25 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
                     ok(json!({ "stdout": r.stdout, "stderr": r.stderr, "exit_code": r.exit_code, "timed_out": r.timed_out }), req.id)
                 }
                 _ => err(-32602, "Missing 'file' in params".into(), req.id),
+            }
+        }
+        "ingest" => {
+            let path = req.params.as_ref().and_then(|p| p.get("workspace_path").and_then(|f| f.as_str())).map(|s| s.trim().to_string());
+            match path {
+                Some(p) if !p.is_empty() => {
+                    let params = req.params.as_ref();
+                    let opts = ingest::IngestOptions {
+                        max_files: params.and_then(|x| x.get("max_files")).and_then(|x| x.as_u64()).unwrap_or(200) as usize,
+                        use_path_table: params.and_then(|x| x.get("use_path_table")).and_then(|x| x.as_bool()).unwrap_or(true),
+                        use_dedup: params.and_then(|x| x.get("use_dedup")).and_then(|x| x.as_bool()).unwrap_or(true),
+                        ..Default::default()
+                    };
+                    match ingest::ingest_workspace(&p, &opts) {
+                        Ok(o) => ok(json!({ "framed": o.framed, "files": o.files, "bytes": o.bytes, "deduped": o.deduped, "truncated": o.truncated }), req.id),
+                        Err(e) => err(-32603, format!("Ingest error: {e}"), req.id),
+                    }
+                }
+                _ => err(-32602, "Missing 'workspace_path' in params".into(), req.id),
             }
         }
         _ => err(-32601, "Method not found".into(), req.id),
