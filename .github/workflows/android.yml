@@ -157,7 +157,7 @@ jobs:
       # sdkmanager downloads it once and re-seeds the cache.
       - name: Setup Android SDK
         if: steps.build-needed.outputs.needed == '1'
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       - name: Cache Android NDK
         if: steps.build-needed.outputs.needed == '1'
