@@ -22,6 +22,7 @@ object SettingsStore {
         val evalModel: String = "",
         val baseUrl: String = "",
         val apiKey: String = "",
+        val maxTokens: String = "",
     )
 
     private fun prefs(ctx: Context): SharedPreferences {
@@ -49,6 +50,7 @@ object SettingsStore {
             evalModel = p.getString("evalModel", "") ?: "",
             baseUrl = p.getString("baseUrl", "") ?: "",
             apiKey = p.getString("apiKey", "") ?: "",
+            maxTokens = p.getString("maxTokens", "") ?: "",
         )
     }
 
@@ -59,6 +61,7 @@ object SettingsStore {
             .putString("evalModel", s.evalModel.trim())
             .putString("baseUrl", s.baseUrl.trim())
             .putString("apiKey", s.apiKey.trim())
+            .putString("maxTokens", s.maxTokens.trim())
             // commit() (not apply()): the settings are read back synchronously by
             // ContainerService the moment we trigger a container restart, so the
             // new values must already be flushed to disk.

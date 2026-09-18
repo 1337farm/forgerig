@@ -18,6 +18,7 @@
   var leanBtnEl = $('lean-btn');
   var leanBarEl = $('lean-bar');
   var leanFillEl = $('lean-fill');
+  var leanPctEl = $('lean-pct');
 
   // ---------- RPC client (id-keyed, supports concurrency) ----------
   var ws = null;
@@ -41,7 +42,18 @@
     ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/');
     ws.onopen = function () {
       statusEl.textContent = 'Connected';
-      call('status', {}, function () {});
+      call('status', {}, function (err, r) {
+        if (err || !r || !r.provider) return;
+        providerEl.textContent = r.provider;
+        if (/key=missing/.test(r.provider)) {
+          var notice = $('setup-notice');
+          var text = $('setup-notice-text');
+          if (notice && text) {
+            text.textContent = 'No API key configured — open Settings to choose a provider, model, and token budget before sending.';
+            notice.style.display = 'block';
+          }
+        }
+      });
       refreshLean();
       loadSessions();
     };
@@ -100,16 +112,16 @@
       var pct = (r.warm_timeout > 0) ? Math.min(100, Math.floor((r.warm_elapsed || 0) * 100 / r.warm_timeout)) : 0;
       leanBarEl.style.display = 'block';
       leanFillEl.style.width = pct + '%';
-      leanFillEl.textContent = 'Warming up Lean runtime… ' + (r.warm_elapsed || 0) + 's';
+      leanPctEl.textContent = 'Warming up Lean runtime… ' + (r.warm_elapsed || 0) + 's';
     } else if (r.downloading && r.total > 0) {
       var dpct = Math.floor(r.downloaded * 100 / r.total);
       leanBarEl.style.display = 'block';
       leanFillEl.style.width = dpct + '%';
-      leanFillEl.textContent = dpct + '%';
+      leanPctEl.textContent = dpct + '%';
     } else if (r.downloading || r.provisioning) {
       leanBarEl.style.display = 'block';
       leanFillEl.style.width = '100%';
-      leanFillEl.textContent = 'working…';
+      leanPctEl.textContent = 'working…';
     } else {
       leanBarEl.style.display = 'none';
     }
