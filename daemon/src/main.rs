@@ -64,6 +64,15 @@ async fn push_notification(push: &WsPush, value: Value) {
         .await;
 }
 
+
+/// Per-connection stop flags: the chat future and its chat_stop RPC share
+/// the same connection task, so a thread-local registry (not a global map)
+/// pairs them without cross-connection races.
+thread_local! {
+    static STOP: std::cell::RefCell<std::collections::HashMap<String, provider::StopFlag>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 async fn system_message_with_memory(memory: &Arc<MemoryEngine>) -> Value {
     let mut sys = provider::system_message();
     if let Ok(mems) = memory.get_macro_memories(5).await {
@@ -110,7 +119,11 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
                         Some(id) => id,
                         None => sessions.create(system_message_with_memory(memory).await).id,
                     };
-                    let mut messages = sessions.get(&sid).map(|s| s.messages).unwrap_or_else(|| vec![provider::system_message()]);
+                    // Commit the user message to the tab immediately (before
+                    // the provider is even contacted) so the tab exists, has
+                    // a title, and survives a mid-flight tab switch.
+                    sessions.append_message(&sid, json!({ "role": "user", "content": p }));
+                    let mut messages = sessions.thread(&sid).unwrap_or_else(|| vec![provider::system_message()]);
                     // Keep the session's system message synced with the latest
                     // permanent project memory (spans sessions/projects).
                     if let Some(first) = messages.first_mut() {
@@ -129,13 +142,15 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
                             push_notification(&bridge_push, ev.into_rpc(&sid_bridge)).await;
                         }
                     });
+                    let stop: provider::StopFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    STOP.with(|cell| { cell.borrow_mut().insert(sid.clone(), std::sync::Arc::clone(&stop)); });
                     let backend2 = Arc::clone(backend);
                     let memory2 = Arc::clone(memory);
                     let sessions2 = Arc::clone(sessions);
                     let push2 = Arc::clone(push);
                     let sid2 = sid.clone();
                     tokio::spawn(async move {
-                        match backend2.chat_session_streaming(&mut messages, &p, &etx).await {
+                        match backend2.chat_session_streaming(&mut messages, &p, &etx, &stop).await {
                             Ok(completion) => {
                                 eprintln!("chat: completion (len={})", completion.len());
                                 let _ = memory2.log_trace(&p, &completion).await;
@@ -170,9 +185,16 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
                             }
                             Err(e) => {
                                 eprintln!("chat: error: {}", e);
-                                // Deliberately NOT persisted: the client puts the
-                                // failed text back in the composer for edit+retry,
-                                // so persisting here would duplicate it on resend.
+                                if e == "stopped by user" {
+                                    // True stop: the thinking bubble is torn
+                                    // down client-side by chat_stopped; the
+                                    // partial (if any) was already banked by
+                                    // chat_stop. Emit nothing further.
+                                    return;
+                                }
+                                // Failed turns leave the optimistic user
+                                // message in place (committed at send time);
+                                // only the error bubble is ephemeral.
                                 push_notification(
                                     &push2,
                                     json!({ "jsonrpc": "2.0", "method": "chat_error",
@@ -190,12 +212,12 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
         "session_list" => ok(json!(sessions.list()), req.id),
         "session_create" => {
             let s = sessions.create(provider::system_message());
-            ok(json!({ "id": s.id, "title": s.title, "messages": s.messages }), req.id)
+            ok(json!({ "id": s.id, "title": s.title, "messages": s.thread() }), req.id)
         }
         "session_history" => {
             let id = req.params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str()).unwrap_or_default();
             match sessions.get(id) {
-                Some(s) => ok(json!({ "id": s.id, "title": s.title, "messages": s.messages }), req.id),
+                Some(s) => ok(json!({ "id": s.id, "title": s.title, "messages": s.thread(), "nav": sessions.nav(id) }), req.id),
                 None => err(-32602, format!("unknown session '{id}'"), req.id),
             }
         }
@@ -203,7 +225,7 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
             let id = req.params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
             let index = req.params.as_ref().and_then(|p| p.get("message_index")).and_then(|i| i.as_u64()).unwrap_or(0) as usize;
             match sessions.fork(&id, index) {
-                Some(f) => ok(json!({ "id": f.id, "title": f.title, "messages": f.messages }), req.id),
+                Some(f) => ok(json!({ "id": f.id, "title": f.title, "messages": f.thread() }), req.id),
                 None => err(-32602, format!("cannot fork unknown session '{id}'"), req.id),
             }
         }
@@ -214,9 +236,51 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
         "session_undo" => {
             let id = req.params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
             match sessions.undo(&id) {
-                Some(text) => ok(json!({ "user_message": text }), req.id),
+                Some(text) => ok(json!({ "user_message": text, "messages": sessions.thread(&id).unwrap_or_default(), "nav": sessions.nav(&id) }), req.id),
                 None => err(-32602, format!("cannot undo unknown session '{id}'"), req.id),
             }
+        }
+        "session_redo" => {
+            let id = req.params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
+            match sessions.redo(&id) {
+                Some(messages) => ok(json!({ "messages": messages, "nav": sessions.nav(&id) }), req.id),
+                None => err(-32602, format!("nothing to redo in session '{id}'"), req.id),
+            }
+        }
+        "session_goto" => {
+            let id = req.params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
+            let node = req.params.as_ref().and_then(|p| p.get("node")).and_then(|n| n.as_u64()).unwrap_or(u64::MAX);
+            match sessions.goto(&id, node) {
+                Some(messages) => ok(json!({ "messages": messages, "nav": sessions.nav(&id) }), req.id),
+                None => err(-32602, format!("unknown node in session '{id}'"), req.id),
+            }
+        }
+        "session_nav" => {
+            let id = req.params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
+            match sessions.nav(&id) {
+                Some(nav) => ok(json!({ "nav": nav, "messages": sessions.thread(&id).unwrap_or_default() }), req.id),
+                None => err(-32602, format!("unknown session '{id}'"), req.id),
+            }
+        }
+        "session_archive" => {
+            let id = req.params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
+            let archived = req.params.as_ref().and_then(|p| p.get("archived")).and_then(|a| a.as_bool()).unwrap_or(true);
+            ok(json!({ "archived": sessions.set_archived(&id, archived) }), req.id)
+        }
+        "chat_stop" => {
+            let id = req.params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
+            let partial = req.params.as_ref().and_then(|p| p.get("partial")).and_then(|x| x.as_str()).unwrap_or_default().to_string();
+            STOP.with(|cell| {
+                if let Some(flag) = cell.borrow().get(&id) {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+            // Bank the client's partial text as the transcript position so a
+            // later Resume continues from near the cutoff, not from scratch.
+            if !partial.trim().is_empty() {
+                let _ = sessions.append_message(&id, json!({ "role": "assistant", "content": partial }));
+            }
+            ok(json!({ "stopped": true }), req.id)
         }
         "session_rename" => {
             let id = req.params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
@@ -230,7 +294,7 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
         "session_restore" => {
             let id = req.params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
             match sessions.restore(&id) {
-                Some(s) => ok(json!({ "id": s.id, "title": s.title, "messages": s.messages }), req.id),
+                Some(s) => ok(json!({ "id": s.id, "title": s.title, "messages": s.thread() }), req.id),
                 None => err(-32602, format!("unknown closed session '{id}'"), req.id),
             }
         }

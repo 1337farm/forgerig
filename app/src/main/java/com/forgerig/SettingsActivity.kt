@@ -276,69 +276,82 @@ class SettingsActivity : AppCompatActivity() {
             override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
         }
 
+        fun fetchModelsFor(provider: String, base: String, key: String): List<String> {
+            // NVIDIA publishes no model-list endpoint; its public catalog lives
+            // in the NIM docs. Keep the curated NIM list (no network call).
+            if (provider == "nvidia") return emptyList()
+            if (provider == "custom" && base.isEmpty()) return emptyList()
+            val (url, auth) = when (provider) {
+                "gemini" -> "${base.trimEnd('/')}/v1beta/models?key=$key" to null
+                "ollama" -> "${base.trimEnd('/')}/api/tags" to null
+                else -> "${base.trimEnd('/')}/v1/models" to key.ifEmpty { null }
+            }
+            val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+            try {
+                conn.connectTimeout = 15000
+                conn.readTimeout = 15000
+                if (auth != null) conn.setRequestProperty("Authorization", "Bearer $auth")
+                if (conn.responseCode !in 200..299) throw java.io.IOException("HTTP ${conn.responseCode}")
+                val body = conn.inputStream.bufferedReader().readText()
+                val json = org.json.JSONObject(body)
+                val ids = mutableListOf<String>()
+                if (provider == "ollama") {
+                    val arr = json.optJSONArray("models") ?: org.json.JSONArray()
+                    for (i in 0 until arr.length()) {
+                        arr.optJSONObject(i)?.optString("name")?.takeIf { it.isNotEmpty() }?.let { ids.add(it) }
+                    }
+                } else if (provider == "gemini") {
+                    val arr = json.optJSONArray("models") ?: org.json.JSONArray()
+                    for (i in 0 until arr.length()) {
+                        arr.optJSONObject(i)?.optString("name")?.removePrefix("models/")?.takeIf { it.isNotEmpty() }?.let { ids.add(it) }
+                    }
+                } else {
+                    val arr = json.optJSONArray("data") ?: org.json.JSONArray()
+                    for (i in 0 until arr.length()) {
+                        arr.optJSONObject(i)?.optString("id")?.takeIf { it.isNotEmpty() }?.let { ids.add(it) }
+                    }
+                }
+                return ids
+            } finally {
+                conn.disconnect()
+            }
+        }
+
         fun fetchModels() {
-            val provider = providerOptions[spinner.selectedItemPosition].second
-            if (provider == "nvidia") {
-                Toast.makeText(this, "NVIDIA has no model-list endpoint; curated list kept.", Toast.LENGTH_SHORT).show()
-                return
-            }
-            val base = urlEdit.text.toString().trim().ifEmpty { defaultBaseUrls[provider] ?: "" }
-            if (base.isEmpty()) {
-                Toast.makeText(this, "Set a Base URL for the custom provider first.", Toast.LENGTH_SHORT).show()
-                return
-            }
-            val key = keyEdit.text.toString().trim()
-            Toast.makeText(this, "Refreshing model list…", Toast.LENGTH_SHORT).show()
+            val current = providerOptions[spinner.selectedItemPosition].second
+            Toast.makeText(this, "Refreshing all providers…", Toast.LENGTH_SHORT).show()
             Thread {
                 try {
-                    val (url, auth) = when (provider) {
-                        "gemini" -> "${base.trimEnd('/')}/v1beta/models?key=$key" to null
-                        "ollama" -> "${base.trimEnd('/')}/api/tags" to null
-                        else -> "${base.trimEnd('/')}/v1/models" to key.ifEmpty { null }
-                    }
-                    val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
-                    try {
-                        conn.connectTimeout = 15000
-                        conn.readTimeout = 15000
-                        if (auth != null) conn.setRequestProperty("Authorization", "Bearer $auth")
-                        if (conn.responseCode !in 200..299) throw java.io.IOException("HTTP ${conn.responseCode}")
-                        val body = conn.inputStream.bufferedReader().readText()
-                        val json = org.json.JSONObject(body)
-                        val ids = mutableListOf<String>()
-                        if (provider == "ollama") {
-                            val arr = json.optJSONArray("models") ?: org.json.JSONArray()
-                            for (i in 0 until arr.length()) {
-                                arr.optJSONObject(i)?.optString("name")?.takeIf { it.isNotEmpty() }?.let { ids.add(it) }
-                            }
-                        } else if (provider == "gemini") {
-                            val arr = json.optJSONArray("models") ?: org.json.JSONArray()
-                            for (i in 0 until arr.length()) {
-                                arr.optJSONObject(i)?.optString("name")?.removePrefix("models/")?.takeIf { it.isNotEmpty() }?.let { ids.add(it) }
-                            }
-                        } else {
-                            val arr = json.optJSONArray("data") ?: org.json.JSONArray()
-                            for (i in 0 until arr.length()) {
-                                arr.optJSONObject(i)?.optString("id")?.takeIf { it.isNotEmpty() }?.let { ids.add(it) }
-                            }
-                        }
-                        runOnUiThread {
-                            if (ids.isEmpty()) {
-                                Toast.makeText(this, "No models returned.", Toast.LENGTH_SHORT).show()
-                            } else {
-                                val known = extraModels.getOrPut(provider) { mutableListOf() }
-                                var added = 0
-                                for (id in ids.sorted()) {
-                                    if ((modelCatalog[provider] ?: emptyList()).none { it.name == id } && !known.contains(id)) {
-                                        known.add(id)
-                                        added++
-                                    }
+                    val key = keyEdit.text.toString().trim()
+                    val customBase = urlEdit.text.toString().trim()
+                    var totalAdded = 0
+                    var totalSeen = 0
+                    val failures = mutableListOf<String>()
+                    for ((_, code) in providerOptions) {
+                        // Each provider is queried against its own default base
+                        // (custom keeps the typed URL); one provider's outage
+                        // must not abort the rest.
+                        val base = if (code == "custom") customBase else defaultBaseUrls[code] ?: ""
+                        if (base.isEmpty()) continue
+                        try {
+                            val ids = fetchModelsFor(code, base, key)
+                            totalSeen += ids.size
+                            val known = extraModels.getOrPut(code) { mutableListOf() }
+                            for (id in ids.sorted()) {
+                                if ((modelCatalog[code] ?: emptyList()).none { it.name == id } && !known.contains(id)) {
+                                    known.add(id)
+                                    totalAdded++
                                 }
-                                refreshModels()
-                                Toast.makeText(this, "Added $added model(s), ${ids.size} total.", Toast.LENGTH_SHORT).show()
                             }
+                        } catch (e: Exception) {
+                            failures.add("$code: ${e.message}")
+                            AssetExtractor.logShared(this, "WARNING: model refresh failed for $code | $e")
                         }
-                    } finally {
-                        conn.disconnect()
+                    }
+                    runOnUiThread {
+                        refreshModels()
+                        val tail = if (failures.isEmpty()) "" else " Failures: ${failures.joinToString("; ")}"
+                        Toast.makeText(this, "Added $totalAdded model(s), $totalSeen seen across providers.$tail", Toast.LENGTH_LONG).show()
                     }
                 } catch (e: Exception) {
                     runOnUiThread {
@@ -348,7 +361,7 @@ class SettingsActivity : AppCompatActivity() {
             }.start()
         }
         root.addView(Button(this).apply {
-            text = "Refresh models from provider"
+            text = "Refresh models (all providers)"
             setBackgroundColor(0xFF3a3348.toInt())
             setTextColor(0xFFe6e6e6.toInt())
             setOnClickListener { fetchModels() }

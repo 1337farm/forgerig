@@ -23,6 +23,37 @@ use crate::tools::CodeIngest;
 /// over the WebSocket as `chat_chunk` / `chat_tool` / `chat_review`
 /// notifications so the UI paints tokens and progress markers as they arrive
 /// instead of waiting for the full reply.
+/// Cooperative cancellation handle for an in-flight generation. Stop sets
+/// the flag; the streaming loop polls it on every chunk and between tool
+/// calls, drops the provider socket, and returns `Stopped` so no completion
+/// is persisted and no chat_done is emitted. Cutting the loop early also
+/// stops token spend at the provider.
+pub type StopFlag = std::sync::Arc<std::sync::atomic::AtomicBool>;
+
+/// Error returned when the user stops a generation mid-flight.
+#[derive(Debug)]
+pub struct Stopped;
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "stopped by user")
+    }
+}
+
+impl From<Stopped> for completion::CompletionError {
+    fn from(_: Stopped) -> Self {
+        completion::CompletionError::ResponseError("stopped by user".into())
+    }
+}
+
+fn is_stopped(stop: &StopFlag) -> bool {
+    stop.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Events emitted while a chat completion streams. The daemon forwards these
+/// over the WebSocket as `chat_chunk` / `chat_tool` / `chat_review`
+/// notifications so the UI paints tokens and progress markers as they arrive
+/// instead of waiting for the full reply.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     /// A slice of assistant text.
@@ -33,6 +64,9 @@ pub enum StreamEvent {
     ToolStart(String),
     /// A tool call finished; String is a truncated result preview.
     ToolResult(String),
+    /// The generation was stopped: the client must tear down the thinking
+    /// bubble and mark the turn stopped (never a completion).
+    Stopped,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +108,10 @@ impl StreamEvent {
             StreamEvent::ToolResult(preview) => json!({
                 "jsonrpc": "2.0", "method": "chat_tool",
                 "params": { "session_id": session_id, "phase": "result", "preview": preview },
+            }),
+            StreamEvent::Stopped => json!({
+                "jsonrpc": "2.0", "method": "chat_stopped",
+                "params": { "session_id": session_id },
             }),
         }
     }
@@ -631,6 +669,7 @@ async fn run_agent_loop_streaming(
     messages: &mut Vec<serde_json::Value>,
     prompt: &str,
     emit: &tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+    stop: &StopFlag,
 ) -> Result<String, completion::CompletionError> {
     use futures_util::StreamExt as _;
     let emit_ev = |ev: StreamEvent| {
@@ -640,6 +679,10 @@ async fn run_agent_loop_streaming(
     messages.push(json!({ "role": "user", "content": prompt }));
     emit_ev(StreamEvent::Phase(PhaseEvent::Thinking));
     for _turn in 0..MAX_TOOL_TURNS {
+        if is_stopped(stop) {
+            emit_ev(StreamEvent::Stopped);
+            return Err(Stopped.into());
+        }
         let mut body = serde_json::Map::new();
         body.insert("model".into(), json!(model.model));
         body.insert("messages".into(), json!(messages));
@@ -670,6 +713,11 @@ async fn run_agent_loop_streaming(
         let mut builders: Vec<ToolCallDelta> = Vec::new();
         let mut ended = false;
         while !ended {
+            if is_stopped(stop) {
+                drop(stream);
+                emit_ev(StreamEvent::Stopped);
+                return Err(Stopped.into());
+            }
             let chunk = stream.next().await;
             let bytes = match chunk {
                 Some(Ok(b)) => b,
@@ -726,6 +774,10 @@ async fn run_agent_loop_streaming(
             .collect();
         messages.push(json!({ "role": "assistant", "tool_calls": wire_calls }));
         for tc in &calls {
+            if is_stopped(stop) {
+                emit_ev(StreamEvent::Stopped);
+                return Err(Stopped.into());
+            }
             emit_ev(StreamEvent::ToolStart(tc.name.clone()));
             let result = match tools.call(&tc.name, tc.arguments.clone()).await {
                 Ok(r) => r,
@@ -904,11 +956,12 @@ impl Backend {
         messages: &mut Vec<serde_json::Value>,
         prompt: &str,
         emit: &tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+        stop: &StopFlag,
     ) -> Result<String, String> {
         let fut = match &self.kind {
             BackendKind::Compat { model, tools, tool_defs, .. } => {
                 futures_util::future::Either::Left(async move {
-                    run_agent_loop_streaming(model, tools, tool_defs, messages, prompt, emit)
+                    run_agent_loop_streaming(model, tools, tool_defs, messages, prompt, emit, stop)
                         .await
                         .map_err(|e| e.to_string())
                 })
@@ -1011,5 +1064,15 @@ mod tests {
         let v = StreamEvent::ToolStart("bash_executor".into()).into_rpc("s1");
         assert_eq!(v["method"], json!("chat_tool"));
         assert_eq!(v["params"]["phase"], json!("start"));
+        let v = StreamEvent::Stopped.into_rpc("s1");
+        assert_eq!(v["method"], json!("chat_stopped"));
+    }
+
+    #[test]
+    fn stop_flag_starts_clear() {
+        let flag: StopFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(!is_stopped(&flag));
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(is_stopped(&flag));
     }
 }

@@ -1,15 +1,14 @@
-//! Persistent chat sessions with history, forking, deletion, and undo.
+//! Persistent branch-tree chat sessions with history, forking, undo/redo.
 //!
-//! A session's `messages` vector is the OpenAI-compat thread (system message
-//! seeded at creation, then user / assistant / tool messages in order), so it
-//! can be replayed verbatim to the model and reused as the cache for resuming,
-//! forking, or branching a conversation. Tool round-trips stay in the thread
-//! (so context is complete) but are invisible to the UI, which renders only
-//! user messages and assistant messages with text content.
+//! A session is a *tree* of OpenAI-compat messages rooted at the system
+//! message. The visible thread is the path from the root to the current
+//! `head` node. Undo moves `head` back past the last user/assistant turn but
+//! never deletes nodes: the undone limb stays in the tree (a "phantom copy"),
+//! so redo and branch navigation can always walk back down/up. Nothing is
+//! ever pruned except the trash-cap eviction of whole closed sessions.
 //!
-//! Sessions and closed tabs are persisted to a JSON file so they survive an
-//! Android process kill or app force-close. The file is stored in the app's
-//! private files directory (or an explicit `FORGERIG_SESSIONS_FILE` path).
+//! Sessions and closed tabs persist to a JSON file so they survive an Android
+//! process kill or app force-close.
 
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -27,23 +26,110 @@ pub struct SessionSummary {
     pub title: String,
     pub message_count: usize,
     pub created_ms: u64,
+    pub archived: bool,
+    /// True when the visible thread has an earlier user turn to undo to.
+    pub can_undo: bool,
+    /// Alternate limbs off the current head (children) plus redo depth.
+    pub alt_count: usize,
+}
+
+/// One message node in a session tree.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct MsgNode {
+    pub id: u64,
+    pub parent: Option<u64>,
+    /// Full OpenAI-compat message object (role/content/tool_calls/...).
+    pub message: Value,
+    pub children: Vec<u64>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SessionTree {
+    pub nodes: HashMap<u64, MsgNode>,
+    pub root: u64,
+    pub head: u64,
+    pub next: u64,
+    /// Heads abandoned by undo, newest last. Cleared by any new append
+    /// (a new message from a rewound head forks a fresh limb).
+    pub redo: Vec<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
     pub title: String,
-    pub messages: Vec<Value>,
+    pub tree: SessionTree,
+    pub archived: bool,
     pub created_ms: u64,
+}
+
+impl Session {
+    /// Visible thread: messages on the path root -> head.
+    pub fn thread(&self) -> Vec<Value> {
+        let mut ids = Vec::new();
+        let mut cur = Some(self.tree.head);
+        while let Some(id) = cur {
+            ids.push(id);
+            cur = self.tree.nodes.get(&id).and_then(|n| n.parent);
+        }
+        ids.reverse();
+        ids.iter()
+            .filter_map(|id| self.tree.nodes.get(id))
+            .map(|n| n.message.clone())
+            .collect()
+    }
+
+    fn autotitle(&mut self) {
+        if !self.title.is_empty() {
+            return;
+        }
+        if let Some(content) = self
+            .thread()
+            .iter()
+            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+        {
+            self.title = SessionManager::derive_title(content);
+        }
+    }
+}
+
+/// Child descriptor for branch navigation UIs.
+#[derive(Clone, Serialize)]
+pub struct BranchChild {
+    pub id: u64,
+    pub role: String,
+    pub preview: String,
 }
 
 #[derive(Serialize, Deserialize)]
 struct PersistedState {
+    version: u32,
     sessions: Vec<Session>,
     trash: Vec<(Session, u64)>,
     seq: u64,
     trash_seq: u64,
 }
+
+/// Pre-tree (v1) on-disk shape, for migration.
+#[derive(Deserialize)]
+struct V1Session {
+    id: String,
+    title: String,
+    messages: Vec<Value>,
+    created_ms: u64,
+}
+
+#[derive(Deserialize)]
+struct V1State {
+    sessions: Vec<V1Session>,
+    trash: Vec<(V1Session, u64)>,
+    seq: u64,
+    trash_seq: u64,
+}
+
+const STATE_VERSION: u32 = 2;
 
 pub struct SessionManager {
     sessions: Mutex<HashMap<String, Session>>,
@@ -78,14 +164,27 @@ impl SessionManager {
                 let mut text = String::new();
                 if file.read_to_string(&mut text).is_ok() {
                     if let Ok(state) = serde_json::from_str::<PersistedState>(&text) {
-                        for session in state.sessions {
-                            sessions.insert(session.id.clone(), session);
+                        if state.version == STATE_VERSION {
+                            for session in state.sessions {
+                                sessions.insert(session.id.clone(), session);
+                            }
+                            for (session, order) in state.trash {
+                                trash.insert(session.id.clone(), (session, order));
+                            }
+                            seq = state.seq;
+                            trash_seq = state.trash_seq;
                         }
-                        for (session, order) in state.trash {
+                    } else if let Ok(v1) = serde_json::from_str::<V1State>(&text) {
+                        // Migrate linear v1 threads into single-limb trees.
+                        for s in v1.sessions {
+                            sessions.insert(s.id.clone(), Self::linear_tree(&s.id, &s.title, s.messages, s.created_ms));
+                        }
+                        for (s, order) in v1.trash {
+                            let session = Self::linear_tree(&s.id, &s.title, s.messages, s.created_ms);
                             trash.insert(session.id.clone(), (session, order));
                         }
-                        seq = state.seq;
-                        trash_seq = state.trash_seq;
+                        seq = v1.seq;
+                        trash_seq = v1.trash_seq;
                     }
                 }
             }
@@ -97,6 +196,34 @@ impl SessionManager {
             seq: Mutex::new(seq),
             trash_seq: Mutex::new(trash_seq),
             persist_path: path,
+        }
+    }
+
+    fn linear_tree(_id: &str, title: &str, messages: Vec<Value>, created_ms: u64) -> Session {
+        let mut nodes = HashMap::new();
+        let mut parent = None;
+        let mut next = 0;
+        for message in messages {
+            let id = next;
+            next += 1;
+            nodes.insert(
+                id,
+                MsgNode { id, parent, message, children: Vec::new() },
+            );
+            if let Some(p) = parent {
+                if let Some(pn) = nodes.get_mut(&p) {
+                    pn.children.push(id);
+                }
+            }
+            parent = Some(id);
+        }
+        let head = parent.unwrap_or(0);
+        Session {
+            id: _id.to_string(),
+            title: title.to_string(),
+            tree: SessionTree { nodes, root: 0, head, next, redo: Vec::new() },
+            archived: false,
+            created_ms,
         }
     }
 
@@ -133,6 +260,7 @@ impl SessionManager {
         let sessions = self.sessions.lock().unwrap();
         let trash = self.trash.lock().unwrap();
         let state = PersistedState {
+            version: STATE_VERSION,
             sessions: sessions.values().cloned().collect(),
             trash: trash.values().cloned().collect(),
             seq: *self.seq.lock().unwrap(),
@@ -140,7 +268,7 @@ impl SessionManager {
         };
         drop(sessions);
         drop(trash);
-        let text = match serde_json::to_string_pretty(&state) {
+        let text = match serde_json::to_string(&state) {
             Ok(text) => text,
             Err(_) => return,
         };
@@ -149,13 +277,61 @@ impl SessionManager {
         let _ = fs::rename(&tmp, path);
     }
 
+    fn summary_of(s: &Session) -> SessionSummary {
+        let thread = s.thread();
+        let can_undo = thread
+            .iter()
+            .skip(1)
+            .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"));
+        let alt_count = s
+            .tree
+            .nodes
+            .get(&s.tree.head)
+            .map(|n| n.children.len())
+            .unwrap_or(0)
+            + s.tree.redo.len();
+        SessionSummary {
+            id: s.id.clone(),
+            title: s.title.clone(),
+            message_count: thread.len(),
+            created_ms: s.created_ms,
+            archived: s.archived,
+            can_undo,
+            alt_count,
+        }
+    }
+
+    /// Append one message node under the current head. Any new append forks
+    /// a fresh limb, so the redo stack is cleared.
+    fn push_node(session: &mut Session, message: Value) -> u64 {
+        let id = session.tree.next;
+        session.tree.next += 1;
+        let parent = session.tree.head;
+        session.tree.nodes.insert(
+            id,
+            MsgNode { id, parent: Some(parent), message, children: Vec::new() },
+        );
+        if let Some(pn) = session.tree.nodes.get_mut(&parent) {
+            pn.children.push(id);
+        }
+        session.tree.head = id;
+        session.tree.redo.clear();
+        id
+    }
+
     /// Create a new session seeded with the system message.
     pub fn create(&self, system_message: Value) -> Session {
         let id = self.next_id();
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            0,
+            MsgNode { id: 0, parent: None, message: system_message, children: Vec::new() },
+        );
         let session = Session {
             id: id.clone(),
             title: String::new(),
-            messages: vec![system_message],
+            tree: SessionTree { nodes, root: 0, head: 0, next: 1, redo: Vec::new() },
+            archived: false,
             created_ms: Self::now_ms(),
         };
         self.sessions.lock().unwrap().insert(id, session.clone());
@@ -165,6 +341,11 @@ impl SessionManager {
 
     pub fn get(&self, id: &str) -> Option<Session> {
         self.sessions.lock().unwrap().get(id).cloned()
+    }
+
+    /// Visible thread (root -> head path) for a session.
+    pub fn thread(&self, id: &str) -> Option<Vec<Value>> {
+        self.sessions.lock().unwrap().get(id).map(|s| s.thread())
     }
 
     pub fn exists(&self, id: &str) -> bool {
@@ -177,37 +358,195 @@ impl SessionManager {
             .lock()
             .unwrap()
             .values()
-            .map(|s| SessionSummary {
-                id: s.id.clone(),
-                title: s.title.clone(),
-                message_count: s.messages.len(),
-                created_ms: s.created_ms,
-            })
+            .filter(|s| !s.archived)
+            .map(Self::summary_of)
             .collect();
         v.sort_by_key(|s| std::cmp::Reverse(s.created_ms));
         v
     }
 
-    /// Replace the whole message thread (written back after a chat extends it).
-    pub fn set_messages(&self, id: &str, messages: Vec<Value>) -> Option<Session> {
+    /// Extend the visible thread to `full`: the longest common prefix with
+    /// the current head path is kept (nodes shared), the remainder is
+    /// appended as new nodes. The system message (index 0) is resynced, not
+    /// compared, since project memory can refresh it between turns.
+    pub fn set_messages(&self, id: &str, full: Vec<Value>) -> Option<Session> {
         let mut lock = self.sessions.lock().unwrap();
         let session = lock.get_mut(id)?;
-        session.messages = messages;
-        if session.title.is_empty() {
-            if let Some(content) = session
-                .messages
-                .iter()
-                .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_str())
-            {
-                session.title = Self::derive_title(content);
-            }
+        let path = session.thread();
+        let base = path.len().min(full.len());
+        let mut i = 1;
+        while i < base && path.get(i) == full.get(i) {
+            i += 1;
         }
+        if full.is_empty() {
+            return None;
+        }
+        if let Some(root) = session.tree.nodes.get_mut(&session.tree.root) {
+            root.message = full[0].clone();
+        }
+        for msg in full.iter().skip(i) {
+            Self::push_node(session, msg.clone());
+        }
+        session.autotitle();
         let session = session.clone();
         drop(lock);
         self.persist();
         Some(session)
+    }
+
+    /// Append a single message to the visible thread (early user-message
+    /// persist at send time, partial assistant text on stop, ...).
+    pub fn append_message(&self, id: &str, message: Value) -> Option<Session> {
+        let mut lock = self.sessions.lock().unwrap();
+        let session = lock.get_mut(id)?;
+        Self::push_node(session, message);
+        session.autotitle();
+        let session = session.clone();
+        drop(lock);
+        self.persist();
+        Some(session)
+    }
+
+    /// Move `head` back past the last assistant/tool block and its user
+    /// message. Nodes are kept (phantom limb) and the old head is pushed on
+    /// the redo stack. Returns the removed user text for edit+retry.
+    pub fn undo(&self, id: &str) -> Option<String> {
+        let mut lock = self.sessions.lock().unwrap();
+        let session = lock.get_mut(id)?;
+        // Walk back over trailing assistant/tool nodes to the user node.
+        let mut cur = session.tree.head;
+        loop {
+            let role = session
+                .tree
+                .nodes
+                .get(&cur)
+                .and_then(|n| n.message.get("role"))
+                .and_then(|r| r.as_str());
+            match role {
+                Some("assistant") | Some("tool") => {
+                    cur = session.tree.nodes.get(&cur)?.parent?;
+                }
+                _ => break,
+            }
+        }
+        let user_node = session.tree.nodes.get(&cur)?;
+        if user_node.message.get("role").and_then(|r| r.as_str()) != Some("user")
+            || cur == session.tree.root
+        {
+            return None;
+        }
+        let text = user_node
+            .message
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+        let new_head = user_node.parent?;
+        session.tree.redo.push(session.tree.head);
+        session.tree.head = new_head;
+        drop(lock);
+        self.persist();
+        Some(text)
+    }
+
+    /// Walk back down to the most recently undone head, if it still exists.
+    pub fn redo(&self, id: &str) -> Option<Vec<Value>> {
+        let mut lock = self.sessions.lock().unwrap();
+        let session = lock.get_mut(id)?;
+        let target = session.tree.redo.pop()?;
+        if !session.tree.nodes.contains_key(&target) {
+            drop(lock);
+            self.persist();
+            return None;
+        }
+        session.tree.head = target;
+        let thread = session.thread();
+        drop(lock);
+        self.persist();
+        Some(thread)
+    }
+
+    /// Jump `head` to any node in the tree (branch navigation). The undone
+    /// limbs stay intact; sending from a rewound head forks a new limb.
+    pub fn goto(&self, id: &str, node: u64) -> Option<Vec<Value>> {
+        let mut lock = self.sessions.lock().unwrap();
+        let session = lock.get_mut(id)?;
+        if !session.tree.nodes.contains_key(&node) {
+            return None;
+        }
+        session.tree.head = node;
+        let thread = session.thread();
+        drop(lock);
+        self.persist();
+        Some(thread)
+    }
+
+    /// Children of the current head: alternate limbs to navigate to.
+    pub fn children(&self, id: &str) -> Option<Vec<BranchChild>> {
+        let lock = self.sessions.lock().unwrap();
+        let session = lock.get(id)?;
+        let head = session.tree.nodes.get(&session.tree.head)?;
+        Some(
+            head.children
+                .iter()
+                .filter_map(|cid| session.tree.nodes.get(cid))
+                .map(|n| {
+                    let role = n
+                        .message
+                        .get("role")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("?")
+                        .to_string();
+                    let preview: String = n
+                        .message
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("(tool)")
+                        .chars()
+                        .take(80)
+                        .collect();
+                    BranchChild { id: n.id, role, preview }
+                })
+                .collect(),
+        )
+    }
+
+    /// Navigation snapshot for the branch pager UI.
+    pub fn nav(&self, id: &str) -> Option<Value> {
+        let lock = self.sessions.lock().unwrap();
+        let session = lock.get(id)?;
+        let thread = session.thread();
+        let can_undo = thread
+            .iter()
+            .skip(1)
+            .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"));
+        let children = self.children(id).unwrap_or_default();
+        Some(serde_json::json!({
+            "head": session.tree.head,
+            "can_undo": can_undo,
+            "can_redo": !session.tree.redo.is_empty(),
+            "children": children,
+        }))
+    }
+
+    /// Archive (hide) or unhide a live or closed session.
+    pub fn set_archived(&self, id: &str, archived: bool) -> bool {
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            if let Some(s) = sessions.get_mut(id) {
+                s.archived = archived;
+            } else {
+                let mut trash = self.trash.lock().unwrap();
+                match trash.get_mut(id) {
+                    Some((s, _)) => {
+                        s.archived = archived;
+                    }
+                    None => return false,
+                }
+            }
+        }
+        self.persist();
+        true
     }
 
     pub fn delete(&self, id: &str) -> bool {
@@ -256,24 +595,14 @@ impl SessionManager {
             .lock()
             .unwrap()
             .values()
-            .map(|(s, ts)| {
-                (
-                    SessionSummary {
-                        id: s.id.clone(),
-                        title: s.title.clone(),
-                        message_count: s.messages.len(),
-                        created_ms: s.created_ms,
-                    },
-                    *ts,
-                )
-            })
+            .map(|(s, ts)| (Self::summary_of(s), *ts))
             .collect();
         v.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
         v.into_iter().map(|(s, _)| s).collect()
     }
 
     /// Rename a tab. A non-empty custom title also pins it: the auto-title
-    /// in set_messages only fills blank titles, so renames stick.
+    /// only fills blank titles, so renames stick.
     pub fn set_title(&self, id: &str, title: &str) -> Option<Session> {
         let trimmed: String = title.chars().take(TITLE_MAX).collect();
         let trimmed = trimmed.trim().to_string();
@@ -289,55 +618,20 @@ impl SessionManager {
         Some(session)
     }
 
-    /// Fork: clone a session and keep only the thread up to and including
-    /// message `index` (0-based, forked session keeps the same cache prefix).
+    /// Fork: clone the head-path prefix up to and including raw thread
+    /// `index` into a new single-limb session.
     pub fn fork(&self, id: &str, index: usize) -> Option<Session> {
         let source = self.get(id)?;
-        if source.messages.is_empty() {
+        let path = source.thread();
+        if path.is_empty() {
             return None;
         }
-        let keep = index.min(source.messages.len() - 1);
+        let keep = index.min(path.len() - 1);
         let new_id = self.next_id();
-        let forked = Session {
-            id: new_id.clone(),
-            title: format!("{} (fork)", source.title),
-            messages: source.messages[..=keep].to_vec(),
-            created_ms: Self::now_ms(),
-        };
+        let forked = Self::linear_tree(&new_id, &format!("{} (fork)", source.title), path[..=keep].to_vec(), Self::now_ms());
         self.sessions.lock().unwrap().insert(new_id, forked.clone());
         self.persist();
         Some(forked)
-    }
-
-    /// Undo the last completed user/assistant turn. Returns the user text so
-    /// the client can put it back in the composer for editing.
-    pub fn undo(&self, id: &str) -> Option<String> {
-        let mut lock = self.sessions.lock().unwrap();
-        let session = lock.get_mut(id)?;
-        if session.messages.len() < 2 {
-            return None;
-        }
-        let mut end = session.messages.len();
-        while end > 0 {
-            let role = session.messages[end - 1].get("role").and_then(|r| r.as_str());
-            if role == Some("assistant") || role == Some("tool") {
-                end -= 1;
-            } else {
-                break;
-            }
-        }
-        if end == 0 || session.messages[end - 1].get("role").and_then(|r| r.as_str()) != Some("user") {
-            return None;
-        }
-        let text = session.messages[end - 1]
-            .get("content")
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .to_string();
-        session.messages.truncate(end - 1);
-        drop(lock);
-        self.persist();
-        Some(text)
     }
 }
 
@@ -350,22 +644,46 @@ mod tests {
         json!({ "role": "system", "content": "SYS" })
     }
 
+    fn user(content: &str) -> Value {
+        json!({"role":"user","content":content})
+    }
+
+    fn assistant(content: &str) -> Value {
+        json!({"role":"assistant","content":content})
+    }
+
     fn thread() -> Vec<Value> {
-        vec![
-            sys(),
-            json!({"role":"user","content":"hello"}),
-            json!({"role":"assistant","content":"hi"}),
-            json!({"role":"user","content":"second question"}),
-        ]
+        vec![sys(), user("hello"), assistant("hi"), user("second question")]
+    }
+
+    fn live(m: &SessionManager, id: &str) -> Vec<Value> {
+        m.thread(id).unwrap()
     }
 
     #[test]
     fn create_seeds_system_and_lists() {
         let m = SessionManager::new();
         let s = m.create(sys());
-        assert_eq!(s.messages.len(), 1);
+        assert_eq!(live(&m, &s.id).len(), 1);
         assert!(m.exists(&s.id));
         assert_eq!(m.list().len(), 1);
+    }
+
+    #[test]
+    fn set_messages_appends_and_keeps_prefix_nodes() {
+        let m = SessionManager::new();
+        let s = m.create(sys());
+        m.set_messages(&s.id, thread());
+        let before = m.get(&s.id).unwrap();
+        let head_before = before.tree.head;
+        // Write back the same thread plus one assistant reply: only one node added.
+        let mut ext = thread();
+        ext.push(assistant("answer"));
+        m.set_messages(&s.id, ext);
+        let after = m.get(&s.id).unwrap();
+        assert_eq!(after.thread().len(), 5);
+        assert_eq!(after.tree.nodes.len(), 5);
+        assert_ne!(after.tree.head, head_before);
     }
 
     #[test]
@@ -375,9 +693,9 @@ mod tests {
         m.set_messages(&s.id, thread());
         // Fork from index 2 (the assistant "hi" reply): keep system + user + assistant.
         let f = m.fork(&s.id, 2).unwrap();
-        assert_eq!(f.messages.len(), 3);
-        assert_eq!(f.messages[1].get("content").unwrap(), "hello");
-        assert_eq!(f.messages[2].get("content").unwrap(), "hi");
+        assert_eq!(f.thread().len(), 3);
+        assert_eq!(f.thread()[1].get("content").unwrap(), "hello");
+        assert_eq!(f.thread()[2].get("content").unwrap(), "hi");
         assert_ne!(f.id, s.id);
         assert!(m.exists(&f.id));
     }
@@ -417,7 +735,7 @@ mod tests {
         assert!(m.delete(&s.id));
         assert_eq!(m.trash_list().len(), 1);
         let back = m.restore(&s.id).unwrap();
-        assert_eq!(back.messages.len(), 4);
+        assert_eq!(back.thread().len(), 4);
         assert!(m.exists(&s.id));
         assert!(m.trash_list().is_empty());
     }
@@ -438,35 +756,86 @@ mod tests {
     }
 
     #[test]
-    fn undo_removes_last_turn_and_returns_user_text() {
+    fn undo_keeps_phantom_limb_for_redo() {
         let m = SessionManager::new();
         let s = m.create(sys());
         m.set_messages(&s.id, thread());
         assert_eq!(m.undo(&s.id).unwrap(), "second question");
         let after = m.get(&s.id).unwrap();
-        assert_eq!(after.messages.len(), 3);
-        assert_eq!(after.messages[2].get("content").unwrap(), "hi");
+        assert_eq!(after.thread().len(), 3);
+        assert_eq!(after.thread()[2].get("content").unwrap(), "hi");
+        // Nothing pruned: the undone node still exists as a child of the head.
+        assert_eq!(after.tree.nodes.len(), 4);
+        // Redo walks back down to the phantom head.
+        let redone = m.redo(&s.id).unwrap();
+        assert_eq!(redone.len(), 4);
+        assert_eq!(redone[3].get("content").unwrap(), "second question");
     }
 
     #[test]
-    fn undo_removes_user_and_assistant_pair() {
+    fn undo_twice_then_branch_keeps_both_limbs() {
         let m = SessionManager::new();
         let s = m.create(sys());
         m.set_messages(&s.id, thread());
         assert_eq!(m.undo(&s.id).unwrap(), "second question");
         assert_eq!(m.undo(&s.id).unwrap(), "hello");
+        assert_eq!(live(&m, &s.id).len(), 1);
+        // New message from the rewound root forks a fresh limb; old limbs stay.
+        m.append_message(&s.id, user("other path"));
         let after = m.get(&s.id).unwrap();
-        assert_eq!(after.messages.len(), 1);
-        assert_eq!(after.messages[0].get("role").unwrap(), "system");
+        assert_eq!(after.thread().len(), 2);
+        assert_eq!(after.thread()[1].get("content").unwrap(), "other path");
+        assert!(after.tree.nodes.len() > 2);
+        // Redo stack was cleared by the new append.
+        assert!(m.redo(&s.id).is_none());
     }
 
     #[test]
-    fn persistence_round_trips_live_and_trash_sessions() {
+    fn goto_navigates_to_any_node() {
+        let m = SessionManager::new();
+        let s = m.create(sys());
+        m.set_messages(&s.id, thread());
+        let full = m.get(&s.id).unwrap();
+        let hello_id = full
+            .tree
+            .nodes
+            .values()
+            .find(|n| n.message.get("content").and_then(|c| c.as_str()) == Some("hello"))
+            .unwrap()
+            .id;
+        let thread = m.goto(&s.id, hello_id).unwrap();
+        assert_eq!(thread.len(), 2);
+        let kids = m.children(&s.id).unwrap();
+        assert!(kids.iter().any(|k| k.preview == "hi"));
+    }
+
+    #[test]
+    fn archive_hides_from_lists_but_stays_restorable() {
+        let m = SessionManager::new();
+        let s = m.create(sys());
+        m.set_messages(&s.id, thread());
+        assert!(m.set_archived(&s.id, true));
+        assert!(m.list().is_empty());
+        assert!(m.delete(&s.id));
+        let trash = m.trash_list();
+        assert_eq!(trash.len(), 1);
+        assert!(trash[0].archived);
+        assert!(m.set_archived(&s.id, false));
+        assert!(!m.trash_list()[0].archived);
+        assert!(m.restore(&s.id).is_some());
+    }
+
+    #[test]
+    fn persistence_round_trips_tree_and_trash() {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("forgerig-sessions-{}.json", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let path = dir.join(format!(
+            "forgerig-sessions-{}.json",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
         let m = SessionManager::with_persist_path(Some(path.clone()));
         let s = m.create(sys());
         m.set_messages(&s.id, thread());
+        m.undo(&s.id).unwrap();
         assert!(m.delete(&s.id));
         drop(m);
 
@@ -474,7 +843,10 @@ mod tests {
         assert!(!m2.exists(&s.id));
         assert_eq!(m2.trash_list().len(), 1);
         let back = m2.restore(&s.id).unwrap();
-        assert_eq!(back.messages.len(), 4);
+        // Restored at the rewound head; the phantom limb survived the reload.
+        assert_eq!(back.thread().len(), 3);
+        assert_eq!(back.tree.nodes.len(), 4);
+        assert!(m2.redo(&s.id).is_some());
         let _ = std::fs::remove_file(path);
     }
 }

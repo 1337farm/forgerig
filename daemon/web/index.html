@@ -42,8 +42,27 @@
   .row { display: flex; align-items: center; gap: .5rem; }
   .row.between { justify-content: space-between; }
   h1 { font-size: 1.1rem; margin: 0; font-weight: 600; color: var(--accent); }
+  .brand { display: flex; align-items: center; gap: .45rem; }
+  .brand .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ok); flex: 0 0 auto; }
+  .brand .dot.busy { background: var(--accent); animation: tblink 1.2s infinite; }
+  .brand .dot.error { background: #ff7b72; }
+  #status-pill {
+    font-size: .68rem; color: var(--ink); background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 999px; padding: .15rem .55rem;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 46vw;
+  }
   #status { color: var(--ok); font-size: .78rem; }
-  #provider { color: var(--accent-soft); font-size: .72rem; font-family: monospace; word-break: break-all; }
+  #provider-line { display: flex; align-items: center; gap: .4rem; min-width: 0; }
+  #provider { color: var(--accent-soft); font-size: .72rem; font-family: monospace; word-break: break-all; flex: 1 1 auto; min-width: 0; }
+  .pill {
+    font-size: .66rem; border: 1px solid var(--line); border-radius: 999px;
+    padding: .12rem .5rem; color: var(--muted); background: var(--panel);
+    white-space: nowrap; flex: 0 0 auto;
+  }
+  .pill.key-ok { color: var(--ok); border-color: var(--ok); }
+  .pill.key-missing { color: #ff7b72; border-color: #ff7b72; }
+  .pill.lean-ok { color: var(--ok); border-color: var(--ok); }
+  .pill.lean-warn { color: var(--warn); border-color: var(--warn); }
   button { cursor: pointer; }
   #settings-btn, #lean-btn {
     background: #333; color: var(--ink); border: 1px solid #555; border-radius: 6px;
@@ -98,6 +117,17 @@
     flex: 0 0 auto; background: var(--panel); border: 1px solid var(--line); color: var(--muted);
     border-radius: 8px; padding: .35rem .55rem; font-size: .8rem;
   }
+  #branch-pager {
+    display: none; gap: .3rem; align-items: center; padding: .35rem .6rem;
+    overflow-x: auto; flex-shrink: 0; border-bottom: 1px solid var(--line); background: var(--bg);
+  }
+  #branch-pager .mini {
+    background: transparent; border: 1px solid var(--line); color: var(--muted);
+    border-radius: 6px; padding: .12rem .45rem; font-size: .68rem; flex: 0 0 auto;
+  }
+  #branch-pager .mini:disabled { opacity: .35; }
+  #branch-pager .mini:not(:disabled):hover { color: var(--link); border-color: var(--accent-soft); }
+  #branch-pager .branch-info { font-size: .68rem; color: var(--muted); margin-left: auto; flex: 0 0 auto; }
   #closed-panel {
     border-bottom: 1px solid var(--line); background: var(--bg);
     padding: .35rem .6rem; flex-shrink: 0; max-height: 9rem; overflow-y: auto;
@@ -201,10 +231,10 @@
 <body>
 <header>
   <div class="row between">
-    <h1>ForgeRig</h1>
+    <div class="brand"><span class="dot" id="conn-dot"></span><h1>ForgeRig</h1><span id="status-pill">Connecting…</span></div>
     <button id="settings-btn" onclick="window.NativeHost && NativeHost.openSettings && NativeHost.openSettings()">⚙ Settings</button>
   </div>
-  <div class="row between"><span id="status">Connecting…</span><span id="provider"></span></div>
+  <div class="row between"><span id="status">Connecting…</span><span id="provider-line"><span id="provider"></span><span class="pill" id="key-pill" style="display:none"></span><span class="pill" id="lean-pill" style="display:none"></span></span></div>
   <div class="row between">
     <span id="lean-status">Lean: —</span>
     <button id="lean-btn">Download &amp; install Lean (~550 MB)</button>
@@ -214,6 +244,7 @@
 </header>
 
 <div id="tabs"><button id="new-session">+ New</button><button id="history-btn" title="Reopen closed tab">🕘</button><div id="tab-list" style="display:flex;gap:.3rem;"></div></div>
+<div id="branch-pager"></div>
 <div id="closed-panel" style="display:none"><div id="closed-list"></div></div>
 <main id="messages"></main>
 <footer>
