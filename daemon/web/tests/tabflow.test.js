@@ -81,6 +81,17 @@ const server = {
         this.pendingChat.push(obj);
         break;
       }
+      case 'chat_stop': reply({ stopped: true }); break;
+      case 'session_undo': {
+        const msgs = this.sessions[obj.params.session_id] || [];
+        const lastUser = [...msgs].reverse().find((m) => m.role === 'user');
+        reply({ user_message: lastUser ? lastUser.content : '', messages: msgs, nav: null });
+        break;
+      }
+      case 'session_redo': reply({ messages: this.sessions[obj.params.session_id] || [], nav: null }); break;
+      case 'session_goto': reply({ messages: this.sessions[obj.params.session_id] || [], nav: null }); break;
+      case 'session_nav': reply({ nav: null, messages: this.sessions[obj.params.session_id] || [] }); break;
+      case 'session_archive': reply({ archived: true }); break;
       case 'session_create': {
         const nid = 'C' + (nextId++);
         this.sessions[nid] = [{ role: 'system', content: 'S' }];
@@ -163,7 +174,8 @@ function tabLabels() {
 }
 function msgTexts() {
   function text(n) {
-    let t = n.textContent || n.innerHTML || '';
+    let t = n.textContent || '';
+    if (!t && typeof n.innerHTML === 'string') t = n.innerHTML.replace(/<[^>]*>/g, ' ');
     (n.children || []).forEach((c) => { t += '|' + text(c); });
     return t;
   }
@@ -256,20 +268,32 @@ function msgTexts() {
   assert.ok(tabLabels().some((t) => t.includes('Budget chat')), 'restored tab back in strip');
   assert.ok(msgTexts().join(' ').includes('reply-B2'), 'restored session shows its messages');
 
-  // Error path: text restored to composer (undo), error bubble, no server dup.
+  // Error path: sent bubble stays, thinking goes away, composer untouched,
+  // error bubble carries Retry; the failed turn is NOT persisted server-side.
   const aIdx = tabLabels().findIndex((t) => t.includes('first'));
   els['tab-list'].children[aIdx].children[0].onclick(); // open A
   await tick(); await tick();
   els.composer.value = 'doomed-q';
   server.failNextChat = true;
   els['send-btn'].onclick();
-  await tick(); await tick(); await tick();
-  assert.equal(els.composer.value, 'doomed-q', 'failed text restored to composer');
+  await tick(); await tick(); await tick(); await tick();
+  assert.equal(els.composer.value, '', 'composer NOT clobbered by failure');
+  assert.ok(msgTexts().join(' ').includes('doomed-q'), 'sent bubble stays in thread');
+  assert.ok(!msgTexts().join(' ').includes('Thinking'), 'thinking bubble torn down');
   assert.ok(msgTexts().join(' ').includes('boom'), 'error bubble shown');
   const dupes = server.sessions.A.filter((m) => m.content === 'doomed-q').length;
   assert.equal(dupes, 0, 'failed turn NOT persisted server-side');
-  // Retry from the restored composer yields exactly one copy.
-  els['send-btn'].onclick();
+  // Retry via the error bubble resends the last user turn exactly once.
+  const retryBtn = (function findRetry(nodes) {
+    for (const n of nodes) {
+      if (n.textContent === '↻ Retry') return n;
+      if (n.children) { const f = findRetry(n.children); if (f) return f; }
+    }
+    return null;
+  })(els.messages.children);
+  assert.ok(retryBtn, 'retry button present on error bubble');
+  retryBtn.onclick({ stopPropagation() {} });
+  await tick(); await tick();
   const retryChat = server.pendingChat.pop();
   server.resolveChat(retryChat, 'retry-ok');
   await tick(); await tick();
@@ -299,23 +323,33 @@ function msgTexts() {
   server.resolveChat(server.pendingChat.pop(), 'fresh-ok');
   await tick(); await tick();
 
-  // Disconnect mid-flight: pending fails into composer restore, no stuck tab.
+  // Disconnect mid-flight: stream resumes with backoff; the sent bubble
+  // and queued turn survive, no stuck tab, no composer clobber.
   const sockNow = server.sock;
   els.composer.value = 'disc-q';
   els['send-btn'].onclick();
+  await tick(); await tick();
   assert.equal(server.pendingChat.length, 1, 'disconnect test chat in flight');
   sockNow.onclose();
   await tick(); await tick();
-  assert.equal(els.composer.value, 'disc-q', 'disconnect restores composer');
-  assert.ok(msgTexts().join(' ').includes('disconnected'), 'disconnect error shown');
+  assert.ok(msgTexts().join(' ').includes('disc-q'), 'sent bubble survives disconnect');
+  assert.equal(els.composer.value, '', 'disconnect does NOT clobber composer');
+  // Finish the disconnect-block flight so later sends are not queued behind it.
+  server.resolveChat(server.pendingChat.pop(), 'disc-ok');
+  await tick(); await tick();
 
   // Live streaming on the active tab: chunks paint, tool lines show, done reloads.
+  // NOTE: the disconnect block above reconnects (new server.sock), so drain
+  // any pre-reconnect leftovers first, then use the fresh socket's queue.
+  server.pendingChat.length = 0;
   const ai = tabLabels().findIndex((t) => t.includes('first'));
   els['tab-list'].children[ai].children[0].onclick();
   await tick(); await tick();
   els.composer.value = 'stream me';
   els['send-btn'].onclick();
-  const sc = server.pendingChat.pop();
+  let sc = null;
+  for (let i = 0; i < 40 && !sc; i++) { await tick(); sc = server.pendingChat.pop(); }
+  assert.ok(sc, 'stream chat accepted after reconnect');
   const scSid = sc.params.session_id;
   server.pushChunk(scSid, 'hel');
   await tick();
