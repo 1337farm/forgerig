@@ -669,7 +669,7 @@ async fn run_agent_loop_streaming(
     tools: &ToolSet,
     tool_defs: &[serde_json::Value],
     messages: &mut Vec<serde_json::Value>,
-    prompt: &str,
+    _prompt: &str,
     emit: &tokio::sync::mpsc::UnboundedSender<StreamEvent>,
     stop: &StopFlag,
 ) -> Result<String, completion::CompletionError> {
@@ -677,8 +677,10 @@ async fn run_agent_loop_streaming(
     let emit_ev = |ev: StreamEvent| {
         let _ = emit.send(ev);
     };
-    // `messages` starts as [system, ...history]; append the new user turn.
-    messages.push(json!({ "role": "user", "content": prompt }));
+    // `messages` already ends with the new user turn (committed by the
+    // caller at send time so the tab exists before the provider is
+    // contacted). Do NOT push again — a duplicate user turn confuses the
+    // model and wastes tokens.
     emit_ev(StreamEvent::Phase(PhaseEvent::Thinking));
     for _turn in 0..MAX_TOOL_TURNS {
         if is_stopped(stop) {
