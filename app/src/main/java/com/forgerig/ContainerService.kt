@@ -426,6 +426,10 @@ class ContainerService : Service() {
                 AssetExtractor.writeResolvConf(this)?.let { resolv ->
                     pb.environment()["CONTAINER_RESOLV_CONF"] = resolv.absolutePath
                 }
+                // Session persistence: closed tabs + live sessions are written
+                // to a JSON file in the app's private files dir so they survive
+                // a process kill or app force-close.
+                pb.environment()["FORGERIG_SESSIONS_FILE"] = File(filesDir, "sessions.json").absolutePath
                 // Provider/model/key from the (encrypted) settings store. Only
                 // non-empty values are set so the daemon's defaults apply when
                 // nothing is configured. Secrets stay in env, never in files.

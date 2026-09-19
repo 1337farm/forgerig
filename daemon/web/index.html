@@ -163,19 +163,20 @@
   .msg .body th, .msg .body td { border: 1px solid var(--line); padding: .3rem .5rem; text-align: left; }
   .msg .body th { background: var(--panel-2); color: var(--accent); }
   .msg .body a { color: var(--link); }
-  .msg .body hr { border: 0; border-top: 1px solid var(--line); margin: .6rem 0; }
-  .msg .meta { display: flex; gap: .3rem; margin-top: .2rem; }
-  .msg .meta .mini {
-    background: transparent; border: 1px solid var(--line); color: var(--muted);
-    border-radius: 6px; padding: .12rem .45rem; font-size: .68rem;
-  }
-  .msg .meta .mini:hover { color: var(--link); border-color: var(--accent-soft); }
-  .tools { display: flex; flex-direction: column; gap: .15rem; margin-top: .25rem; }
-  .tool-line { font-size: .72rem; color: var(--muted); font-family: 'Intel One Mono', ui-monospace, monospace; }
-  footer {
-    flex-shrink: 0; padding: .55rem; border-top: 1px solid var(--line); background: var(--bg);
-    display: flex; gap: .45rem; align-items: flex-end;
-  }
+.msg .body hr { border: 0; border-top: 1px solid var(--line); margin: .6rem 0; }
+   .msg .meta { display: flex; gap: .3rem; margin-top: .2rem; }
+   .msg .meta .mini {
+     background: transparent; border: 1px solid var(--line); color: var(--muted);
+     border-radius: 6px; padding: .12rem .45rem; font-size: .68rem;
+   }
+   .msg .meta .mini:hover { color: var(--link); border-color: var(--accent-soft); }
+   .tools { display: flex; flex-direction: column; gap: .15rem; margin-top: .25rem; }
+   .tool-line { font-size: .72rem; color: var(--muted); font-family: 'Intel One Mono', ui-monospace, monospace; }
+   .phase { display: inline-block; font-style: italic; color: var(--muted); padding: .2rem .4rem; background: var(--panel); border-radius: 4px; }
+   footer {
+     flex-shrink: 0; padding: .55rem; border-top: 1px solid var(--line); background: var(--bg);
+     display: flex; gap: .45rem; align-items: flex-end;
+   }
   #composer {
     flex: 1 1 auto; resize: none; background: var(--panel); color: var(--ink);
     border: 1px solid var(--line); border-radius: 10px; padding: .6rem; font-size: .92rem;
@@ -187,6 +188,14 @@
     padding: .6rem 1rem; font-size: .9rem; flex: 0 0 auto;
   }
   #send-btn:disabled { background: #33505f; border-color: #33505f; }
+   .toast {
+     position: fixed; bottom: 1.2rem; left: 50%; transform: translateX(-50%);
+     background: var(--panel); border: 1px solid var(--accent-soft); color: var(--ink);
+     padding: .5rem 1rem; border-radius: 8px; font-size: .85rem; z-index: 1000;
+     animation: toast-in .2s ease-out;
+   }
+   @keyframes toast-in { from { opacity: 0; bottom: .8rem; } to { opacity: 1; bottom: 1.2rem; } }
+   .msg { cursor: pointer; }
 </style>
 </head>
 <body>

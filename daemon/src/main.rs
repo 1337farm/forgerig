@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -210,6 +211,13 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
             let id = req.params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
             ok(json!({ "deleted": sessions.delete(&id) }), req.id)
         }
+        "session_undo" => {
+            let id = req.params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
+            match sessions.undo(&id) {
+                Some(text) => ok(json!({ "user_message": text }), req.id),
+                None => err(-32602, format!("cannot undo unknown session '{id}'"), req.id),
+            }
+        }
         "session_rename" => {
             let id = req.params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
             let title = req.params.as_ref().and_then(|p| p.get("title")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
@@ -312,7 +320,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .map_err(|e| format!("open memory db oss_memory.db: {e}"))?,
     );
-    let sessions = Arc::new(sessions::SessionManager::new());
+    let persist_path = std::env::var("FORGERIG_SESSIONS_FILE")
+        .map(PathBuf::from)
+        .ok();
+    let sessions = Arc::new(sessions::SessionManager::with_persist_path(persist_path));
     println!("Listening on: {} ({})", addr, backend.describe());
 
     let listener = TcpListener::bind(&addr)

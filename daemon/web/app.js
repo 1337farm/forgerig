@@ -95,6 +95,7 @@
     var sid = p.session_id;
     if (!sid) return;
     if (d.method === 'chat_chunk') onStreamChunk(sid, p.delta || '');
+    else if (d.method === 'chat_phase') onStreamPhase(sid, p.phase || 'thinking');
     else if (d.method === 'chat_tool') onStreamTool(sid, p);
     else if (d.method === 'chat_done') onStreamDone(sid);
     else if (d.method === 'chat_error') {
@@ -147,6 +148,21 @@
     return refs;
   }
 
+  function onStreamPhase(sid, phase) {
+    if (activeId !== sid) {
+      if (!tabFlag[sid]) tabFlag[sid] = 'unread';
+      renderTabs();
+      return;
+    }
+    var refs = streamBubble(sid);
+    if (!refs || !refs.body) return;
+    var label = phase === 'reviewing' ? 'Reviewing…' :
+      phase === 'researching' ? 'Researching…' :
+      phase === 'ready' ? 'Ready' : 'Thinking…';
+    refs.body.innerHTML = '<span class="phase">' + label + '</span>';
+    scrollToBottom();
+  }
+
   function onStreamChunk(sid, delta) {
     streamBuf[sid] = (streamBuf[sid] || '') + delta;
     if (activeId !== sid) {
@@ -180,8 +196,11 @@
     delete streamBuf[sid];
     delete streamEls[sid];
     delete pendEl[sid];
+    if (currentFlight === sid) currentFlight = null;
+    updateSendButton();
     if (!activeId || activeId === sid) openSession(sid);
     else { tabFlag[sid] = 'unread'; refreshSessionsAfterChat(); }
+    drainQueue();
   }
 
   // ---------- state ----------
@@ -190,6 +209,8 @@
   var activeThread = [];  // raw OpenAI messages of the active session
   var inflight = {};      // sessionId -> user text still awaiting a reply
   var tabFlag = {};       // sessionId -> 'unread' | 'error' status icon
+  var messageQueue = [];  // queued user messages
+  var currentFlight = null;
 
   function refreshLean() {
     call('lean_status', {}, function (err, r) { if (!err) renderLean(r); });
@@ -391,8 +412,8 @@
   var flightTimer = {}; // sid -> watchdog timeout id
   var failedFlight = {}; // sid -> failure already reported (disconnect can race accept)
 
-  function sendMessage() {
-    var text = composerEl.value;
+  function sendMessage(text) {
+    text = (typeof text === 'string') ? text : composerEl.value;
     if (!text.trim()) return;
     var sid = activeId || '__fresh__';
     if (inflight[sid]) return; // one flight per tab (fresh tab included)
@@ -410,7 +431,9 @@
     pendEl[sid] = appendElement(makePendingEl());
     delete failedFlight[sid];
     inflight[sid] = text;
+    currentFlight = sid;
     renderTabs();
+    updateSendButton();
     // Client-side bound matching the server's 300s cap: a hung reply
     // becomes a recoverable error instead of a stuck pending bubble.
     flightTimer[sid] = setTimeout(function () {
@@ -426,6 +449,38 @@
     });
   }
 
+  function queueMessage(text) {
+    if (!text.trim()) return;
+    messageQueue.push(text.trim());
+    composerEl.value = '';
+    if (!currentFlight) drainQueue();
+  }
+
+  function drainQueue() {
+    if (currentFlight || !messageQueue.length) return;
+    var next = messageQueue.shift();
+    sendMessage(next);
+  }
+
+  function interruptFlight() {
+    if (!currentFlight) return;
+    var sid = currentFlight;
+    // The daemon has no cancellation RPC; mark the flight failed locally and
+    // restore the text to the composer for edit/resend.
+    failFlight(sid, 'interrupted — message restored to the composer; edit and resend.');
+    composerEl.value = inflight[sid] || composerEl.value;
+  }
+
+  function updateSendButton() {
+    if (currentFlight && inflight[currentFlight]) {
+      sendBtn.textContent = 'Stop';
+      sendBtn.disabled = false;
+    } else {
+      sendBtn.textContent = 'Send';
+      sendBtn.disabled = false;
+    }
+  }
+
   // Shared failure path: flag, refresh titles, restore the text for retry.
   function failFlight(sid, message) {
     if (failedFlight[sid]) return;
@@ -436,6 +491,8 @@
     delete streamBuf[sid];
     delete streamEls[sid];
     delete pendEl[sid];
+    if (currentFlight === sid) currentFlight = null;
+    updateSendButton();
     var replySid = (sid === '__fresh__') ? null : sid;
     if (replySid) tabFlag[replySid] = 'error';
     refreshSessionsAfterChat();
@@ -445,6 +502,7 @@
       if (text) composerEl.value = text;
       appendMessage({ kind: 'assistant', content: '**Error:** ' + message }, true);
     }
+    drainQueue();
   }
 
   function formatExec(r) {
@@ -496,14 +554,70 @@
       var fork = document.createElement('button');
       fork.className = 'mini';
       fork.textContent = '⤴ Fork';
-      fork.onclick = function () { forkFrom(visibleIndex); };
+      fork.onclick = function (e) { if (e && e.stopPropagation) e.stopPropagation(); forkFrom(visibleIndex); };
       meta.appendChild(fork);
     }
+    var copy = document.createElement('button');
+    copy.className = 'mini';
+    copy.textContent = '⧉ Copy';
+    copy.onclick = function (e) { if (e && e.stopPropagation) e.stopPropagation(); copyText(turn.content); };
+    meta.appendChild(copy);
+
+    if (turn.kind === 'user') {
+      var undo = document.createElement('button');
+      undo.className = 'mini';
+      undo.textContent = '↩ Undo';
+      undo.onclick = function (e) { if (e && e.stopPropagation) e.stopPropagation(); undoLastTurn(); };
+      meta.appendChild(undo);
+    }
+
+    wrap.onclick = function () { copyText(turn.content); };
+    wrap.title = 'Tap to copy';
 
     wrap.appendChild(head);
     wrap.appendChild(body);
     wrap.appendChild(meta);
     return wrap;
+  }
+
+  function copyText(text) {
+    if (!text) return;
+    var nav = (typeof navigator !== 'undefined') ? navigator : null;
+    if (nav && nav.clipboard && nav.clipboard.writeText) {
+      nav.clipboard.writeText(text).catch(function () {});
+    } else if (typeof document !== 'undefined' && document.body) {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      if (ta.select) ta.select();
+      try { document.execCommand('copy'); } catch (_) {}
+      document.body.removeChild(ta);
+    }
+    showToast('Copied');
+  }
+
+  function showToast(text) {
+    if (typeof document === 'undefined' || !document.body) return;
+    var el = document.createElement('div');
+    el.className = 'toast';
+    el.textContent = text;
+    document.body.appendChild(el);
+    setTimeout(function () { el.parentNode && el.parentNode.removeChild(el); }, 1200);
+  }
+
+  function undoLastTurn() {
+    if (!activeId) return;
+    call('session_undo', { session_id: activeId }, function (err, r) {
+      if (err || !r || !r.user_message) {
+        showToast('Nothing to undo');
+        return;
+      }
+      composerEl.value = r.user_message;
+      openSession(activeId);
+      composerEl.focus();
+    });
   }
 
   // noFork skips the Fork button for ephemeral bubbles (errors, exec
@@ -599,7 +713,16 @@
       closedPanel.style.display = 'block';
     });
   };
-  sendBtn.onclick = sendMessage;
+  sendBtn.onclick = function () {
+    if (currentFlight && inflight[currentFlight]) {
+      interruptFlight();
+    } else {
+      var text = composerEl.value;
+      if (text.trim()) {
+        queueMessage(text);
+      }
+    }
+  };
   leanBtnEl.onclick = function () {
     var was = leanBtnEl.style.display;
     leanBtnEl.style.display = 'none';
@@ -611,7 +734,14 @@
   composerEl.addEventListener('keydown', function (e) {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      sendMessage();
+      var text = composerEl.value;
+      if (text.trim()) {
+        if (currentFlight && inflight[currentFlight]) {
+          queueMessage(text);
+        } else {
+          queueMessage(text);
+        }
+      }
     }
   });
 

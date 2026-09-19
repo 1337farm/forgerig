@@ -20,16 +20,31 @@ use crate::tools::BashExecutor;
 use crate::tools::CodeIngest;
 
 /// Events emitted while a chat completion streams. The daemon forwards these
-/// over the WebSocket as `chat_chunk` / `chat_tool` notifications so the UI
-/// paints tokens as they arrive instead of waiting for the full reply.
+/// over the WebSocket as `chat_chunk` / `chat_tool` / `chat_review`
+/// notifications so the UI paints tokens and progress markers as they arrive
+/// instead of waiting for the full reply.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     /// A slice of assistant text.
     TextDelta(String),
+    /// A thinking/reviewing/research phase marker.
+    Phase(PhaseEvent),
     /// A tool call started (arguments still streaming or complete).
     ToolStart(String),
     /// A tool call finished; String is a truncated result preview.
     ToolResult(String),
+}
+
+#[derive(Debug, Clone)]
+pub enum PhaseEvent {
+    /// The model is thinking / reasoning about the answer.
+    Thinking,
+    /// The model is reviewing / critiquing its previous answer.
+    Reviewing,
+    /// The model is researching / looking up info (via tools).
+    Researching,
+    /// The model has finished its reasoning and is ready to emit the answer.
+    Ready,
 }
 
 impl StreamEvent {
@@ -40,6 +55,18 @@ impl StreamEvent {
                 "jsonrpc": "2.0", "method": "chat_chunk",
                 "params": { "session_id": session_id, "delta": delta },
             }),
+            StreamEvent::Phase(phase) => {
+                let (phase_name, note) = match &phase {
+                    PhaseEvent::Thinking => ("thinking", ""),
+                    PhaseEvent::Reviewing => ("reviewing", ""),
+                    PhaseEvent::Researching => ("researching", ""),
+                    PhaseEvent::Ready => ("ready", ""),
+                };
+                json!({
+                    "jsonrpc": "2.0", "method": "chat_phase",
+                    "params": { "session_id": session_id, "phase": phase_name, "note": note },
+                })
+            }
             StreamEvent::ToolStart(name) => json!({
                 "jsonrpc": "2.0", "method": "chat_tool",
                 "params": { "session_id": session_id, "phase": "start", "name": name },
@@ -611,6 +638,7 @@ async fn run_agent_loop_streaming(
     };
     // `messages` starts as [system, ...history]; append the new user turn.
     messages.push(json!({ "role": "user", "content": prompt }));
+    emit_ev(StreamEvent::Phase(PhaseEvent::Thinking));
     for _turn in 0..MAX_TOOL_TURNS {
         let mut body = serde_json::Map::new();
         body.insert("model".into(), json!(model.model));
@@ -631,6 +659,7 @@ async fn run_agent_loop_streaming(
             Err(e) => {
                 eprintln!("chat stream: falling back to non-streaming turn ({e:?})");
                 let out = run_agent_loop_once(model, tools, tool_defs, messages).await?;
+                emit_ev(StreamEvent::Phase(PhaseEvent::Ready));
                 emit_ev(StreamEvent::TextDelta(out.clone()));
                 return Ok(out);
             }
@@ -675,10 +704,15 @@ async fn run_agent_loop_streaming(
         }
         let calls: Vec<ToolCallDelta> = builders.into_iter().filter(|b| !b.name.is_empty()).collect();
         if calls.is_empty() {
+            emit_ev(StreamEvent::Phase(PhaseEvent::Ready));
             messages.push(json!({ "role": "assistant", "content": text }));
             return Ok(text);
         }
-        // Tool turn: replay the assistant tool_calls message for coherence,
+        // Tool turn: the model is researching (calling tools). Emit a phase
+        // marker so the UI can show a "researching" status instead of a
+        // silent pause between chunks.
+        emit_ev(StreamEvent::Phase(PhaseEvent::Researching));
+        // replay the assistant tool_calls message for coherence,
         // run every requested tool, stream start/result markers, continue.
         let wire_calls: Vec<Value> = calls
             .iter()
@@ -702,6 +736,7 @@ async fn run_agent_loop_streaming(
             emit_ev(StreamEvent::ToolResult(preview));
             messages.push(json!({ "role": "tool", "tool_call_id": tc.id, "content": result }));
         }
+        emit_ev(StreamEvent::Phase(PhaseEvent::Reviewing));
         eprintln!("chat tool: streaming loop continues after tool turn");
     }
     Err(completion::CompletionError::ResponseError(format!(
