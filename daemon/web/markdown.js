@@ -52,6 +52,39 @@
       return '<' + tag + '>' + lis + '</' + tag + '>';
     }
 
+    function splitRow(line) {
+      var cells = line.trim().split('|');
+      if (cells.length && /^\s*$/.test(cells[0])) cells.shift();
+      if (cells.length && /^\s*$/.test(cells[cells.length - 1])) cells.pop();
+      return cells.map(function (c) { return c.trim(); });
+    }
+
+    function isDelimRow(line) {
+      var cells = splitRow(line);
+      if (!cells.length) return false;
+      return cells.every(function (c) { return /^:?-+:?$/.test(c); });
+    }
+
+    function isTableStart(idx) {
+      return idx + 1 < lines.length
+        && lines[idx].indexOf('|') !== -1
+        && isDelimRow(lines[idx + 1]);
+    }
+
+    function renderTable(header, aligns, rows) {
+      var thead = '<thead><tr>' + header.map(function (h, c) {
+        var a = aligns[c] ? ' align="' + aligns[c] + '"' : '';
+        return '<th' + a + '>' + inline(h) + '</th>';
+      }).join('') + '</tr></thead>';
+      var tbody = '<tbody>' + rows.map(function (r) {
+        return '<tr>' + r.map(function (cell, c) {
+          var a = aligns[c] ? ' align="' + aligns[c] + '"' : '';
+          return '<td' + a + '>' + inline(cell || '') + '</td>';
+        }).join('') + '</tr>';
+      }).join('') + '</tbody>';
+      return '<table>' + thead + tbody + '</table>';
+    }
+
     while (i < lines.length) {
       var line = lines[i];
 
@@ -124,6 +157,24 @@
         continue;
       }
 
+      // GFM table: header row + delimiter row, then body rows.
+      if (isTableStart(i)) {
+        var header = splitRow(line);
+        var aligns = splitRow(lines[i + 1]).map(function (d) {
+          var left = d.charAt(0) === ':';
+          var right = d.charAt(d.length - 1) === ':';
+          return left && right ? 'center' : (right ? 'right' : (left ? 'left' : ''));
+        });
+        i += 2;
+        var rows = [];
+        while (i < lines.length && !/^\s*$/.test(lines[i]) && lines[i].indexOf('|') !== -1) {
+          rows.push(splitRow(lines[i]));
+          i++;
+        }
+        html.push(renderTable(header, aligns, rows));
+        continue;
+      }
+
       // Paragraph: gather consecutive non-blank, non-special lines.
       var para = [line];
       i++;
@@ -134,6 +185,7 @@
         if (/^\s*[-*+]\s+/.test(lines[i])) break;
         if (/^\s*\d+[.)]\s+/.test(lines[i])) break;
         if (/^\s*>\s?/.test(lines[i])) break;
+        if (isTableStart(i)) break;
         para.push(lines[i]);
         i++;
       }

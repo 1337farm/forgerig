@@ -53,3 +53,15 @@ test('empty input renders empty', () => {
   assert.equal(Markdown.render(''), '');
   assert.equal(Markdown.render(null), '');
 });
+test('renders GFM tables with alignment', () => {
+  const out = Markdown.render('| a | b |\n|---|:---:|\n| 1 | `x` |');
+  assert.equal(out.includes('<table>'), true);
+  assert.equal(out.includes('<th>a</th>'), true);
+  assert.equal(out.includes('<th align="center">b</th>'), true);
+  assert.equal(out.includes('<td>1</td>'), true);
+  assert.equal(out.includes('<td align="center"><code>x</code></td>'), true);
+});
+
+test('pipe text without a delimiter row stays a paragraph', () => {
+  assert.equal(Markdown.render('a | b').startsWith('<p>'), true);
+});

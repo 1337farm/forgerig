@@ -38,6 +38,9 @@ class SettingsActivity : AppCompatActivity() {
 
     private data class ModelOption(val name: String, val free: Boolean)
 
+    // Curated real model IDs per provider (free flags follow each provider's
+    // free tier). "Refresh from provider" below merges the live /v1/models
+    // list so drift self-heals; curated entries are the offline fallback.
     private val modelCatalog: Map<String, List<ModelOption>> = mapOf(
         "openai" to listOf(
             ModelOption("gpt-4o-mini", false),
@@ -45,27 +48,61 @@ class SettingsActivity : AppCompatActivity() {
         ),
         "openrouter" to listOf(
             ModelOption("meta-llama/llama-3.3-70b-instruct:free", true),
+            ModelOption("google/gemma-3-27b-it:free", true),
+            ModelOption("deepseek/deepseek-chat-v3-0324:free", true),
         ),
         "nvidia" to listOf(
             ModelOption("nvidia/llama-3.1-nemotron-70b-instruct", true),
+            ModelOption("meta/llama-3.1-405b-instruct", true),
+            ModelOption("mistralai/mixtral-8x22b-instruct-v0.1", true),
+            ModelOption("deepseek-ai/deepseek-r1", true),
         ),
         "groq" to listOf(
             ModelOption("llama-3.3-70b-versatile", true),
+            ModelOption("llama-3.1-8b-instant", true),
+            ModelOption("mixtral-8x7b-32768", true),
+            ModelOption("gemma2-9b-it", true),
         ),
         "deepseek" to listOf(
             ModelOption("deepseek-chat", false),
+            ModelOption("deepseek-reasoner", false),
         ),
         "mistral" to listOf(
             ModelOption("mistral-small-latest", false),
+            ModelOption("mistral-medium-latest", false),
+            ModelOption("mistral-large-latest", false),
+            ModelOption("open-mistral-7b", false),
+            ModelOption("open-mixtral-8x7b", false),
         ),
         "gemini" to listOf(
             ModelOption("gemini-2.5-flash", true),
+            ModelOption("gemini-2.5-pro", true),
+            ModelOption("gemini-2.0-flash", true),
         ),
         "ollama" to listOf(
             ModelOption("llama3.1:8b", true),
+            ModelOption("llama3.1:70b", true),
+            ModelOption("mistral", true),
+            ModelOption("gemma2", true),
+            ModelOption("qwen2.5", true),
+            ModelOption("deepseek-r1", true),
         ),
         "custom" to emptyList(),
     )
+
+    private val defaultBaseUrls = mapOf(
+        "openai" to "https://api.openai.com",
+        "openrouter" to "https://openrouter.ai/api",
+        "nvidia" to "https://integrate.api.nvidia.com",
+        "groq" to "https://api.groq.com/openai",
+        "deepseek" to "https://api.deepseek.com",
+        "mistral" to "https://api.mistral.ai/v1",
+        "gemini" to "https://generativelanguage.googleapis.com",
+        "ollama" to "http://localhost:11434",
+    )
+
+    // Live-fetched model IDs merged over the curated catalog (per provider).
+    private val extraModels: MutableMap<String, MutableList<String>> = mutableMapOf()
 
     private val finishReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -163,24 +200,35 @@ class SettingsActivity : AppCompatActivity() {
         }
         root.addView(modelSpinner)
         root.addView(modelEdit)
+        val evalSpinner = Spinner(this).apply {
+            adapter = spinnerAdapter()
+        }
         var refreshingModels = false
+        fun fillSpinner(view: Spinner, names: List<String>, selected: String) {
+            @Suppress("UNCHECKED_CAST")
+            val adapter = view.adapter as ArrayAdapter<String>
+            adapter.clear()
+            adapter.addAll(names)
+            adapter.notifyDataSetChanged()
+            val idx = names.indexOfFirst { it.removeSuffix("  (free)") == selected }
+            if (idx >= 0) view.setSelection(idx)
+        }
         fun refreshModels() {
             if (refreshingModels) return
             refreshingModels = true
             try {
                 val provider = providerOptions[spinner.selectedItemPosition].second
                 val query = modelFilterEdit.text.toString().trim().lowercase()
-                val names = (modelCatalog[provider] ?: emptyList())
+                val known = (modelCatalog[provider] ?: emptyList()).toMutableList()
+                for (extra in extraModels[provider] ?: emptyList()) {
+                    if (known.none { it.name == extra }) known.add(ModelOption(extra, extra.endsWith(":free")))
+                }
+                val names = known
                     .filter { (!freeOnlyBox.isChecked || it.free) && (query.isEmpty() || it.name.lowercase().contains(query)) }
                     .map { if (it.free) "${it.name}  (free)" else it.name }
                     .sorted()
-                @Suppress("UNCHECKED_CAST")
-                val adapter = modelSpinner.adapter as ArrayAdapter<String>
-                adapter.clear()
-                adapter.addAll(names)
-                adapter.notifyDataSetChanged()
-                val currentIdx = names.indexOfFirst { it.removeSuffix("  (free)") == current.model }
-                if (currentIdx >= 0) modelSpinner.setSelection(currentIdx)
+                fillSpinner(modelSpinner, names, current.model)
+                fillSpinner(evalSpinner, names, current.evalModel)
             } finally {
                 refreshingModels = false
             }
@@ -204,6 +252,7 @@ class SettingsActivity : AppCompatActivity() {
             override fun afterTextChanged(s: android.text.Editable?) {}
         })
         root.addView(label("Evaluation model (blank = same as chat)"))
+        root.addView(evalSpinner)
         val evalEdit = editText(current.evalModel, "cheap model for background memory evaluation")
         root.addView(evalEdit)
         root.addView(label("Base URL (blank = provider default; required for custom)"))
@@ -217,6 +266,93 @@ class SettingsActivity : AppCompatActivity() {
             inputType = android.text.InputType.TYPE_CLASS_NUMBER
         }
         root.addView(maxTokensEdit)
+
+        evalSpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: android.view.View?, position: Int, id: Long) {
+                if (refreshingModels) return
+                val item = parent?.getItemAtPosition(position) as? String ?: return
+                evalEdit.setText(item.removeSuffix("  (free)"))
+            }
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+        }
+
+        fun fetchModels() {
+            val provider = providerOptions[spinner.selectedItemPosition].second
+            if (provider == "nvidia") {
+                Toast.makeText(this, "NVIDIA has no model-list endpoint; curated list kept.", Toast.LENGTH_SHORT).show()
+                return
+            }
+            val base = urlEdit.text.toString().trim().ifEmpty { defaultBaseUrls[provider] ?: "" }
+            if (base.isEmpty()) {
+                Toast.makeText(this, "Set a Base URL for the custom provider first.", Toast.LENGTH_SHORT).show()
+                return
+            }
+            val key = keyEdit.text.toString().trim()
+            Toast.makeText(this, "Refreshing model list…", Toast.LENGTH_SHORT).show()
+            Thread {
+                try {
+                    val (url, auth) = when (provider) {
+                        "gemini" -> "${base.trimEnd('/')}/v1beta/models?key=$key" to null
+                        "ollama" -> "${base.trimEnd('/')}/api/tags" to null
+                        else -> "${base.trimEnd('/')}/v1/models" to key.ifEmpty { null }
+                    }
+                    val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+                    try {
+                        conn.connectTimeout = 15000
+                        conn.readTimeout = 15000
+                        if (auth != null) conn.setRequestProperty("Authorization", "Bearer $auth")
+                        if (conn.responseCode !in 200..299) throw java.io.IOException("HTTP ${conn.responseCode}")
+                        val body = conn.inputStream.bufferedReader().readText()
+                        val json = org.json.JSONObject(body)
+                        val ids = mutableListOf<String>()
+                        if (provider == "ollama") {
+                            val arr = json.optJSONArray("models") ?: org.json.JSONArray()
+                            for (i in 0 until arr.length()) {
+                                arr.optJSONObject(i)?.optString("name")?.takeIf { it.isNotEmpty() }?.let { ids.add(it) }
+                            }
+                        } else if (provider == "gemini") {
+                            val arr = json.optJSONArray("models") ?: org.json.JSONArray()
+                            for (i in 0 until arr.length()) {
+                                arr.optJSONObject(i)?.optString("name")?.removePrefix("models/")?.takeIf { it.isNotEmpty() }?.let { ids.add(it) }
+                            }
+                        } else {
+                            val arr = json.optJSONArray("data") ?: org.json.JSONArray()
+                            for (i in 0 until arr.length()) {
+                                arr.optJSONObject(i)?.optString("id")?.takeIf { it.isNotEmpty() }?.let { ids.add(it) }
+                            }
+                        }
+                        runOnUiThread {
+                            if (ids.isEmpty()) {
+                                Toast.makeText(this, "No models returned.", Toast.LENGTH_SHORT).show()
+                            } else {
+                                val known = extraModels.getOrPut(provider) { mutableListOf() }
+                                var added = 0
+                                for (id in ids.sorted()) {
+                                    if ((modelCatalog[provider] ?: emptyList()).none { it.name == id } && !known.contains(id)) {
+                                        known.add(id)
+                                        added++
+                                    }
+                                }
+                                refreshModels()
+                                Toast.makeText(this, "Added $added model(s), ${ids.size} total.", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    } finally {
+                        conn.disconnect()
+                    }
+                } catch (e: Exception) {
+                    runOnUiThread {
+                        Toast.makeText(this, "Refresh failed: ${e.message}", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }.start()
+        }
+        root.addView(Button(this).apply {
+            text = "Refresh models from provider"
+            setBackgroundColor(0xFF3a3348.toInt())
+            setTextColor(0xFFe6e6e6.toInt())
+            setOnClickListener { fetchModels() }
+        })
         refreshModels()
 
         root.addView(Button(this).apply {

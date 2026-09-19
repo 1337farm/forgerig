@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::accept_async;
 use futures_util::{StreamExt, SinkExt};
@@ -41,6 +41,28 @@ struct RpcError {
     message: String,
 }
 
+/// Push handle for server-initiated JSON-RPC notifications (chat_chunk,
+/// chat_tool, chat_done, chat_error) on the same WebSocket as the request.
+type WsPush = Arc<
+    tokio::sync::Mutex<
+        futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+            tokio_tungstenite::tungstenite::Message,
+        >,
+    >,
+>;
+
+async fn push_notification(push: &WsPush, value: Value) {
+    let text = serde_json::to_string(&value).unwrap_or_default();
+    if text.is_empty() {
+        return;
+    }
+    let mut sink = push.lock().await;
+    let _ = sink
+        .send(tokio_tungstenite::tungstenite::Message::Text(text))
+        .await;
+}
+
 async fn system_message_with_memory(memory: &Arc<MemoryEngine>) -> Value {
     let mut sys = provider::system_message();
     if let Ok(mems) = memory.get_macro_memories(5).await {
@@ -57,7 +79,7 @@ async fn system_message_with_memory(memory: &Arc<MemoryEngine>) -> Value {
     sys
 }
 
-async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &Arc<MemoryEngine>, sessions: &Arc<sessions::SessionManager>) -> RpcResponse {
+async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &Arc<MemoryEngine>, sessions: &Arc<sessions::SessionManager>, push: &WsPush) -> RpcResponse {
     fn ok(result: Value, id: Option<Value>) -> RpcResponse {
         RpcResponse { jsonrpc: "2.0".into(), result: Some(result), error: None, id }
     }
@@ -94,44 +116,72 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
                         *first = system_message_with_memory(memory).await;
                     }
                     eprintln!("chat: session={sid} prompt_len={}", p.len());
-                    match backend.chat_session(&mut messages, &p).await {
-                        Ok(completion) => {
-                            eprintln!("chat: completion (len={})", completion.len());
-                            let _ = memory.log_trace(&p, &completion).await;
-                            // Persist the extended thread as the reusable session cache.
-                            sessions.set_messages(&sid, messages);
-                            // Detached: every 5th trace, evaluate recent traces for
-                            // milestones (prune noise + record macro memory). Never
-                            // blocks the reply.
-                            let backend2 = Arc::clone(backend);
-                            let memory2 = Arc::clone(memory);
-                            tokio::spawn(async move {
-                                let recent = memory2.get_recent_traces(1).await.map_err(|e| e.to_string());
-                                if let Ok(recent) = recent {
-                                    if let Some((id, _, _)) = recent.first() {
-                                        if id % 5 == 0 {
-                                            let traces = memory2.get_recent_traces(10).await.map_err(|e| e.to_string());
-                                            if let Ok(traces) = traces {
-                                                if let Err(e) = memory::evaluate_and_process(&backend2, &memory2, traces).await {
-                                                    eprintln!("Background evaluation failed: {}", e);
+                    // Streaming: acknowledge immediately so the UI can paint
+                    // progress, then run the agent loop in the background and
+                    // forward chat_chunk / chat_tool notifications over this
+                    // socket, finishing with chat_done (or chat_error).
+                    let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel::<provider::StreamEvent>();
+                    let bridge_push = Arc::clone(push);
+                    let sid_bridge = sid.clone();
+                    tokio::spawn(async move {
+                        while let Some(ev) = erx.recv().await {
+                            push_notification(&bridge_push, ev.into_rpc(&sid_bridge)).await;
+                        }
+                    });
+                    let backend2 = Arc::clone(backend);
+                    let memory2 = Arc::clone(memory);
+                    let sessions2 = Arc::clone(sessions);
+                    let push2 = Arc::clone(push);
+                    let sid2 = sid.clone();
+                    tokio::spawn(async move {
+                        match backend2.chat_session_streaming(&mut messages, &p, &etx).await {
+                            Ok(completion) => {
+                                eprintln!("chat: completion (len={})", completion.len());
+                                let _ = memory2.log_trace(&p, &completion).await;
+                                // Persist the extended thread as the reusable session cache.
+                                sessions2.set_messages(&sid2, messages);
+                                // Detached: every 5th trace, evaluate recent traces for
+                                // milestones (prune noise + record macro memory). Never
+                                // blocks the reply.
+                                let backend3 = Arc::clone(&backend2);
+                                let memory3 = Arc::clone(&memory2);
+                                tokio::spawn(async move {
+                                    let recent = memory3.get_recent_traces(1).await.map_err(|e| e.to_string());
+                                    if let Ok(recent) = recent {
+                                        if let Some((id, _, _)) = recent.first() {
+                                            if id % 5 == 0 {
+                                                let traces = memory3.get_recent_traces(10).await.map_err(|e| e.to_string());
+                                                if let Ok(traces) = traces {
+                                                    if let Err(e) = memory::evaluate_and_process(&backend3, &memory3, traces).await {
+                                                        eprintln!("Background evaluation failed: {}", e);
+                                                    }
                                                 }
                                             }
                                         }
                                     }
-                                }
-                            });
-                            ok(json!({ "reply": completion, "session_id": sid }), req.id)
+                                });
+                                push_notification(
+                                    &push2,
+                                    json!({ "jsonrpc": "2.0", "method": "chat_done",
+                                            "params": { "session_id": sid2, "reply": completion } }),
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                eprintln!("chat: error: {}", e);
+                                // Deliberately NOT persisted: the client puts the
+                                // failed text back in the composer for edit+retry,
+                                // so persisting here would duplicate it on resend.
+                                push_notification(
+                                    &push2,
+                                    json!({ "jsonrpc": "2.0", "method": "chat_error",
+                                            "params": { "session_id": sid2, "error": e } }),
+                                )
+                                .await;
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("chat: error: {}", e);
-                            // Persist the failed turn anyway: the user DID say
-                            // it, so tab history/titles stay truthful and the
-                            // next send continues the thread instead of
-                            // silently dropping the message.
-                            sessions.set_messages(&sid, messages);
-                            err(-32603, format!("Agent error: {}", e), req.id)
-                        }
-                    }
+                    });
+                    ok(json!({ "accepted": true, "session_id": sid }), req.id)
                 }
                 _ => err(-32602, "Missing 'prompt' in params".into(), req.id),
             }
@@ -159,6 +209,22 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
         "session_delete" => {
             let id = req.params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
             ok(json!({ "deleted": sessions.delete(&id) }), req.id)
+        }
+        "session_rename" => {
+            let id = req.params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
+            let title = req.params.as_ref().and_then(|p| p.get("title")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
+            match sessions.set_title(&id, &title) {
+                Some(s) => ok(json!({ "id": s.id, "title": s.title }), req.id),
+                None => err(-32602, format!("cannot rename unknown session '{id}' (title must be non-blank)"), req.id),
+            }
+        }
+        "session_closed" => ok(json!(sessions.trash_list()), req.id),
+        "session_restore" => {
+            let id = req.params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
+            match sessions.restore(&id) {
+                Some(s) => ok(json!({ "id": s.id, "title": s.title, "messages": s.messages }), req.id),
+                None => err(-32602, format!("unknown closed session '{id}'"), req.id),
+            }
         }
         "lean_status" => {
             let st = lean::status().await;
@@ -283,7 +349,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let sender = Arc::clone(&ws_sender);
                         tokio::spawn(async move {
                             let response = match serde_json::from_str::<RpcRequest>(&text) {
-                                Ok(req) => handle_rpc(req, &backend, &memory, &sessions).await,
+                                Ok(req) => handle_rpc(req, &backend, &memory, &sessions, &sender).await,
                                 Err(_) => RpcResponse {
                                     jsonrpc: "2.0".into(),
                                     result: None,
@@ -316,7 +382,36 @@ fn page_html() -> String {
         .replace("/*@APP_JS@*/", include_str!("../web/app.js"))
 }
 
+/// Bundled UI font (Intel One Mono, latin subset) served at /font.woff2.
+static FONT_WOFF2: &[u8] = include_bytes!("../web/IntelOneMono-Regular.woff2");
+
+async fn read_http_path(stream: &mut TcpStream) -> String {
+    let mut buf = [0u8; 1024];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.peek(&mut buf))
+        .await
+        .unwrap_or(Ok(0))
+        .unwrap_or(0);
+    String::from_utf8_lossy(&buf[..n])
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("/")
+        .to_string()
+}
+
 async fn serve_http(mut stream: TcpStream) {
+    if read_http_path(&mut stream).await == "/font.woff2" {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: font/woff2\r\nContent-Length: {}\r\nCache-Control: max-age=86400\r\nConnection: close\r\n\r\n",
+            FONT_WOFF2.len(),
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.write_all(FONT_WOFF2).await;
+        let _ = stream.shutdown().await;
+        return;
+    }
     let body = page_html();
 
     let response = format!(
