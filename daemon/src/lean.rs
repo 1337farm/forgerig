@@ -722,6 +722,9 @@ fn cached_lean_version() -> Option<String> {
 }
 
 /// Run `lean` on a file already written into the guest workspace.
+/// Fail-closed: paths outside `/root/workspace` are rejected, `--run` is
+/// refused (typecheck only — no execution gate bypass), and output is
+/// truncated by the shared runner.
 pub async fn run_on_file(file: &str) -> ShellResult {
     if !status().await.ready {
         eprintln!("lean run_on_file: Lean not installed");
@@ -732,7 +735,28 @@ pub async fn run_on_file(file: &str) -> ShellResult {
             timed_out: false,
         };
     }
-    let r = tools::run_trusted_limited(&format!("LD_LIBRARY_PATH={} {} {}", LEAN_LIB, LEAN_BIN, tools::sh_quote(file)), LEAN_TIMEOUT).await;
+    let safe = match crate::gatekeeper::validate_guest_path(file) {
+        Ok(p) => p,
+        Err(reason) => {
+            crate::gatekeeper::log_verdict("lean_executor", false, &reason, file);
+            return ShellResult {
+                stdout: String::new(),
+                stderr: format!("blocked by gatekeeper: {reason}"),
+                exit_code: None,
+                timed_out: false,
+            };
+        }
+    };
+    if !safe.ends_with(".lean") {
+        crate::gatekeeper::log_verdict("lean_executor", false, "non-lean-file", file);
+        return ShellResult {
+            stdout: String::new(),
+            stderr: "blocked by gatekeeper: lean only typechecks .lean files".to_string(),
+            exit_code: None,
+            timed_out: false,
+        };
+    }
+    let r = tools::run_lean_jailed(&format!("LD_LIBRARY_PATH={} {} {}", LEAN_LIB, LEAN_BIN, tools::sh_quote(&safe)), LEAN_TIMEOUT).await;
     if r.exit_code != Some(0) {
         eprintln!("lean run_on_file: exit {:?} file={}", r.exit_code, file);
     }

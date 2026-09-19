@@ -71,6 +71,11 @@ fn build_cmd_binds(command: &str, sandbox: bool, binds: &[String]) -> Command {
     if let (Some(proot), Some(rootfs)) = (proot, rootfs) {
         let mut cmd = Command::new(&proot);
         cmd.kill_on_drop(true)
+            // Never leak host secrets into the guest: the daemon inherits
+            // FORGERIG_* provider keys, but guest shells only get an
+            // allowlisted env. Brokered network (net_fetch) attaches keys
+            // host-side instead.
+            .env_clear()
             .arg("-r")
             .arg(&rootfs)
             .arg("-0")
@@ -105,6 +110,10 @@ fn build_cmd_binds(command: &str, sandbox: bool, binds: &[String]) -> Command {
         cmd
     } else {
         let mut cmd = Command::new("sh");
+        // Local-dev fallback has no proot boundary: strip secrets explicitly.
+        for v in crate::gatekeeper::SECRET_ENV_VARS {
+            cmd.env_remove(v);
+        }
         cmd.kill_on_drop(true).arg("-c").arg(&line);
         cmd
     }
@@ -120,12 +129,18 @@ async fn run_shell_binds(command: &str, sandbox: bool, limit: Duration, binds: &
         Ok::<_, std::io::Error>(output)
     };
     match timeout(limit, fut).await {
-        Ok(Ok(output)) => ShellResult {
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            exit_code: output.status.code(),
-            timed_out: false,
-        },
+        Ok(Ok(output)) => {
+            // Fail-closed on size: truncate unbounded tool output so a noisy
+            // `lean` stderr or `cat` can never OOM the daemon / WebView.
+            let (stdout, _) = crate::gatekeeper::truncate_output(&String::from_utf8_lossy(&output.stdout));
+            let (stderr, _) = crate::gatekeeper::truncate_output(&String::from_utf8_lossy(&output.stderr));
+            ShellResult {
+                stdout,
+                stderr,
+                exit_code: output.status.code(),
+                timed_out: false,
+            }
+        }
         Ok(Err(e)) => ShellResult {
             stdout: String::new(),
             stderr: format!("failed to spawn: {e}"),
@@ -142,7 +157,17 @@ async fn run_shell_binds(command: &str, sandbox: bool, limit: Duration, binds: &
 }
 
 /// Model-facing, sandboxed shell (resource limits + disposable workdir).
+/// Fail-closed: oversized or exfil-shaped commands are rejected before proot.
 pub async fn run_sandboxed(command: &str) -> ShellResult {
+    if let Err(reason) = crate::gatekeeper::validate_command(command) {
+        crate::gatekeeper::log_verdict("bash_executor", false, &reason, command);
+        return ShellResult {
+            stdout: String::new(),
+            stderr: format!("blocked by gatekeeper: {reason}"),
+            exit_code: None,
+            timed_out: false,
+        };
+    }
     run_shell(command, true, SANDBOX_TIMEOUT).await
 }
 
@@ -159,6 +184,17 @@ pub async fn run_trusted_limited(command: &str, limit: Duration) -> ShellResult 
 /// Trusted shell with extra proot `-b` bindings and an explicit timeout.
 pub async fn run_trusted_binds_limited(command: &str, binds: &[String], limit: Duration) -> ShellResult {
     run_shell_binds(command, false, limit, binds).await
+}
+
+/// Lean typecheck runner: jailed to the workspace like sandboxed shells, but
+/// without the 512 MiB `ulimit -v` cap (Lean loads ~500 MB of shared libs and
+/// would die under it). Wall-clock still bounded; secrets never enter the guest.
+pub async fn run_lean_jailed(command: &str, limit: Duration) -> ShellResult {
+    let line = format!(
+        "mkdir -p {} 2>/dev/null; cd {} 2>/dev/null || true; {}",
+        SANDBOX_WORKDIR, SANDBOX_WORKDIR, command
+    );
+    run_shell_binds(&line, false, limit, &[]).await
 }
 
 impl Tool for BashExecutor {

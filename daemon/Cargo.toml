@@ -27,6 +27,11 @@ schemars = "0.8.22"
 ureq = "2.10"
 sha2 = "0.10"
 sentinel_engine = { path = "../sentinel-engine" }
+url = "2.5"
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
 
 [features]
 # rig-core pulls reqwest with default TLS (native-tls -> openssl-sys). There

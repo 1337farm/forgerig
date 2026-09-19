@@ -7,7 +7,6 @@ import android.content.IntentFilter
 import android.content.res.ColorStateList
 import android.os.Build
 import android.os.Bundle
-import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.ArrayAdapter
@@ -128,42 +127,42 @@ class SettingsActivity : AppCompatActivity() {
         // The default action bar is light-gray and clashes with the neon
         // theme: hide it and draw our own title in-layout instead.
         supportActionBar?.hide()
+
         registerFinishReceiver()
+
         val current = SettingsStore.load(this)
 
+        val scroll = ScrollView(this)
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(20), dp(20), dp(20))
-            setBackgroundColor(0xFF151221.toInt())
+            setPadding(dp(16), dp(16), dp(16), dp(16))
         }
+        scroll.addView(root)
+        setContentView(scroll)
+
+        root.addView(label("ForgeRig Settings"))
         root.addView(TextView(this).apply {
-            text = "ForgeRig Settings"
-            textSize = 20f
-            setTextColor(0xFFd946ef.toInt())
-            setPadding(0, 0, 0, dp(4))
+            text = "Provider, model, and API key are encrypted with the Android Keystore. " +
+                "Keys are never written to plaintext files or sent to the model."
+            setTextColor(0xFF999999.toInt())
+            textSize = 13f
+            setPadding(0, 0, 0, dp(16))
         })
-
-        fun spinnerAdapter(): ArrayAdapter<String> =
-            object : ArrayAdapter<String>(this, android.R.layout.simple_spinner_item, mutableListOf()) {
-                override fun getView(position: Int, convertView: View?, parent: ViewGroup): View =
-                    (super.getView(position, convertView, parent) as TextView).apply {
-                        textSize = 14f
-                        setTextColor(0xFFe6e6e6.toInt())
-                    }
-
-                override fun getDropDownView(position: Int, convertView: View?, parent: ViewGroup): View =
-                    (super.getDropDownView(position, convertView, parent) as TextView).apply {
-                        textSize = 14f
-                        setSingleLine(false)
-                        setTextColor(0xFFe6e6e6.toInt())
-                    }
-            }
 
         fun label(text: String): TextView = TextView(this).apply {
             this.text = text
             setPadding(0, dp(14), 0, dp(4))
             textSize = 14f
             setTextColor(0xFFe6e6e6.toInt())
+        }
+
+        fun editText(text: String, hint: String): EditText = EditText(this).apply {
+            setText(text)
+            this.hint = hint
+            setTextColor(0xFFe6e6e6.toInt())
+            setHintTextColor(0xFF777777.toInt())
+            backgroundTintList = ColorStateList.valueOf(0xFF333742.toInt())
+            setPadding(dp(8), dp(8), dp(8), dp(8))
         }
 
         root.addView(label("Provider"))
@@ -175,15 +174,6 @@ class SettingsActivity : AppCompatActivity() {
             setSelection(if (idx >= 0) idx else 0)
         }
         root.addView(spinner)
-
-        fun editText(text: String, hint: String): EditText = EditText(this).apply {
-            setText(text)
-            this.hint = hint
-            setTextColor(0xFFe6e6e6.toInt())
-            setHintTextColor(0xFF777777.toInt())
-            backgroundTintList = ColorStateList.valueOf(0xFF333742.toInt())
-            setPadding(dp(8), dp(8), dp(8), dp(8))
-        }
 
         root.addView(label("Model (leave blank for provider default)"))
         val modelEdit = editText(current.model, "e.g. mistral-small-latest or llama-3.3-70b-versatile")
@@ -248,7 +238,7 @@ class SettingsActivity : AppCompatActivity() {
         freeOnlyBox.setOnCheckedChangeListener { _, _ -> refreshModels() }
         modelFilterEdit.addTextChangedListener(object : android.text.TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
-            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = refreshModels()
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, after: Int) = refreshModels()
             override fun afterTextChanged(s: android.text.Editable?) {}
         })
         root.addView(label("Evaluation model (blank = same as chat)"))
@@ -263,7 +253,7 @@ class SettingsActivity : AppCompatActivity() {
         root.addView(keyEdit)
         root.addView(label("Max output tokens (blank = provider default)"))
         val maxTokensEdit = editText(current.maxTokens, "e.g. 2000").apply {
-            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            setInputType(android.text.InputType.TYPE_CLASS_NUMBER)
         }
         root.addView(maxTokensEdit)
 
@@ -368,22 +358,42 @@ class SettingsActivity : AppCompatActivity() {
         })
         refreshModels()
 
+        // Network Allowlist section
+        root.addView(label("Network Allowlist (for net_fetch)"))
+        val netAllowBtn = Button(this).apply {
+            text = "Manage Allowlist…"
+            setBackgroundColor(0xFF1e3a5f.toInt())
+            setTextColor(0xFFFFFFFF.toInt())
+            setOnClickListener {
+                startActivity(Intent(this@SettingsActivity, NetworkAllowlistActivity::class.java))
+            }
+        }
+        root.addView(netAllowBtn, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(8) })
+
         root.addView(Button(this).apply {
             text = "Save"
             setBackgroundColor(0xFF9333ea.toInt())
             setTextColor(0xFFFFFFFF.toInt())
             setOnClickListener {
-                SettingsStore.save(
-                    this@SettingsActivity,
-                    SettingsStore.Settings(
-                        provider = providerOptions[spinner.selectedItemPosition].second,
-                        model = modelEdit.text.toString(),
-                        evalModel = evalEdit.text.toString(),
-                        baseUrl = urlEdit.text.toString(),
-                        apiKey = keyEdit.text.toString(),
-                        maxTokens = maxTokensEdit.text.toString(),
-                    ),
-                )
+                try {
+                    SettingsStore.save(
+                        this@SettingsActivity,
+                        Settings(
+                            provider = providerOptions[spinner.selectedItemPosition].second,
+                            model = modelEdit.text.toString(),
+                            evalModel = evalEdit.text.toString(),
+                            baseUrl = urlEdit.text.toString(),
+                            apiKey = keyEdit.text.toString(),
+                            maxTokens = maxTokensEdit.text.toString(),
+                        ),
+                    )
+                } catch (e: Exception) {
+                    AssetExtractor.logShared(this@SettingsActivity, "ERROR: settings save refused (fail-closed) | $e")
+                    Toast.makeText(this@SettingsActivity, "Secure storage unavailable — key NOT saved.", Toast.LENGTH_LONG).show()
+                    return@setOnClickListener
+                }
                 try {
                     val restart = Intent(this@SettingsActivity, ContainerService::class.java)
                         .setAction(ContainerService.ACTION_RESTART)
@@ -426,23 +436,39 @@ class SettingsActivity : AppCompatActivity() {
             text = "The API key is encrypted with the Android keystore and only injected into the container at launch — it never reaches the model through chat."
             setPadding(0, dp(14), 0, 0)
             textSize = 12f
-            gravity = Gravity.CENTER
             setTextColor(0xFF777777.toInt())
         })
-
-        setContentView(ScrollView(this).apply {
-            setBackgroundColor(0xFF151221.toInt())
-            addView(root)
-        })
     }
 
-    override fun onDestroy() {
-        try {
-            unregisterReceiver(finishReceiver)
-        } catch (e: Exception) {
-        }
-        super.onDestroy()
+    override fun onStart() {
+        super.onStart()
+        registerFinishReceiver()
     }
 
-    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+    override fun onStop() {
+        super.onStop()
+        try { unregisterReceiver(finishReceiver) } catch (_: Exception) {}
+    }
+
+    private fun label(text: String): TextView = TextView(this).apply {
+        this.text = text
+        setPadding(0, dp(14), 0, dp(4))
+        textSize = 14f
+        setTextColor(0xFFe6e6e6.toInt())
+    }
+
+    private fun editText(text: String, hint: String): EditText = EditText(this).apply {
+        setText(text)
+        this.hint = hint
+        setTextColor(0xFFe6e6e6.toInt())
+        setHintTextColor(0xFF777777.toInt())
+        backgroundTintList = ColorStateList.valueOf(0xFF333742.toInt())
+        setPadding(dp(8), dp(8), dp(8), dp(8))
+    }
+
+    private fun dp(n: Int): Int = (n * resources.displayMetrics.density).toInt()
+
+    private fun spinnerAdapter() = ArrayAdapter<String>(this, android.R.layout.simple_spinner_dropdown_item).apply {
+        setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+    }
 }

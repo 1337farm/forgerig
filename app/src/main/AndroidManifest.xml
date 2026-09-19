@@ -44,6 +44,12 @@
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize|density|uiMode"
             android:theme="@style/Theme.AppCompat.DayNight.Dialog.Alert" />
 
+        <activity
+            android:name=".NetworkAllowlistActivity"
+            android:exported="false"
+            android:label="Network Allowlist"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize|density|uiMode" />
+
         <service
             android:name=".ContainerService"
             android:enabled="true"
