@@ -35,6 +35,9 @@ class ContainerService : Service() {
         const val ACTION_STOP = "com.forgerig.action.STOP"
         /** Relaunch the daemon with freshly-read settings (no activity finish). */
         const val ACTION_RESTART = "com.forgerig.action.RESTART"
+        /** Live agent status text for the foreground notification. */
+        const val ACTION_AGENT_STATUS = "com.forgerig.action.AGENT_STATUS"
+        const val EXTRA_AGENT_STATUS = "agent_status_text"
         /** Broadcast when the service stops so activities finish too (full shutdown). */
         const val ACTION_FINISH_APP = "com.forgerig.action.FINISH_APP"
         private const val NOTIF_ID = 1
@@ -63,6 +66,16 @@ class ContainerService : Service() {
             ACTION_INSTALL -> startInstall()
             ACTION_START_CONTAINER -> startContainerProcess()
             ACTION_RESTART -> restartContainer("settings changed")
+            ACTION_AGENT_STATUS -> {
+                // Live agent state from the WebView (working/done): mirror it
+                // into the drawer text. Deduped so chatty updates don't
+                // rebuild the notification every chunk.
+                val text = intent.getStringExtra(EXTRA_AGENT_STATUS)?.trim()
+                if (!text.isNullOrEmpty() && text != lastAgentStatus) {
+                    lastAgentStatus = text
+                    updateNotification(text)
+                }
+            }
             else -> {
                 // Backward compatible plain start (and START_STICKY restart
                 // after process death): run the container when the environment
@@ -94,6 +107,8 @@ class ContainerService : Service() {
     }
 
     private var lastInstallNotif = ""
+    /** Last agent-status text mirrored to the notification (dedup key). */
+    private var lastAgentStatus = ""
 
     /** Runs extraction inside the service so it survives the activity going away. */
     private fun startInstall() {
@@ -400,6 +415,7 @@ class ContainerService : Service() {
         }
 
         writeStatus("running")
+        lastAgentStatus = "Container starting…"
         updateNotification("Container starting…")
         thread {
             try {

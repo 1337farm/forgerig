@@ -1,5 +1,8 @@
 package com.forgerig
 
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -14,6 +17,9 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.appcompat.app.AppCompatDelegate
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.app.RemoteInput
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -38,9 +44,48 @@ class MainActivity : AppCompatActivity() {
                 e.printStackTrace()
             }
         }
+
+        const val ACTION_AGENT_REPLY = "com.forgerig.action.AGENT_REPLY"
+        const val EXTRA_AGENT_REPLY = "forgerig_reply"
+        private const val AGENT_CHANNEL_ID = "agent_updates_channel"
+        private const val AGENT_NOTIF_ID = 2
+        private const val REQ_AGENT_OPEN = 102
+        private const val REQ_AGENT_REPLY = 103
+        private const val KEY_TEXT_REPLY = "agent_text_reply"
+    }
+
+    /** Manifest-declared receiver so the notification Reply action works even
+     * when the activity is gone: it wakes MainActivity with the reply text,
+     * which is injected into the WebView composer once the page is ready. */
+    class AgentReplyReceiver : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action != ACTION_AGENT_REPLY) return
+            val text = RemoteInput.getResultsFromIntent(intent)?.getCharSequence(KEY_TEXT_REPLY)?.toString()
+            try {
+                NotificationManagerCompat.from(context).cancel(AGENT_NOTIF_ID)
+            } catch (e: Exception) {
+            }
+            if (text.isNullOrBlank()) return
+            try {
+                val open = Intent(context, MainActivity::class.java).apply {
+                    action = Intent.ACTION_MAIN
+                    addCategory(Intent.CATEGORY_LAUNCHER)
+                    flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                    putExtra(EXTRA_AGENT_REPLY, text)
+                }
+                open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                context.startActivity(open)
+            } catch (e: Exception) {
+                AssetExtractor.logShared(context, "ERROR: agent reply open failed | $e")
+            }
+        }
     }
 
     private lateinit var webView: WebView
+    /** Reply text from the agent-done notification, injected into the
+     * composer once the daemon UI (which defines ForgeRigReply) is loaded. */
+    @Volatile
+    private var pendingAgentReply: String? = null
 
     // Stop from the notification must shut the whole app, not just the
     // service: the service broadcasts this and every activity finishes.
@@ -421,6 +466,13 @@ if (installState && typeof window.NativeHost.isInstalled === 'function') {
                 super.onReceivedError(view, request, error)
             }
         }
+
+        override fun onPageFinished(view: WebView?, url: String?) {
+            super.onPageFinished(view, url)
+            // Daemon UI (or a reload) is ready: deliver any pending
+            // notification reply into the composer.
+            injectAgentReply()
+        }
     }
 
     inner class WebAppInterface(private val context: MainActivity) {
@@ -481,6 +533,94 @@ if (installState && typeof window.NativeHost.isInstalled === 'function') {
                 AssetExtractor.logShared(context, "ERROR: openSettings failed | $e")
             }
         }
+
+        /** Mirror the agent's working state into the foreground-service
+         * notification so the drawer shows live status/progress. */
+        @JavascriptInterface
+        fun reportAgentStatus(text: String) {
+            try {
+                val status = Intent(context, ContainerService::class.java)
+                    .setAction(ContainerService.ACTION_AGENT_STATUS)
+                    .putExtra(ContainerService.EXTRA_AGENT_STATUS, text)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(status)
+                } else {
+                    context.startService(status)
+                }
+            } catch (t: Throwable) {
+                AssetExtractor.logShared(context, "ERROR: reportAgentStatus failed | $t")
+            }
+        }
+
+        /** Agent finished a turn: ping the drawer (only when the app is
+         * backgrounded — the caller checks visibility) with the reply
+         * preview, an Open action, and an inline Reply action that feeds
+         * straight back into the composer. */
+        @JavascriptInterface
+        fun notifyAgentDone(preview: String) {
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    val channel = NotificationChannel(
+                        AGENT_CHANNEL_ID,
+                        "Agent updates",
+                        NotificationManager.IMPORTANCE_DEFAULT
+                    ).apply { description = "Agent reply status and quick reply" }
+                    val manager = context.getSystemService(NotificationManager::class.java)
+                    manager.createNotificationChannel(channel)
+                }
+                val open = Intent(context, MainActivity::class.java).apply {
+                    action = Intent.ACTION_MAIN
+                    addCategory(Intent.CATEGORY_LAUNCHER)
+                    flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                }
+                val openPi = PendingIntent.getActivity(
+                    context, REQ_AGENT_OPEN, open,
+                    PendingIntent.FLAG_UPDATE_CURRENT or immutableFlag()
+                )
+                // RemoteInput needs a MUTABLE PendingIntent on API 31+.
+                val mutable = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    PendingIntent.FLAG_MUTABLE
+                } else {
+                    0
+                }
+                val replyIntent = Intent(context, AgentReplyReceiver::class.java)
+                    .setAction(ACTION_AGENT_REPLY)
+                val replyPi = PendingIntent.getBroadcast(
+                    context, REQ_AGENT_REPLY, replyIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or mutable
+                )
+                val remoteInput = RemoteInput.Builder(KEY_TEXT_REPLY)
+                    .setLabel("Reply to agent…")
+                    .build()
+                val replyAction = NotificationCompat.Action.Builder(
+                    android.R.drawable.ic_menu_send, "Reply", replyPi
+                ).addRemoteInput(remoteInput).build()
+                val body = preview.ifBlank { "The agent finished and is ready for more." }
+                val notif = NotificationCompat.Builder(context, AGENT_CHANNEL_ID)
+                    .setContentTitle("ForgeRig agent ready")
+                    .setContentText(body)
+                    .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+                    .setSmallIcon(android.R.drawable.ic_dialog_info)
+                    .setContentIntent(openPi)
+                    .addAction(replyAction)
+                    .addAction(android.R.drawable.ic_menu_view, "Open", openPi)
+                    .setAutoCancel(true)
+                    .setOnlyAlertOnce(false)
+                    .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+                    .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+                    .build()
+                NotificationManagerCompat.from(context).notify(AGENT_NOTIF_ID, notif)
+            } catch (t: Throwable) {
+                AssetExtractor.logShared(context, "ERROR: notifyAgentDone failed | $t")
+            }
+        }
+
+        private fun immutableFlag(): Int =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                PendingIntent.FLAG_IMMUTABLE
+            } else {
+                0
+            }
 
         @JavascriptInterface
         fun installNow() {
@@ -692,9 +832,44 @@ if (installState && typeof window.NativeHost.isInstalled === 'function') {
         handleIntent(intent)
     }
 
+    /** Feed a notification reply into the chat composer. Probes for the
+     * ForgeRigReply bridge first so a fallback/install page (which lacks it)
+     * keeps the text pending instead of dropping it. */
+    private fun injectAgentReply() {
+        val text = pendingAgentReply ?: return
+        if (!::webView.isInitialized) return
+        try {
+            webView.post {
+                try {
+                    webView.evaluateJavascript("typeof ForgeRigReply") { type ->
+                        if (type?.trim('"') == "function") {
+                            pendingAgentReply = null
+                            webView.evaluateJavascript(
+                                "ForgeRigReply(${org.json.JSONObject.quote(text)})",
+                                null
+                            )
+                        }
+                    }
+                } catch (e: Exception) {
+                    AssetExtractor.logShared(this, "ERROR: agent reply inject failed | $e")
+                }
+            }
+        } catch (e: Exception) {
+            AssetExtractor.logShared(this, "ERROR: agent reply post failed | $e")
+        }
+    }
+
     private fun handleIntent(intent: Intent?) {
         val action = intent?.action
         val data: Uri? = intent?.data
+
+        // Reply typed in the agent-done notification: hold it for injection
+        // once the page finishes loading, and try immediately in case the
+        // WebView is already on the daemon UI.
+        intent?.getStringExtra(EXTRA_AGENT_REPLY)?.takeIf { it.isNotBlank() }?.let {
+            pendingAgentReply = it
+            injectAgentReply()
+        }
 
         if (Intent.ACTION_VIEW == action && data != null) {
             if (data.scheme == "forgerig" && data.host == "oauth-callback") {

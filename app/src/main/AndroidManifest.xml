@@ -50,6 +50,14 @@
             android:exported="false"
             android:foregroundServiceType="dataSync"/>
 
+        <receiver
+            android:name=".MainActivity$AgentReplyReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.forgerig.action.AGENT_REPLY" />
+            </intent-filter>
+        </receiver>
+
     </application>
 
 </manifest>
