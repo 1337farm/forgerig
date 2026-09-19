@@ -76,14 +76,25 @@
   var sessions = [];      // [{id, title, message_count, created_ms}]
   var activeId = null;    // current session id
   var activeThread = [];  // raw OpenAI messages of the active session
-  var busy = false;       // a chat is in flight for the active session
+  var inflight = {};      // sessionId -> user text still awaiting a reply
+  var tabFlag = {};       // sessionId -> 'unread' | 'error' status icon
 
   function refreshLean() {
     call('lean_status', {}, function (err, r) { if (!err) renderLean(r); });
   }
 
   function pollTick() {
-    call('lean_progress', {}, function (err, r) { if (!err) renderLean(r); });
+    call('lean_progress', {}, function (err, r) {
+      if (err) return;
+      renderLean(r);
+      if (!r.downloading && !r.provisioning && !r.warming) {
+        // Settled: progress() never reports ready and never kicks the
+        // warm-up (both need the full status()), so take one full reading
+        // to surface ready/version and start warming, then stop polling.
+        if (leanTimer) { clearInterval(leanTimer); leanTimer = null; }
+        refreshLean();
+      }
+    });
   }
 
   function renderLean(r) {
@@ -144,7 +155,7 @@
       el.className = 'tab' + (s.id === activeId ? ' active' : '');
       var label = document.createElement('button');
       label.className = 'tab-label';
-      label.textContent = s.title || '(new)';
+      label.textContent = tabGlyph(s.id) + (s.title || '(new)');
       label.onclick = function () { openSession(s.id); };
       var x = document.createElement('button');
       x.className = 'tab-close';
@@ -170,15 +181,31 @@
     });
   }
 
+  // Per-tab status glyph: … while a reply is in flight, ● when a reply
+  // arrived while the tab was in the background, ! when the last send
+  // failed. Cleared when the tab is opened.
+  function tabGlyph(id) {
+    if (id && inflight[id]) return '\u2026 ';
+    var f = tabFlag[id];
+    if (f === 'unread') return '\u25cf ';
+    if (f === 'error') return '! ';
+    return '';
+  }
+
   function openSession(id) {
     activeId = id;
+    delete tabFlag[id];
     renderTabs();
     call('session_history', { session_id: id }, function (err, s) {
       if (err || !s) return;
+      if (activeId !== id) return; // stale: user already moved on
       activeThread = s.messages || [];
-      busy = false;
       renderTabs();
       render();
+      if (id && inflight[id]) {
+        renderPendingUser(inflight[id]);
+        appendElement(makePendingEl());
+      }
     });
   }
 
@@ -187,7 +214,6 @@
       if (err || !s) return;
       activeId = s.id;
       activeThread = [];
-      busy = false;
       sessions.unshift({ id: s.id, title: s.title || '(new)', message_count: 0 });
       renderTabs();
       render();
@@ -196,6 +222,8 @@
   }
 
   function removeSession(id) {
+    delete inflight[id];
+    delete tabFlag[id];
     call('session_delete', { session_id: id }, function () {
       sessions = sessions.filter(function (s) { return s.id !== id; });
       if (activeId === id) { activeId = null; activeThread = []; }
@@ -206,29 +234,45 @@
 
   function sendMessage() {
     var text = composerEl.value;
-    if (!text.trim() || busy) return;
+    if (!text.trim()) return;
     var sid = activeId;
+    if (sid && inflight[sid]) return; // one flight per tab
     composerEl.value = '';
 
     if (text.charAt(0) === '!') {
       renderPendingUser(text);
       call('exec', { command: text.slice(1).trim() }, function (err, r) {
-        appendMessage({ kind: 'assistant', content: err ? ('Error: ' + err) : formatExec(r) });
+        appendMessage({ kind: 'assistant', content: err ? ('Error: ' + err) : formatExec(r) }, true);
       });
       return;
     }
 
     renderPendingUser(text);
-    busy = true;
+    appendElement(makePendingEl());
+    if (sid) { inflight[sid] = text; renderTabs(); }
     call('chat', { session_id: sid, prompt: text }, function (err, r) {
-      busy = false;
+      var replySid = (r && r.session_id) || sid;
+      if (replySid) delete inflight[replySid];
       if (err) {
-        appendMessage({ kind: 'assistant', content: '**Error:** ' + (err.message || err) });
-      } else if (r) {
-        if (r.session_id) activeId = r.session_id;
-        appendMessage({ kind: 'assistant', content: r.reply });
+        if (replySid) tabFlag[replySid] = 'error';
+        refreshSessionsAfterChat();
+        if (!activeId || activeId === replySid) {
+          appendMessage({ kind: 'assistant', content: '**Error:** ' + (err.message || err) }, true);
+        }
+        return;
       }
-      refreshSessionsAfterChat();
+      if (r) {
+        if (!activeId || activeId === replySid) {
+          // Canonical reload: server-truth thread, so fork indices line up
+          // and titles refresh (fixes dead Fork on just-sent replies).
+          openSession(replySid);
+        } else {
+          // Reply landed while the user is elsewhere: flag the tab, don't
+          // disturb the current view.
+          if (replySid) tabFlag[replySid] = 'unread';
+          refreshSessionsAfterChat();
+        }
+      }
     });
   }
 
@@ -255,7 +299,6 @@
     turns.forEach(function (t, idx) {
       appendElement(makeTurnEl(t, idx));
     });
-    if (busy) appendElement(makePendingEl());
     scrollToBottom();
   }
 
@@ -278,7 +321,7 @@
     var meta = document.createElement('div');
     meta.className = 'meta';
 
-    if (turn.kind === 'assistant') {
+    if (turn.kind === 'assistant' && visibleIndex >= 0) {
       var fork = document.createElement('button');
       fork.className = 'mini';
       fork.textContent = '⤴ Fork';
@@ -292,9 +335,11 @@
     return wrap;
   }
 
-  function appendMessage(turn) {
+  // noFork skips the Fork button for ephemeral bubbles (errors, exec
+  // output) whose position does not map onto the server thread.
+  function appendMessage(turn, noFork) {
     var turns = ChatState.visibleTurns(activeThread);
-    appendElement(makeTurnEl(turn, turns.length));
+    appendElement(makeTurnEl(turn, noFork ? -1 : turns.length));
   }
 
   function renderPendingUser(text) {
@@ -337,7 +382,6 @@
       if (err || !f) return;
       activeId = f.id;
       activeThread = f.messages || [];
-      busy = false;
       sessions.unshift({ id: f.id, title: f.title, message_count: f.messages.length });
       renderTabs();
       render();

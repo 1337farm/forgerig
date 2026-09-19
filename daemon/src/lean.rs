@@ -164,8 +164,8 @@ fn snapshot(ready: bool, version: Option<String>) -> LeanStatus {
 
 /// Progress-only status: reads the shared atomics WITHOUT spawning a proot
 /// child, so the UI can poll it every second while a download/extract runs.
-/// `ready`/`version` are left unset here; the full `status()` sets them (it
-/// has to run `lean --version` in the guest, which the progress path avoids).
+/// `ready`/`version` are left unset and no warm-up is kicked here; the UI
+/// takes one full `status()` once this settles (see pollTick) for that.
 pub fn progress() -> LeanStatus {
     snapshot(false, None)
 }
@@ -441,6 +441,30 @@ pub async fn extract_in_guest(archive: &Path) -> Result<(), LeanError> {
         )));
     }
     eprintln!("lean install step 1/3: unpacked in {:.1}s", t0.elapsed().as_secs_f64());
+
+    // ---- Step 1b/3: modes + readiness gate ----
+    // Tar usually preserves +x, but a stripped mode (or an unexpected top
+    // level) leaves a "downloaded but never ready" install: status() keeps
+    // reporting missing and the UI loops back to the download button.
+    // Repair modes explicitly, then FAIL LOUDLY if the binary still is not
+    // executable instead of declaring success.
+    let fix = tools::run_trusted_limited(
+        &format!(
+            "chmod +x /usr/local/bin/lean* /usr/local/bin/lake* 2>/dev/null; test -x {LEAN_BIN} && echo READY || echo MISSING"
+        ),
+        Duration::from_secs(60),
+    )
+    .await;
+    if fix.timed_out || !fix.stdout.contains("READY") {
+        return Err(LeanError::Install(format!(
+            "lean unpacked but {LEAN_BIN} is not executable (exit {:?}, timed_out={}); stdout={:?} stderr={:?}",
+            fix.exit_code,
+            fix.timed_out,
+            fix.stdout.trim(),
+            fix.stderr.trim(),
+        )));
+    }
+    eprintln!("lean install step 1b/3: {LEAN_BIN} executable");
 
     // ---- Step 2/3: ldconfig so the loader finds libInit_shared.so etc. ----
     eprintln!("lean install step 2/3: running ldconfig");
