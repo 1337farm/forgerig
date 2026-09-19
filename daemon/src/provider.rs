@@ -12,18 +12,118 @@ use rig::completion::{self, CompletionModel, CompletionRequest, CompletionRespon
 use rig::extractor::{Extractor, ExtractorBuilder};
 use rig::providers::gemini;
 use rig::tool::{Tool, ToolSet};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::memory::EvaluationResult;
 use crate::lean::LeanExecutor;
 use crate::tools::BashExecutor;
 use crate::tools::CodeIngest;
+
+/// Events emitted while a chat completion streams. The daemon forwards these
+/// over the WebSocket as `chat_chunk` / `chat_tool` notifications so the UI
+/// paints tokens as they arrive instead of waiting for the full reply.
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    /// A slice of assistant text.
+    TextDelta(String),
+    /// A tool call started (arguments still streaming or complete).
+    ToolStart(String),
+    /// A tool call finished; String is a truncated result preview.
+    ToolResult(String),
+}
+
+impl StreamEvent {
+    /// Render as a JSON-RPC notification for the wire.
+    pub fn into_rpc(self, session_id: &str) -> Value {
+        match self {
+            StreamEvent::TextDelta(delta) => json!({
+                "jsonrpc": "2.0", "method": "chat_chunk",
+                "params": { "session_id": session_id, "delta": delta },
+            }),
+            StreamEvent::ToolStart(name) => json!({
+                "jsonrpc": "2.0", "method": "chat_tool",
+                "params": { "session_id": session_id, "phase": "start", "name": name },
+            }),
+            StreamEvent::ToolResult(preview) => json!({
+                "jsonrpc": "2.0", "method": "chat_tool",
+                "params": { "session_id": session_id, "phase": "result", "preview": preview },
+            }),
+        }
+    }
+}
+
+/// One parsed SSE `data:` payload from an OpenAI-compat stream.
+#[derive(Debug, Default)]
+struct SseDelta {
+    content: String,
+    tool_calls: Vec<ToolCallDelta>,
+    finish: bool,
+}
+
+#[derive(Debug, Default, Clone)]
+struct ToolCallDelta {
+    index: usize,
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+/// Parse a single SSE line. Returns (done, delta): done=true on `[DONE]`.
+fn parse_sse_line(line: &str) -> Option<(bool, SseDelta)> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with(':') {
+        return None;
+    }
+    let data = line.strip_prefix("data:")?.trim();
+    if data == "[DONE]" {
+        return Some((true, SseDelta::default()));
+    }
+    let v: Value = serde_json::from_str(data).ok()?;
+    let mut delta = SseDelta::default();
+    let choice = v.get("choices")?.as_array()?.first()?;
+    if choice.get("finish_reason").and_then(|r| r.as_str()).is_some() {
+        delta.finish = true;
+    }
+    let d = choice.get("delta")?;
+    if let Some(text) = d.get("content").and_then(|c| c.as_str()) {
+        delta.content = text.to_string();
+    }
+    if let Some(calls) = d.get("tool_calls").and_then(|c| c.as_array()) {
+        for call in calls {
+            let index = call.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+            let id = call.get("id").and_then(|i| i.as_str()).unwrap_or_default().to_string();
+            let f = call.get("function");
+            delta.tool_calls.push(ToolCallDelta {
+                index,
+                id,
+                name: f.and_then(|x| x.get("name")).and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+                arguments: f.and_then(|x| x.get("arguments")).and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+            });
+        }
+    }
+    Some((false, delta))
+}
+
+/// Split newly-arrived SSE bytes into complete lines, keeping the tail.
+fn feed_sse_lines(buffer: &mut String, bytes: &[u8]) -> Vec<String> {
+    buffer.push_str(&String::from_utf8_lossy(bytes));
+    let mut lines = Vec::new();
+    while let Some(pos) = buffer.find('\n') {
+        lines.push(buffer[..pos].to_string());
+        buffer.drain(..=pos);
+    }
+    lines
+}
 use crate::wasm::WasmTransformer;
 
 const SYSTEM_PREAMBLE: &str = "\
 You are an autonomous orchestrator daemon running in a Linux userland inside an \
 Android app. You have tools to run bash, transform WASM, and type-check Lean \
-theorem-prover sources. Be concise and action-oriented. Format replies as Markdown.";
+theorem-prover sources. Be concise and action-oriented. Format replies as Markdown. \
+Formatting contract (the client parses this output, so follow it exactly): use \
+fenced code blocks with a language tag for all code, inline code spans for \
+identifiers and paths, GFM tables for tabular data, short paragraphs, and no \
+filler. Prefer the smallest correct reply: fewer tokens is faster for everyone.";
 
 /// Upper bound on a single chat completion (rig's HTTP client has no timeout).
 const CHAT_TIMEOUT_SECS: u64 = 300;
@@ -185,6 +285,43 @@ struct LoggedOpenAiModel {
 impl LoggedOpenAiModel {
     fn new(http: reqwest::Client, base_url: String, api_key: String, model: String) -> Self {
         Self { http, base_url, api_key, model }
+    }
+
+    /// POST that returns the raw streaming response (caller reads SSE).
+    /// Same logging/timeouts as post_chat; the body must set stream:true.
+    async fn stream_post(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<reqwest::Response, completion::CompletionError> {
+        let url = format!("{}/v1/chat/completions", self.base_url.trim_end_matches('/'));
+        let request_json = serde_json::to_string(body).map_err(completion::CompletionError::JsonError)?;
+        eprintln!("chat http: -> POST {url} (model={}, stream)", self.model);
+        eprintln!("chat http: request {request_json}");
+        let t0 = std::time::Instant::now();
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.api_key)
+            .header("Connection", "close")
+            .header("Accept", "text/event-stream")
+            .json(body)
+            .send()
+            .await;
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("chat http: stream send failed after {:.2}s: {e}", t0.elapsed().as_secs_f64());
+                return Err(completion::CompletionError::HttpError(e));
+            }
+        };
+        let status = resp.status();
+        eprintln!("chat http: stream <- {status} (headers in {:.2}s)", t0.elapsed().as_secs_f64());
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            eprintln!("chat http: stream server error body: {text}");
+            return Err(completion::CompletionError::ProviderError(text));
+        }
+        Ok(resp)
     }
 
     /// One POST to /v1/chat/completions with full logging and parsed JSON.
@@ -456,6 +593,161 @@ async fn run_agent_loop(
     )))
 }
 
+/// Streaming twin of run_agent_loop: same tool loop, but assistant text and
+/// tool activity flow out as StreamEvents while the model is still talking.
+/// On stream-open failure it falls back to one non-streaming turn so a
+/// half-broken SSE path degrades to today's behavior, not an error.
+async fn run_agent_loop_streaming(
+    model: &LoggedOpenAiModel,
+    tools: &ToolSet,
+    tool_defs: &[serde_json::Value],
+    messages: &mut Vec<serde_json::Value>,
+    prompt: &str,
+    emit: &tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+) -> Result<String, completion::CompletionError> {
+    use futures_util::StreamExt as _;
+    let emit_ev = |ev: StreamEvent| {
+        let _ = emit.send(ev);
+    };
+    // `messages` starts as [system, ...history]; append the new user turn.
+    messages.push(json!({ "role": "user", "content": prompt }));
+    for _turn in 0..MAX_TOOL_TURNS {
+        let mut body = serde_json::Map::new();
+        body.insert("model".into(), json!(model.model));
+        body.insert("messages".into(), json!(messages));
+        body.insert("temperature".into(), json!(0.7));
+        body.insert("stream".into(), json!(true));
+        if let Some(mt) = max_tokens_limit() {
+            body.insert("max_tokens".into(), json!(mt));
+        }
+        if !tool_defs.is_empty() {
+            body.insert("tools".into(), json!(tool_defs));
+            body.insert("tool_choice".into(), json!("auto"));
+        }
+        let body = serde_json::Value::Object(body);
+
+        let resp = match model.stream_post(&body).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("chat stream: falling back to non-streaming turn ({e:?})");
+                let out = run_agent_loop_once(model, tools, tool_defs, messages).await?;
+                emit_ev(StreamEvent::TextDelta(out.clone()));
+                return Ok(out);
+            }
+        };
+        let mut stream = resp.bytes_stream();
+        let mut buf = String::new();
+        let mut text = String::new();
+        let mut builders: Vec<ToolCallDelta> = Vec::new();
+        let mut ended = false;
+        while !ended {
+            let chunk = stream.next().await;
+            let bytes = match chunk {
+                Some(Ok(b)) => b,
+                Some(Err(e)) => return Err(completion::CompletionError::HttpError(e)),
+                None => break,
+            };
+            for line in feed_sse_lines(&mut buf, &bytes) {
+                let Some((done, delta)) = parse_sse_line(&line) else { continue };
+                if !delta.content.is_empty() {
+                    text.push_str(&delta.content);
+                    emit_ev(StreamEvent::TextDelta(delta.content));
+                }
+                for tc in delta.tool_calls {
+                    while builders.len() <= tc.index {
+                        builders.push(ToolCallDelta::default());
+                    }
+                    let b = &mut builders[tc.index];
+                    b.index = tc.index;
+                    if !tc.id.is_empty() {
+                        b.id = tc.id;
+                    }
+                    if !tc.name.is_empty() {
+                        b.name = tc.name;
+                    }
+                    b.arguments.push_str(&tc.arguments);
+                }
+                if done || delta.finish {
+                    ended = true;
+                    break;
+                }
+            }
+        }
+        let calls: Vec<ToolCallDelta> = builders.into_iter().filter(|b| !b.name.is_empty()).collect();
+        if calls.is_empty() {
+            messages.push(json!({ "role": "assistant", "content": text }));
+            return Ok(text);
+        }
+        // Tool turn: replay the assistant tool_calls message for coherence,
+        // run every requested tool, stream start/result markers, continue.
+        let wire_calls: Vec<Value> = calls
+            .iter()
+            .map(|c| {
+                json!({
+                    "id": c.id,
+                    "type": "function",
+                    "function": { "name": c.name, "arguments": c.arguments },
+                })
+            })
+            .collect();
+        messages.push(json!({ "role": "assistant", "tool_calls": wire_calls }));
+        for tc in &calls {
+            emit_ev(StreamEvent::ToolStart(tc.name.clone()));
+            let result = match tools.call(&tc.name, tc.arguments.clone()).await {
+                Ok(r) => r,
+                Err(e) => format!("tool error: {e}"),
+            };
+            eprintln!("chat tool: {} -> {:.240}", tc.name, result);
+            let preview: String = result.chars().take(240).collect();
+            emit_ev(StreamEvent::ToolResult(preview));
+            messages.push(json!({ "role": "tool", "tool_call_id": tc.id, "content": result }));
+        }
+        eprintln!("chat tool: streaming loop continues after tool turn");
+    }
+    Err(completion::CompletionError::ResponseError(format!(
+        "agent did not finish within {MAX_TOOL_TURNS} tool turns"
+    )))
+}
+
+/// One non-streaming turn used as the SSE fallback: sends the current thread
+/// once and runs any requested tools a single time (no follow-up turn).
+async fn run_agent_loop_once(
+    model: &LoggedOpenAiModel,
+    tools: &ToolSet,
+    tool_defs: &[serde_json::Value],
+    messages: &mut Vec<serde_json::Value>,
+) -> Result<String, completion::CompletionError> {
+    let mut body = serde_json::Map::new();
+    body.insert("model".into(), json!(model.model));
+    body.insert("messages".into(), json!(messages));
+    body.insert("temperature".into(), json!(0.7));
+    if let Some(mt) = max_tokens_limit() {
+        body.insert("max_tokens".into(), json!(mt));
+    }
+    if !tool_defs.is_empty() {
+        body.insert("tools".into(), json!(tool_defs));
+        body.insert("tool_choice".into(), json!("auto"));
+    }
+    let v = model.post_chat(&serde_json::Value::Object(body)).await?;
+    let (content, tool_calls) = LoggedOpenAiModel::parse_turn(&v)?;
+    if let Some(message) = v
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|c| c.first())
+        .and_then(|m| m.get("message"))
+    {
+        messages.push(message.clone());
+    }
+    for tc in &tool_calls {
+        let result = match tools.call(&tc.name, tc.arguments.clone()).await {
+            Ok(r) => r,
+            Err(e) => format!("tool error: {e}"),
+        };
+        messages.push(json!({ "role": "tool", "tool_call_id": tc.id, "content": result }));
+    }
+    Ok(content.unwrap_or_default())
+}
+
 impl Backend {
     pub async fn resolve() -> Backend {
         let provider = Provider::from_env();
@@ -532,8 +824,7 @@ impl Backend {
         &self,
         messages: &mut Vec<serde_json::Value>,
         prompt: &str,
-    ) -> Result<String, String> {
-        // The compat model bounds each HTTP round-trip with a 15s connect +
+    ) -> Result<String, String> {        // The compat model bounds each HTTP round-trip with a 15s connect +
         // 180s read timeout (see LoggedOpenAiModel); this outer cap bounds the
         // whole tool loop (up to MAX_TOOL_TURNS round-trips).
         let fut = match &self.kind {
@@ -545,6 +836,49 @@ impl Backend {
             BackendKind::Gemini { agent, .. } => {
                 // Gemini has no exposed multi-turn history; flatten the prior
                 // user/assistant turns into a single transcript.
+                let transcript = messages
+                    .iter()
+                    .filter_map(|m| match (m.get("role").and_then(|r| r.as_str()), m.get("content").and_then(|c| c.as_str())) {
+                        (Some("user"), Some(c)) => Some(format!("User: {c}")),
+                        (Some("assistant"), Some(c)) => Some(format!("Assistant: {c}")),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                futures_util::future::Either::Right(async move {
+                    let full: std::borrow::Cow<'_, str> = if transcript.is_empty() {
+                        std::borrow::Cow::Borrowed(prompt)
+                    } else {
+                        std::borrow::Cow::Owned(format!("{transcript}\nUser: {prompt}"))
+                    };
+                    agent.prompt(&full).await.map_err(|e| e.to_string())
+                })
+            }
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(CHAT_TIMEOUT_SECS), fut).await {
+            Ok(res) => res,
+            Err(_) => Err(format!("chat timed out after {}s", CHAT_TIMEOUT_SECS)),
+        }
+    }
+
+    /// Streaming twin of chat_session: tokens and tool activity flow out as
+    /// StreamEvents while the model is still talking. Gemini has no streaming
+    /// path here, so it resolves as one silent turn (client paints it whole).
+    pub async fn chat_session_streaming(
+        &self,
+        messages: &mut Vec<serde_json::Value>,
+        prompt: &str,
+        emit: &tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+    ) -> Result<String, String> {
+        let fut = match &self.kind {
+            BackendKind::Compat { model, tools, tool_defs, .. } => {
+                futures_util::future::Either::Left(async move {
+                    run_agent_loop_streaming(model, tools, tool_defs, messages, prompt, emit)
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+            }
+            BackendKind::Gemini { agent, .. } => {
                 let transcript = messages
                     .iter()
                     .filter_map(|m| match (m.get("role").and_then(|r| r.as_str()), m.get("content").and_then(|c| c.as_str())) {
@@ -584,5 +918,63 @@ impl Backend {
             self.chat_model,
             if self.key_present { "set" } else { "missing" }
         )
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sse_text_delta_parses() {
+        let line = r#"data: {"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}"#;
+        let (done, d) = parse_sse_line(line).unwrap();
+        assert!(!done);
+        assert_eq!(d.content, "Hello");
+        assert!(!d.finish);
+    }
+
+    #[test]
+    fn sse_done_and_finish_flag() {
+        assert!(parse_sse_line("data: [DONE]").unwrap().0);
+        let line = r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#;
+        let (done, d) = parse_sse_line(line).unwrap();
+        assert!(!done);
+        assert!(d.finish);
+    }
+
+    #[test]
+    fn sse_tool_call_delta_parses_with_index() {
+        let line = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash_executor","arguments":"{\"com"}}]}}]}"#;
+        let (_, d) = parse_sse_line(line).unwrap();
+        assert_eq!(d.tool_calls.len(), 1);
+        assert_eq!(d.tool_calls[0].name, "bash_executor");
+        assert_eq!(d.tool_calls[0].id, "call_1");
+    }
+
+    #[test]
+    fn sse_comments_and_blanks_skipped() {
+        assert!(parse_sse_line(": ping").is_none());
+        assert!(parse_sse_line("").is_none());
+        assert!(parse_sse_line("event: message").is_none());
+    }
+
+    #[test]
+    fn feed_sse_lines_keeps_partial_tail() {
+        let mut buf = String::new();
+        let lines = feed_sse_lines(&mut buf, b"data: {\"a\":1}\npartial");
+        assert_eq!(lines, vec!["data: {\"a\":1}".to_string()]);
+        let lines2 = feed_sse_lines(&mut buf, b"-tail\n");
+        assert_eq!(lines2, vec!["partial-tail".to_string()]);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn stream_event_renders_rpc_notifications() {
+        let v = StreamEvent::TextDelta("hi".into()).into_rpc("s1");
+        assert_eq!(v["method"], json!("chat_chunk"));
+        assert_eq!(v["params"]["delta"], json!("hi"));
+        let v = StreamEvent::ToolStart("bash_executor".into()).into_rpc("s1");
+        assert_eq!(v["method"], json!("chat_tool"));
+        assert_eq!(v["params"]["phase"], json!("start"));
     }
 }

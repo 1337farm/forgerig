@@ -12,6 +12,9 @@
   var composerEl = $('composer');
   var sendBtn = $('send-btn');
   var newBtn = $('new-session');
+  var historyBtn = $('history-btn');
+  var closedPanel = $('closed-panel');
+  var closedList = $('closed-list');
   var statusEl = $('status');
   var providerEl = $('provider');
   var leanStatusEl = $('lean-status');
@@ -30,11 +33,12 @@
   function call(method, params, cb) {
     if (!ws || ws.readyState !== 1) {
       if (cb) cb(new Error('not connected'));
-      return;
+      return null;
     }
     var id = ++reqId;
     pending[id] = cb || function () {};
     ws.send(JSON.stringify({ jsonrpc: '2.0', method: method, params: params || {}, id: id }));
+    return id;
   }
 
   function connect() {
@@ -59,17 +63,125 @@
     };
     ws.onclose = function () {
       statusEl.textContent = 'Disconnected — retrying…';
+      // Fail every in-flight call so sends are recoverable (composer
+      // restore) instead of stuck forever with a dead pending bubble.
+      // This covers both bare RPCs (pending map) and accepted streams
+      // (whose reply already consumed their pending entry).
+      var stale = pending;
+      pending = {};
+      Object.keys(stale).forEach(function (id) {
+        try { stale[id](new Error('disconnected')); } catch (_) {}
+      });
+      Object.keys(inflight).forEach(function (sid) {
+        try { failFlight(sid, 'disconnected — message restored to the composer; edit and resend.'); } catch (_) {}
+      });
       setTimeout(connect, 1000);
     };
     ws.onmessage = function (e) {
       var d;
       try { d = JSON.parse(e.data); } catch (_) { return; }
+      if (d.id == null && d.method) { handlePush(d); return; }
       if (d.id != null && pending[d.id]) {
         var cb = pending[d.id];
         delete pending[d.id];
         cb(d.error, d.result);
       }
     };
+  }
+
+  // Server-initiated streaming notifications (no request id).
+  function handlePush(d) {
+    var p = d.params || {};
+    var sid = p.session_id;
+    if (!sid) return;
+    if (d.method === 'chat_chunk') onStreamChunk(sid, p.delta || '');
+    else if (d.method === 'chat_tool') onStreamTool(sid, p);
+    else if (d.method === 'chat_done') onStreamDone(sid);
+    else if (d.method === 'chat_error') {
+      failFlight(sid, (p.error && (p.error.message || p.error)) || p.error || 'unknown error');
+    }
+  }
+
+  function childByClass(el, cls) {
+    var kids = el.children || [];
+    for (var i = 0; i < kids.length; i++) {
+      if (kids[i].className === cls) return kids[i];
+    }
+    return null;
+  }
+
+  // Bubble for live tokens: morphs the Thinking bubble when attached,
+  // otherwise builds (or rebuilds, after a re-render) a fresh one.
+  function streamBubble(sid) {
+    var refs = streamEls[sid];
+    if (refs && refs.wrap.parentNode) return refs;
+    var pw = pendEl[sid];
+    if (pw && pw.parentNode) {
+      delete pendEl[sid];
+      var b = childByClass(pw, 'body');
+      var t = childByClass(pw, 'tools');
+      if (!t) {
+        t = document.createElement('div');
+        t.className = 'tools';
+        pw.appendChild(t);
+      }
+      refs = { wrap: pw, body: b, tools: t };
+    } else {
+      delete pendEl[sid];
+      var wrap = document.createElement('div');
+      wrap.className = 'msg assistant';
+      var head = document.createElement('div');
+      head.className = 'author';
+      head.textContent = 'Assistant';
+      var body = document.createElement('div');
+      body.className = 'body';
+      var tools = document.createElement('div');
+      tools.className = 'tools';
+      wrap.appendChild(head);
+      wrap.appendChild(body);
+      wrap.appendChild(tools);
+      appendElement(wrap);
+      refs = { wrap: wrap, body: body, tools: tools };
+    }
+    streamEls[sid] = refs;
+    return refs;
+  }
+
+  function onStreamChunk(sid, delta) {
+    streamBuf[sid] = (streamBuf[sid] || '') + delta;
+    if (activeId !== sid) {
+      if (!tabFlag[sid]) tabFlag[sid] = 'unread';
+      renderTabs();
+      return;
+    }
+    var refs = streamBubble(sid);
+    if (refs.body) refs.body.innerHTML = Markdown.render(streamBuf[sid]);
+    scrollToBottom();
+  }
+
+  function onStreamTool(sid, p) {
+    if (activeId !== sid) {
+      if (!tabFlag[sid]) tabFlag[sid] = 'unread';
+      renderTabs();
+      return;
+    }
+    var refs = streamBubble(sid);
+    var line = document.createElement('div');
+    line.className = 'tool-line';
+    if (p.phase === 'start') line.textContent = '\u2699 ' + (p.name || 'tool') + ' …';
+    else line.textContent = '\u2192 ' + String(p.preview || '').slice(0, 240);
+    refs.tools.appendChild(line);
+    scrollToBottom();
+  }
+
+  function onStreamDone(sid) {
+    if (flightTimer[sid]) { clearTimeout(flightTimer[sid]); delete flightTimer[sid]; }
+    delete inflight[sid];
+    delete streamBuf[sid];
+    delete streamEls[sid];
+    delete pendEl[sid];
+    if (!activeId || activeId === sid) openSession(sid);
+    else { tabFlag[sid] = 'unread'; refreshSessionsAfterChat(); }
   }
 
   // ---------- state ----------
@@ -157,6 +269,10 @@
       label.className = 'tab-label';
       label.textContent = tabGlyph(s.id) + (s.title || '(new)');
       label.onclick = function () { openSession(s.id); };
+      var edit = document.createElement('button');
+      edit.className = 'tab-rename';
+      edit.textContent = '✎';
+      edit.onclick = function (e) { e.stopPropagation(); startRename(s.id, label); };
       var x = document.createElement('button');
       x.className = 'tab-close';
       x.textContent = '×';
@@ -176,9 +292,42 @@
         }
       };
       el.appendChild(label);
+      el.appendChild(edit);
       el.appendChild(x);
       sessionsEl.appendChild(el);
     });
+  }
+
+  // Inline tab rename: swap the label for an input; Enter commits via
+  // session_rename, Escape/blur cancels. (prompt() is dead here too.)
+  function startRename(id, labelEl) {
+    var cur = '';
+    sessions.forEach(function (x) { if (x.id === id) cur = x.title || ''; });
+    var input = document.createElement('input');
+    input.className = 'tab-edit';
+    input.value = cur;
+    input.placeholder = 'Name this chat…';
+    var done = false;
+    function finish(commit) {
+      if (done) return;
+      done = true;
+      if (!commit) { renderTabs(); return; }
+      call('session_rename', { session_id: id, title: input.value }, function (err, r) {
+        if (!err && r && r.title) {
+          sessions.forEach(function (x) { if (x.id === id) x.title = r.title; });
+        }
+        renderTabs();
+      });
+    }
+    input.addEventListener('keydown', function (e) {
+      e.stopPropagation();
+      if (e.key === 'Enter') finish(true);
+      else if (e.key === 'Escape') finish(false);
+    });
+    input.addEventListener('blur', function () { finish(true); });
+    labelEl.parentNode.replaceChild(input, labelEl);
+    input.focus();
+    try { input.select(); } catch (_) {}
   }
 
   // Per-tab status glyph: … while a reply is in flight, ● when a reply
@@ -202,7 +351,10 @@
       activeThread = s.messages || [];
       renderTabs();
       render();
-      if (id && inflight[id]) {
+      if (streamBuf[id]) {
+        var rb = streamBubble(id);
+        if (rb.body) rb.body.innerHTML = Markdown.render(streamBuf[id]);
+      } else if (id && inflight[id]) {
         renderPendingUser(inflight[id]);
         appendElement(makePendingEl());
       }
@@ -232,11 +384,18 @@
     });
   }
 
+  // Live stream state, keyed by session id.
+  var streamBuf = {};   // sid -> accumulated streamed markdown
+  var streamEls = {};   // sid -> { wrap, body, tools } bubble refs (viewing tab)
+  var pendEl = {};      // sid -> Thinking bubble ref, morphed on first chunk
+  var flightTimer = {}; // sid -> watchdog timeout id
+  var failedFlight = {}; // sid -> failure already reported (disconnect can race accept)
+
   function sendMessage() {
     var text = composerEl.value;
     if (!text.trim()) return;
-    var sid = activeId;
-    if (sid && inflight[sid]) return; // one flight per tab
+    var sid = activeId || '__fresh__';
+    if (inflight[sid]) return; // one flight per tab (fresh tab included)
     composerEl.value = '';
 
     if (text.charAt(0) === '!') {
@@ -248,32 +407,44 @@
     }
 
     renderPendingUser(text);
-    appendElement(makePendingEl());
-    if (sid) { inflight[sid] = text; renderTabs(); }
-    call('chat', { session_id: sid, prompt: text }, function (err, r) {
-      var replySid = (r && r.session_id) || sid;
-      if (replySid) delete inflight[replySid];
-      if (err) {
-        if (replySid) tabFlag[replySid] = 'error';
-        refreshSessionsAfterChat();
-        if (!activeId || activeId === replySid) {
-          appendMessage({ kind: 'assistant', content: '**Error:** ' + (err.message || err) }, true);
-        }
-        return;
+    pendEl[sid] = appendElement(makePendingEl());
+    delete failedFlight[sid];
+    inflight[sid] = text;
+    renderTabs();
+    // Client-side bound matching the server's 300s cap: a hung reply
+    // becomes a recoverable error instead of a stuck pending bubble.
+    flightTimer[sid] = setTimeout(function () {
+      failFlight(sid, 'timed out after 310s — message restored to the composer; edit and resend.');
+    }, 310000);
+    call('chat', { session_id: activeId, prompt: text }, function (err, r) {
+      if (err || !(r && r.accepted)) {
+        // Transport-level failure (the streamed outcome arrives as
+        // chat_done/chat_error notifications instead).
+        failFlight(sid, (err && (err.message || err)) || 'send failed');
       }
-      if (r) {
-        if (!activeId || activeId === replySid) {
-          // Canonical reload: server-truth thread, so fork indices line up
-          // and titles refresh (fixes dead Fork on just-sent replies).
-          openSession(replySid);
-        } else {
-          // Reply landed while the user is elsewhere: flag the tab, don't
-          // disturb the current view.
-          if (replySid) tabFlag[replySid] = 'unread';
-          refreshSessionsAfterChat();
-        }
-      }
+      // Accepted: chunks arrive as notifications; the watchdog bounds them.
     });
+  }
+
+  // Shared failure path: flag, refresh titles, restore the text for retry.
+  function failFlight(sid, message) {
+    if (failedFlight[sid]) return;
+    failedFlight[sid] = true;
+    var text = inflight[sid];
+    if (flightTimer[sid]) { clearTimeout(flightTimer[sid]); delete flightTimer[sid]; }
+    delete inflight[sid];
+    delete streamBuf[sid];
+    delete streamEls[sid];
+    delete pendEl[sid];
+    var replySid = (sid === '__fresh__') ? null : sid;
+    if (replySid) tabFlag[replySid] = 'error';
+    refreshSessionsAfterChat();
+    if (!activeId || activeId === replySid) {
+      // Undo: failed turns are NOT persisted server-side, so the text goes
+      // back in the composer for edit+retry with no duplication.
+      if (text) composerEl.value = text;
+      appendMessage({ kind: 'assistant', content: '**Error:** ' + message }, true);
+    }
   }
 
   function formatExec(r) {
@@ -359,9 +530,13 @@
   function makePendingEl() {
     var wrap = document.createElement('div');
     wrap.className = 'msg assistant pending';
+    var head = document.createElement('div');
+    head.className = 'author';
+    head.textContent = 'Assistant';
     var body = document.createElement('div');
     body.className = 'body';
-    body.textContent = 'Thinking…';
+    body.innerHTML = '<span class="typing"><span></span><span></span><span></span></span>';
+    wrap.appendChild(head);
     wrap.appendChild(body);
     return wrap;
   }
@@ -369,6 +544,7 @@
   function appendElement(el) {
     messagesEl.appendChild(el);
     scrollToBottom();
+    return el;
   }
 
   function scrollToBottom() {
@@ -390,6 +566,39 @@
 
   // ---------- wire events ----------
   newBtn.onclick = newSession;
+  historyBtn.onclick = function () {
+    if (closedPanel.style.display === 'block') { closedPanel.style.display = 'none'; return; }
+    call('session_closed', {}, function (err, list) {
+      if (err || !list) return;
+      closedList.innerHTML = '';
+      if (!list.length) {
+        var em = document.createElement('div');
+        em.className = 'closed-empty';
+        em.textContent = 'No closed tabs — deleted tabs stay here for restore.';
+        closedList.appendChild(em);
+      }
+      list.forEach(function (s) {
+        var row = document.createElement('div');
+        row.className = 'closed-item';
+        var t = document.createElement('span');
+        t.textContent = (s.title || '(new)') + ' (' + (s.message_count || 0) + ')';
+        var rb = document.createElement('button');
+        rb.textContent = 'Restore';
+        rb.onclick = function () {
+          call('session_restore', { session_id: s.id }, function (e2, f) {
+            if (e2 || !f) return;
+            closedPanel.style.display = 'none';
+            sessions.unshift({ id: f.id, title: f.title, message_count: (f.messages || []).length });
+            openSession(f.id);
+          });
+        };
+        row.appendChild(t);
+        row.appendChild(rb);
+        closedList.appendChild(row);
+      });
+      closedPanel.style.display = 'block';
+    });
+  };
   sendBtn.onclick = sendMessage;
   leanBtnEl.onclick = function () {
     var was = leanBtnEl.style.display;

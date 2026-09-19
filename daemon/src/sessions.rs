@@ -32,14 +32,26 @@ pub struct Session {
 
 pub struct SessionManager {
     sessions: Mutex<HashMap<String, Session>>,
+    /// Soft-deleted sessions (closed tabs): restorable, capped.
+    /// The u64 is a monotonic trash sequence (insertion order); wall-clock
+    /// millis would tie under fast test loops and evict arbitrarily.
+    trash: Mutex<HashMap<String, (Session, u64)>>,
     seq: Mutex<u64>,
+    trash_seq: Mutex<u64>,
 }
+
+/// Cap on restorable closed tabs; oldest evicted first.
+const TRASH_CAP: usize = 20;
+/// Max stored title length (UI + RPC trim longer input).
+const TITLE_MAX: usize = 60;
 
 impl SessionManager {
     pub fn new() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            trash: Mutex::new(HashMap::new()),
             seq: Mutex::new(0),
+            trash_seq: Mutex::new(0),
         }
     }
 
@@ -127,7 +139,75 @@ impl SessionManager {
     }
 
     pub fn delete(&self, id: &str) -> bool {
-        self.sessions.lock().unwrap().remove(id).is_some()
+        let mut lock = self.sessions.lock().unwrap();
+        match lock.remove(id) {
+            Some(session) => {
+                let mut trash_seq = self.trash_seq.lock().unwrap();
+                *trash_seq += 1;
+                let order = *trash_seq;
+                drop(trash_seq);
+                let mut trash = self.trash.lock().unwrap();
+                trash.insert(id.to_string(), (session, order));
+                while trash.len() > TRASH_CAP {
+                    if let Some(oldest) = trash
+                        .iter()
+                        .min_by_key(|(_, (_, ts))| *ts)
+                        .map(|(k, _)| k.clone())
+                    {
+                        trash.remove(&oldest);
+                    } else {
+                        break;
+                    }
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Restore a soft-deleted (closed-tab) session back to the live list.
+    pub fn restore(&self, id: &str) -> Option<Session> {
+        let (session, _) = self.trash.lock().unwrap().remove(id)?;
+        let mut lock = self.sessions.lock().unwrap();
+        lock.insert(session.id.clone(), session.clone());
+        Some(session)
+    }
+
+    /// Closed tabs available for restore, newest first.
+    pub fn trash_list(&self) -> Vec<SessionSummary> {
+        let mut v: Vec<(SessionSummary, u64)> = self
+            .trash
+            .lock()
+            .unwrap()
+            .values()
+            .map(|(s, ts)| {
+                (
+                    SessionSummary {
+                        id: s.id.clone(),
+                        title: s.title.clone(),
+                        message_count: s.messages.len(),
+                        created_ms: s.created_ms,
+                    },
+                    *ts,
+                )
+            })
+            .collect();
+        v.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
+        v.into_iter().map(|(s, _)| s).collect()
+    }
+
+    /// Rename a tab. A non-empty custom title also pins it: the auto-title
+    /// in set_messages only fills blank titles, so renames stick.
+    pub fn set_title(&self, id: &str, title: &str) -> Option<Session> {
+        let trimmed: String = title.chars().take(TITLE_MAX).collect();
+        let trimmed = trimmed.trim().to_string();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let mut lock = self.sessions.lock().unwrap();
+        let session = lock.get_mut(id)?;
+        session.title = trimmed;
+        Some(session.clone())
     }
 
     /// Fork: clone a session and keep only the thread up to and including
@@ -206,5 +286,43 @@ mod tests {
         let s = m.create(sys());
         assert!(m.delete(&s.id));
         assert!(!m.exists(&s.id));
+    }
+
+    #[test]
+    fn rename_pins_title_against_auto_title() {
+        let m = SessionManager::new();
+        let s = m.create(sys());
+        m.set_title(&s.id, "Custom").unwrap();
+        m.set_messages(&s.id, thread());
+        assert_eq!(m.get(&s.id).unwrap().title, "Custom");
+        assert!(m.set_title(&s.id, "   ").is_none());
+    }
+
+    #[test]
+    fn delete_trashes_and_restore_brings_back() {
+        let m = SessionManager::new();
+        let s = m.create(sys());
+        m.set_messages(&s.id, thread());
+        assert!(m.delete(&s.id));
+        assert_eq!(m.trash_list().len(), 1);
+        let back = m.restore(&s.id).unwrap();
+        assert_eq!(back.messages.len(), 4);
+        assert!(m.exists(&s.id));
+        assert!(m.trash_list().is_empty());
+    }
+
+    #[test]
+    fn trash_evicts_oldest_beyond_cap() {
+        let m = SessionManager::new();
+        let mut first = String::new();
+        for _ in 0..(TRASH_CAP + 5) {
+            let s = m.create(sys());
+            if first.is_empty() {
+                first = s.id.clone();
+            }
+            m.delete(&s.id);
+        }
+        assert_eq!(m.trash_list().len(), TRASH_CAP);
+        assert!(m.restore(&first).is_none());
     }
 }
