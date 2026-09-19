@@ -16,7 +16,8 @@ try {
 }
 
 // Short commit hash baked into the APK filename (farm-style:
-// forgerig-<buildtype>-<sha>.apk) and BuildConfig.GIT_SHA.
+// forgerig-<buildtype>-<sha>.apk), BuildConfig.GIT_SHA, and — like the
+// gatekeeper demo — the human-readable versionName.
 val gitCommitHash: String = try {
     val proc = ProcessBuilder("git", "rev-parse", "--short=10", "HEAD")
         .directory(rootProject.projectDir)
@@ -38,7 +39,9 @@ android {
         minSdk = 26
         targetSdk = 34
         versionCode = 1
-        versionName = "1.0"
+        // Human-readable: the committing SHA beats a constant for debugging
+        // (gatekeeper-demo style).
+        versionName = gitCommitHash
 
         buildConfigField("String", "GITHUB_CLIENT_ID", "\"${localProperties.getProperty("GITHUB_CLIENT_ID", "")}\"")
         buildConfigField("String", "GITHUB_CLIENT_SECRET", "\"${localProperties.getProperty("GITHUB_CLIENT_SECRET", "")}\"")
@@ -110,6 +113,16 @@ dependencies {
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
     implementation("androidx.security:security-crypto:1.0.0")
     implementation("org.apache.commons:commons-compress:1.24.0")
+    // CameraX for QR scanning
+    implementation("androidx.camera:camera-core:1.3.1")
+    implementation("androidx.camera:camera-camera2:1.3.1")
+    implementation("androidx.camera:camera-view:1.3.1")
+    implementation("androidx.camera:camera-lifecycle:1.3.1")
+    // ZXing for QR code decoding/encoding
+    implementation("com.google.zxing:core:3.5.2")
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+    // OkHttp for WebSocket client in NetworkAllowlistActivity
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
     // @aar: the base zstd-jni artifact is a plain jar whose natives live under
     // /linux|darwin|win/... — AGP strips the linux/ resource out of the APK and
     // ships nothing loadable on Android, so ZstdCompressorInputStream blows up

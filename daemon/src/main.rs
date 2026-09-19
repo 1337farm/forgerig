@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use memory::MemoryEngine;
+use rig::tool::Tool;
 
 mod tools;
 mod wasm;
@@ -17,6 +18,8 @@ mod provider;
 mod lean;
 mod sessions;
 mod ingest;
+mod gatekeeper;
+mod net_fetch;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct RpcRequest {
@@ -43,7 +46,8 @@ struct RpcError {
 }
 
 /// Push handle for server-initiated JSON-RPC notifications (chat_chunk,
-/// chat_tool, chat_done, chat_error) on the same WebSocket as the request.
+/// chat_tool, chat_phase, chat_done, chat_stopped, chat_error) on the same
+/// WebSocket as the request.
 type WsPush = Arc<
     tokio::sync::Mutex<
         futures_util::stream::SplitSink<
@@ -63,7 +67,6 @@ async fn push_notification(push: &WsPush, value: Value) {
         .send(tokio_tungstenite::tungstenite::Message::Text(text))
         .await;
 }
-
 
 /// Per-connection stop flags: the chat future and its chat_stop RPC share
 /// the same connection task, so a thread-local registry (not a global map)
@@ -103,8 +106,17 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
             let cmd = req.params.as_ref().and_then(|p| p.get("command").and_then(|c| c.as_str())).map(|s| s.trim().to_string());
             match cmd {
                 Some(c) if !c.is_empty() => {
+                    if c.len() > gatekeeper::MAX_TOOL_ARG_BYTES {
+                        gatekeeper::log_verdict("exec", false, "command-too-long", &c.len().to_string());
+                        return err(-32602, "command too long".into(), req.id);
+                    }
                     let r = tools::run_trusted(&c).await;
-                    ok(json!({ "stdout": r.stdout, "stderr": r.stderr, "exit_code": r.exit_code, "timed_out": r.timed_out }), req.id)
+                    // Truncate + scrub before the payload crosses back over RPC.
+                    let (stdout, _) = gatekeeper::scrub_secrets(&r.stdout);
+                    let (stderr, _) = gatekeeper::scrub_secrets(&r.stderr);
+                    let (stdout, _) = gatekeeper::truncate_output(&stdout);
+                    let (stderr, _) = gatekeeper::truncate_output(&stderr);
+                    ok(json!({ "stdout": stdout, "stderr": stderr, "exit_code": r.exit_code, "timed_out": r.timed_out }), req.id)
                 }
                 _ => err(-32602, "Missing 'command' in params".into(), req.id),
             }
@@ -114,6 +126,10 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
             let session_id = req.params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str()).map(|s| s.to_string());
             match prompt {
                 Some(p) if !p.trim().is_empty() => {
+                    if p.len() > gatekeeper::MAX_PROMPT_BYTES {
+                        gatekeeper::log_verdict("chat", false, "prompt-too-long", &p.len().to_string());
+                        return err(-32602, "prompt too long".into(), req.id);
+                    }
                     // Reuse an existing session's cached thread, or start a new one.
                     let sid = match session_id.filter(|s| sessions.exists(s)) {
                         Some(id) => id,
@@ -133,7 +149,8 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
                     // Streaming: acknowledge immediately so the UI can paint
                     // progress, then run the agent loop in the background and
                     // forward chat_chunk / chat_tool notifications over this
-                    // socket, finishing with chat_done (or chat_error).
+                    // socket, finishing with chat_done, chat_stopped, or
+                    // chat_error.
                     let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel::<provider::StreamEvent>();
                     let bridge_push = Arc::clone(push);
                     let sid_bridge = sid.clone();
@@ -153,7 +170,8 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
                         match backend2.chat_session_streaming(&mut messages, &p, &etx, &stop).await {
                             Ok(completion) => {
                                 eprintln!("chat: completion (len={})", completion.len());
-                                let _ = memory2.log_trace(&p, &completion).await;
+                                let (sc, _) = gatekeeper::scrub_secrets(&completion);
+                                let _ = memory2.log_trace(&p, &sc).await;
                                 // Persist the extended thread as the reusable session cache.
                                 sessions2.set_messages(&sid2, messages);
                                 // Detached: every 5th trace, evaluate recent traces for
@@ -229,10 +247,6 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
                 None => err(-32602, format!("cannot fork unknown session '{id}'"), req.id),
             }
         }
-        "session_delete" => {
-            let id = req.params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
-            ok(json!({ "deleted": sessions.delete(&id) }), req.id)
-        }
         "session_undo" => {
             let id = req.params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
             match sessions.undo(&id) {
@@ -282,21 +296,9 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
             }
             ok(json!({ "stopped": true }), req.id)
         }
-        "session_rename" => {
+        "session_delete" => {
             let id = req.params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
-            let title = req.params.as_ref().and_then(|p| p.get("title")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
-            match sessions.set_title(&id, &title) {
-                Some(s) => ok(json!({ "id": s.id, "title": s.title }), req.id),
-                None => err(-32602, format!("cannot rename unknown session '{id}' (title must be non-blank)"), req.id),
-            }
-        }
-        "session_closed" => ok(json!(sessions.trash_list()), req.id),
-        "session_restore" => {
-            let id = req.params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
-            match sessions.restore(&id) {
-                Some(s) => ok(json!({ "id": s.id, "title": s.title, "messages": s.thread() }), req.id),
-                None => err(-32602, format!("unknown closed session '{id}'"), req.id),
-            }
+            ok(json!({ "deleted": sessions.delete(&id) }), req.id)
         }
         "lean_status" => {
             let st = lean::status().await;
@@ -319,6 +321,27 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
                 _ => err(-32602, "Missing 'file' in params".into(), req.id),
             }
         }
+        "wasm_transform" => {
+            let args = req.params.as_ref().and_then(|p| {
+                let wat = p.get("wat").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let base64_wasm = p.get("base64_wasm").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let input = p.get("input").and_then(|v| v.as_i64()).map(|v| v as i32);
+                if input.is_none() {
+                    return None;
+                }
+                Some(wasm::WasmTransformerArgs { wat, base64_wasm, input: input.unwrap() })
+            });
+            match args {
+                Some(args) => {
+                    let tool = wasm::WasmTransformer::default();
+                    match tool.call(args).await {
+                        Ok(result) => ok(json!({ "output": result.output, "fuel_consumed": result.fuel_consumed }), req.id),
+                        Err(e) => err(-32603, format!("Wasm transform error: {e}"), req.id),
+                    }
+                }
+                _ => err(-32602, "Missing 'input' in params (and either 'wat' or 'base64_wasm')".into(), req.id),
+            }
+        }
         "ingest" => {
             let path = req.params.as_ref().and_then(|p| p.get("workspace_path").and_then(|f| f.as_str())).map(|s| s.trim().to_string());
             match path {
@@ -336,6 +359,39 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
                     }
                 }
                 _ => err(-32602, "Missing 'workspace_path' in params".into(), req.id),
+            }
+        }
+        "network_policy_list" => {
+            let scope = req.params.as_ref().and_then(|p| p.get("scope").and_then(|s| s.as_str())).unwrap_or("global");
+            match memory.list_allowed_domains(scope).await {
+                Ok(domains) => ok(json!({ "domains": domains }), req.id),
+                Err(e) => err(-32603, format!("NetworkPolicy error: {e}"), req.id),
+            }
+        }
+        "network_policy_add" => {
+            let scope = req.params.as_ref().and_then(|p| p.get("scope").and_then(|s| s.as_str())).unwrap_or("global");
+            let domain = req.params.as_ref().and_then(|p| p.get("domain").and_then(|s| s.as_str())).map(|s| s.trim().to_string());
+            match domain {
+                Some(d) if !d.is_empty() => {
+                    match memory.allow_domain(scope, &d).await {
+                        Ok(_) => ok(json!({ "added": d }), req.id),
+                        Err(e) => err(-32603, format!("NetworkPolicy error: {e}"), req.id),
+                    }
+                }
+                _ => err(-32602, "Missing 'domain' in params".into(), req.id),
+            }
+        }
+        "network_policy_remove" => {
+            let scope = req.params.as_ref().and_then(|p| p.get("scope").and_then(|s| s.as_str())).unwrap_or("global");
+            let domain = req.params.as_ref().and_then(|p| p.get("domain").and_then(|s| s.as_str())).map(|s| s.trim().to_string());
+            match domain {
+                Some(d) if !d.is_empty() => {
+                    match memory.deny_domain(scope, &d).await {
+                        Ok(_) => ok(json!({ "removed": d }), req.id),
+                        Err(e) => err(-32603, format!("NetworkPolicy error: {e}"), req.id),
+                    }
+                }
+                _ => err(-32602, "Missing 'domain' in params".into(), req.id),
             }
         }
         _ => err(-32601, "Method not found".into(), req.id),
@@ -378,12 +434,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
     let addr = format!("127.0.0.1:{}", port);
 
-    let backend = Arc::new(provider::Backend::resolve().await);
     let memory_engine = Arc::new(
         MemoryEngine::new("oss_memory.db")
             .await
             .map_err(|e| format!("open memory db oss_memory.db: {e}"))?,
     );
+    let backend = Arc::new(provider::Backend::resolve(memory_engine.clone()).await);
     let persist_path = std::env::var("FORGERIG_SESSIONS_FILE")
         .map(PathBuf::from)
         .ok();
@@ -474,42 +530,72 @@ fn page_html() -> String {
         .replace("/*@APP_JS@*/", include_str!("../web/app.js"))
 }
 
-/// Bundled UI font (Intel One Mono, latin subset) served at /font.woff2.
-static FONT_WOFF2: &[u8] = include_bytes!("../web/IntelOneMono-Regular.woff2");
-
-async fn read_http_path(stream: &mut TcpStream) -> String {
-    let mut buf = [0u8; 1024];
-    let n = tokio::time::timeout(Duration::from_secs(5), stream.peek(&mut buf))
-        .await
-        .unwrap_or(Ok(0))
-        .unwrap_or(0);
-    String::from_utf8_lossy(&buf[..n])
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .split_whitespace()
-        .nth(1)
-        .unwrap_or("/")
-        .to_string()
-}
-
 async fn serve_http(mut stream: TcpStream) {
-    if read_http_path(&mut stream).await == "/font.woff2" {
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: font/woff2\r\nContent-Length: {}\r\nCache-Control: max-age=86400\r\nConnection: close\r\n\r\n",
-            FONT_WOFF2.len(),
-        );
-        let _ = stream.write_all(response.as_bytes()).await;
-        let _ = stream.write_all(FONT_WOFF2).await;
-        let _ = stream.shutdown().await;
+    // Read request line
+    let mut buf = [0u8; 4096];
+    let n = match tokio::time::timeout(
+        Duration::from_secs(5),
+        stream.read(&mut buf),
+    ).await {
+        Ok(Ok(n)) if n > 0 => n,
+        _ => return,
+    };
+    let request = String::from_utf8_lossy(&buf[..n]);
+    let first_line = request.lines().next().unwrap_or("");
+    let parts: Vec<&str> = first_line.split_whitespace().collect();
+    if parts.len() < 2 {
         return;
     }
-    let body = page_html();
+    let method = parts[0];
+    let path = parts[1];
 
+    // API routes
+    if path.starts_with("/api/network-policy/") {
+        handle_network_policy_api(&mut stream, method, path).await;
+        return;
+    }
+
+    // Landing page
+    let body = page_html();
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.as_bytes().len(),
         body
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
+}
+
+async fn handle_network_policy_api(stream: &mut TcpStream, _method: &str, path: &str) {
+    // Parse scope and domain from path: /api/network-policy/<scope>/<domain>
+    let parts: Vec<&str> = path.trim_start_matches("/api/network-policy/").split('/').collect();
+    if parts.is_empty() {
+        send_json(stream, 400, json!({ "error": "missing scope" })).await;
+        return;
+    }
+    let _scope = parts[0];
+
+    // For simplicity, we need access to MemoryEngine - but it's not available here.
+    // This is a simplified HTTP endpoint that would need MemoryEngine access.
+    // For now, return not implemented. The WebSocket RPC is the primary interface.
+    let response = json!({ "error": "HTTP API not fully implemented; use WebSocket RPC" });
+    send_json(stream, 501, response).await;
+}
+
+async fn send_json(stream: &mut TcpStream, status: u16, body: Value) {
+    let body_str = serde_json::to_string(&body).unwrap_or_default();
+    let response = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status,
+        match status {
+            200 => "OK",
+            400 => "Bad Request",
+            404 => "Not Found",
+            501 => "Not Implemented",
+            _ => "Error",
+        },
+        body_str.len(),
+        body_str
     );
     let _ = stream.write_all(response.as_bytes()).await;
     let _ = stream.shutdown().await;

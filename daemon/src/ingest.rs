@@ -52,10 +52,14 @@ fn collect_files(root: &std::path::Path, max_files: usize) -> Vec<std::path::Pat
             let name = entry.file_name().to_string_lossy().into_owned();
             let ftype = entry.file_type().ok();
             if ftype.map(|t| t.is_dir()).unwrap_or(false) {
-                if !SKIP_DIRS.contains(&name.as_str()) {
+                if !SKIP_DIRS.contains(&name.as_str()) && !crate::gatekeeper::is_sensitive_dir(&name) {
                     stack.push(path);
                 }
             } else if ftype.map(|t| t.is_file()).unwrap_or(true) {
+                // Fail-closed: secret/key material never enters model context.
+                if crate::gatekeeper::is_sensitive_path(&name) {
+                    continue;
+                }
                 let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
                 if INCLUDE_EXT.contains(&ext.as_str()) {
                     out.push(path);
@@ -73,12 +77,26 @@ pub fn ingest_workspace(root: &str, opts: &IngestOptions) -> Result<IngestOutput
     if !root_path.is_dir() {
         return Err(format!("not a directory: {root}"));
     }
+    // Canonicalize once so symlink escapes can be rejected per file below.
+    let canonical_root = std::fs::canonicalize(root_path).unwrap_or_else(|_| root_path.to_path_buf());
     let files = collect_files(root_path, opts.max_files);
     let mut store = sentinel_engine::ContentStore::new();
     let mut bodies: Vec<(String, Vec<u8>)> = Vec::with_capacity(files.len());
     let mut truncated = files.len() >= opts.max_files;
+    let mut total: usize = 0;
     for path in &files {
+        // Reject symlinks / `..` escapes that resolve outside the workspace.
+        if let Ok(canonical) = std::fs::canonicalize(path) {
+            if !canonical.starts_with(&canonical_root) {
+                truncated = true;
+                continue;
+            }
+        }
         let rel = path.strip_prefix(root_path).unwrap_or(path).to_string_lossy().replace('\\', "/");
+        if crate::gatekeeper::is_sensitive_path(&rel) {
+            truncated = true;
+            continue;
+        }
         let mut data = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
         if data.len() > opts.max_bytes_per_file {
             data.truncate(opts.max_bytes_per_file);
@@ -86,6 +104,16 @@ pub fn ingest_workspace(root: &str, opts: &IngestOptions) -> Result<IngestOutput
         }
         if !is_text_sample(&data) {
             continue;
+        }
+        // Scrub secrets before they reach model context (fail-closed: keep the
+        // file shape, drop the secret bytes).
+        let text = String::from_utf8_lossy(&data).into_owned();
+        let (scrubbed, _) = crate::gatekeeper::scrub_secrets(&text);
+        let data = scrubbed.into_bytes();
+        total += data.len();
+        if total > crate::gatekeeper::MAX_INGEST_TOTAL_BYTES {
+            truncated = true;
+            break;
         }
         let body = if opts.tab_zip { sentinel_engine::tab_zip(&data) } else { data };
         bodies.push((rel, body));
@@ -178,6 +206,33 @@ mod tests {
         let out = ingest_workspace(dir.to_str().unwrap(), &opts).unwrap();
         assert_eq!(out.deduped, 1);
         assert!(out.framed.contains("§#"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn secret_files_never_enter_context() {
+        let dir = std::env::temp_dir().join("forgerig-ingest-secret-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(dir.join(".env"), "OPENAI_API_KEY=sk-live-1234567890\n").unwrap();
+        std::fs::write(dir.join("keystore.properties"), "storePassword=hunter2hunter2\n").unwrap();
+        let out = ingest_workspace(dir.to_str().unwrap(), &Default::default()).unwrap();
+        assert_eq!(out.files, 1);
+        assert!(!out.framed.contains("sk-live"));
+        assert!(!out.framed.contains("hunter2"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inline_secrets_are_scrubbed() {
+        let dir = std::env::temp_dir().join("forgerig-ingest-scrub-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "let key = \"AKIAIOSFODNN7EXAMPLE\";\n").unwrap();
+        let out = ingest_workspace(dir.to_str().unwrap(), &Default::default()).unwrap();
+        assert!(!out.framed.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(out.framed.contains("[API_KEY_REDACTED]"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

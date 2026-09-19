@@ -449,13 +449,31 @@ class ContainerService : Service() {
                 // Provider/model/key from the (encrypted) settings store. Only
                 // non-empty values are set so the daemon's defaults apply when
                 // nothing is configured. Secrets stay in env, never in files.
-                SettingsStore.load(this).let { s ->
-                    if (s.provider.isNotEmpty()) pb.environment()["FORGERIG_PROVIDER"] = s.provider
-                    if (s.model.isNotEmpty()) pb.environment()["FORGERIG_MODEL"] = s.model
-                    if (s.evalModel.isNotEmpty()) pb.environment()["FORGERIG_EVAL_MODEL"] = s.evalModel
-                    if (s.baseUrl.isNotEmpty()) pb.environment()["FORGERIG_BASE_URL"] = s.baseUrl
-                    if (s.apiKey.isNotEmpty()) pb.environment()["FORGERIG_API_KEY"] = s.apiKey
-                    if (s.maxTokens.isNotEmpty()) pb.environment()["FORGERIG_MAX_TOKENS"] = s.maxTokens
+                val settings = SettingsStore.load(this)
+                if (settings.provider.isNotEmpty()) pb.environment()["FORGERIG_PROVIDER"] = settings.provider
+                if (settings.model.isNotEmpty()) pb.environment()["FORGERIG_MODEL"] = settings.model
+                if (settings.evalModel.isNotEmpty()) pb.environment()["FORGERIG_EVAL_MODEL"] = settings.evalModel
+                if (settings.baseUrl.isNotEmpty()) pb.environment()["FORGERIG_BASE_URL"] = settings.baseUrl
+                if (settings.maxTokens.isNotEmpty()) pb.environment()["FORGERIG_MAX_TOKENS"] = settings.maxTokens
+
+                // LLM provider key (legacy compat + primary)
+                val llmScope = SettingsStore.llmScope(settings.provider)
+                val llmKey = SettingsStore.getKey(this, llmScope)
+                    .takeIf { it.isNotBlank() }
+                    ?: settings.apiKey.takeIf { it.isNotBlank() }
+                if (llmKey != null) pb.environment()["FORGERIG_API_KEY"] = llmKey
+
+                // GitHub / HF tokens for net_fetch allowlist (daemon checks NetworkPolicy, not keys directly)
+                val githubKey = SettingsStore.getKey(this, SettingsStore.SCOPE_GITHUB)
+                if (githubKey.isNotBlank()) pb.environment()["GITHUB_TOKEN"] = githubKey
+                val hfKey = SettingsStore.getKey(this, SettingsStore.SCOPE_HF)
+                if (hfKey.isNotBlank()) pb.environment()["HF_TOKEN"] = hfKey
+
+                // Custom endpoint key
+                if (settings.baseUrl.isNotBlank()) {
+                    val customScope = SettingsStore.customScope(settings.baseUrl)
+                    val customKey = SettingsStore.getKey(this, customScope)
+                    if (customKey.isNotBlank()) pb.environment()["FORGERIG_API_KEY"] = customKey
                 }
                 pb.redirectErrorStream(true)
                 pb.directory(File(filesDir, "work").also { it.mkdirs() })

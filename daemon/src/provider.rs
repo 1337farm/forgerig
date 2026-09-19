@@ -13,11 +13,14 @@ use rig::extractor::{Extractor, ExtractorBuilder};
 use rig::providers::gemini;
 use rig::tool::{Tool, ToolSet};
 use serde_json::{json, Value};
+use std::sync::Arc;
 
-use crate::memory::EvaluationResult;
+use crate::memory::{EvaluationResult, MemoryEngine};
 use crate::lean::LeanExecutor;
 use crate::tools::BashExecutor;
 use crate::tools::CodeIngest;
+use crate::wasm::WasmTransformer;
+use crate::net_fetch::NetFetchTool;
 
 /// Events emitted while a chat completion streams. The daemon forwards these
 /// over the WebSocket as `chat_chunk` / `chat_tool` / `chat_review`
@@ -179,7 +182,6 @@ fn feed_sse_lines(buffer: &mut String, bytes: &[u8]) -> Vec<String> {
     }
     lines
 }
-use crate::wasm::WasmTransformer;
 
 const SYSTEM_PREAMBLE: &str = "\
 You are an autonomous orchestrator daemon running in a Linux userland inside an \
@@ -836,7 +838,7 @@ async fn run_agent_loop_once(
 }
 
 impl Backend {
-    pub async fn resolve() -> Backend {
+    pub async fn resolve(memory: Arc<MemoryEngine>) -> Backend {
         let provider = Provider::from_env();
         let key = resolve_key(provider);
         let key_present = !key.is_empty() && key != "dummy-key";
@@ -855,7 +857,8 @@ impl Backend {
                 .tool(BashExecutor::default())
                 .tool(WasmTransformer::default())
                 .tool(LeanExecutor::default())
-                .tool(CodeIngest::default());
+                .tool(CodeIngest::default())
+                .tool(NetFetchTool::new(memory.clone(), "global".to_string()));
             let agent = match max_tokens_limit() {
                 Some(mt) => builder.max_tokens(mt).build(),
                 None => builder.build(),
@@ -882,12 +885,14 @@ impl Backend {
             tools.add_tool(WasmTransformer::default());
             tools.add_tool(LeanExecutor::default());
             tools.add_tool(CodeIngest::default());
+            tools.add_tool(NetFetchTool::new(memory.clone(), "global".to_string()));
 
             let bash_def = BashExecutor::default().definition(String::new()).await;
             let wasm_def = WasmTransformer::default().definition(String::new()).await;
             let lean_def = LeanExecutor::default().definition(String::new()).await;
             let ingest_def = CodeIngest::default().definition(String::new()).await;
-            let tool_defs: Vec<serde_json::Value> = [bash_def, wasm_def, lean_def, ingest_def]
+            let net_fetch_def = NetFetchTool::new(memory.clone(), "global".to_string()).definition(String::new()).await;
+            let tool_defs: Vec<serde_json::Value> = [bash_def, wasm_def, lean_def, ingest_def, net_fetch_def]
                 .into_iter()
                 .map(|d| {
                     json!({

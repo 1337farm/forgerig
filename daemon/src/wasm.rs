@@ -85,6 +85,23 @@ impl Tool for WasmTransformer {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // Fail-closed input caps: oversized modules never reach the compiler.
+        if let Some(w) = args.wat.as_ref() {
+            if w.len() > 64 * 1024 {
+                crate::gatekeeper::log_verdict("wasm_transformer", false, "wat-too-long", &w.len().to_string());
+                return Err(WasmTransformerError::Execution("wat too long (64KB cap)".to_string()));
+            }
+            if w.to_ascii_lowercase().contains("(import") {
+                crate::gatekeeper::log_verdict("wasm_transformer", false, "wasm-imports-denied", "wat");
+                return Err(WasmTransformerError::Execution("wasm imports denied".to_string()));
+            }
+        }
+        if let Some(b) = args.base64_wasm.as_ref() {
+            if b.len() > 64 * 1024 {
+                crate::gatekeeper::log_verdict("wasm_transformer", false, "wasm-too-long", &b.len().to_string());
+                return Err(WasmTransformerError::Execution("wasm too long (64KB cap)".to_string()));
+            }
+        }
         let wasm_bytes = if let Some(wat_str) = args.wat {
             wat::parse_str(wat_str)?
         } else if let Some(b64) = args.base64_wasm {

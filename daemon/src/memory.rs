@@ -1,7 +1,7 @@
 use tokio_rusqlite::Connection;
 use std::sync::Arc;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct MemoryEngine {
     db: Arc<Connection>,
 }
@@ -31,6 +31,33 @@ impl MemoryEngine {
                 )",
                 [],
             )?;
+
+            // NetworkPolicy: deny-by-default egress allowlist per project/session.
+            // scope: "global" or "session:<id>" or "project:<path>"
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS network_policy (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scope TEXT NOT NULL,
+                    domain TEXT NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(scope, domain)
+                )",
+                [],
+            )?;
+
+            // Audit ledger for gatekeeper verdicts (append-only).
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS gatekeeper_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    tool TEXT NOT NULL,
+                    allowed INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    detail TEXT NOT NULL
+                )",
+                [],
+            )?;
+
             Ok(())
         }).await?;
 
@@ -84,31 +111,57 @@ impl MemoryEngine {
         }).await.map_err(|e| e.into())
     }
 
-    pub async fn log_macro_memory(&self, milestone: &str, context: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let milestone_str = milestone.to_string();
-        let context_str = context.to_string();
+    /// NetworkPolicy: check if a domain is allowed for a given scope.
+    pub async fn is_domain_allowed(&self, scope: &str, domain: &str) -> Result<bool, Box<dyn std::error::Error>> {
+        let scope = scope.to_string();
+        let domain = domain.to_string();
+        self.db.call(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT 1 FROM network_policy WHERE scope = ?1 AND domain = ?2"
+            )?;
+            let mut rows = stmt.query([&scope, &domain])?;
+            Ok(rows.next()?.is_some())
+        }).await.map_err(|e| e.into())
+    }
 
-        {
-            let (m, c) = (milestone_str.clone(), context_str.clone());
-            self.db.call(move |conn| {
-                conn.execute(
-                    "INSERT INTO macro_memory (milestone, context) VALUES (?1, ?2)",
-                    (&m, &c),
-                )?;
-                Ok(())
-            }).await?;
-        }
+    /// Add a domain to the allowlist for a scope.
+    pub async fn allow_domain(&self, scope: &str, domain: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let scope = scope.to_string();
+        let domain = domain.to_string();
+        self.db.call(move |conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO network_policy (scope, domain) VALUES (?1, ?2)",
+                [&scope, &domain],
+            )?;
+            Ok(())
+        }).await.map_err(|e| e.into())
+    }
 
-        // Also append to AGENTS.md in the current working directory (the work
-        // root when running in-guest, or the daemon CWD host-side).
-        let append_content = format!("\n## Milestone: {}\n\n{}\n", milestone_str, context_str);
-        match std::fs::read_to_string("AGENTS.md") {
-            Ok(existing) if !existing.contains(&milestone_str) => write_agents_append(append_content)?,
-            Ok(_) => {}
-            Err(_) => write_agents_append(append_content)?,
-        }
+    /// Remove a domain from the allowlist for a scope.
+    pub async fn deny_domain(&self, scope: &str, domain: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let scope = scope.to_string();
+        let domain = domain.to_string();
+        self.db.call(move |conn| {
+            conn.execute(
+                "DELETE FROM network_policy WHERE scope = ?1 AND domain = ?2",
+                [&scope, &domain],
+            )?;
+            Ok(())
+        }).await.map_err(|e| e.into())
+    }
 
-        Ok(())
+    /// List all allowed domains for a scope.
+    pub async fn list_allowed_domains(&self, scope: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let scope = scope.to_string();
+        self.db.call(move |conn| {
+            let mut stmt = conn.prepare("SELECT domain FROM network_policy WHERE scope = ?1 ORDER BY domain")?;
+            let mut rows = stmt.query([&scope])?;
+            let mut domains = Vec::new();
+            while let Some(row) = rows.next()? {
+                domains.push(row.get(0)?);
+            }
+            Ok(domains)
+        }).await.map_err(|e| e.into())
     }
 
     /// Chronological (oldest-first) list of prior milestones (permanent memories).
@@ -126,6 +179,68 @@ impl MemoryEngine {
             mems.reverse();
             Ok(mems)
         }).await.map_err(|e| e.into())
+    }
+
+    /// Log a gatekeeper verdict to the persistent audit trail.
+    pub async fn log_gatekeeper_verdict(&self, tool: &str, allowed: bool, reason: &str, detail: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let tool = tool.to_string();
+        let allowed = allowed.to_string();
+        let reason = reason.to_string();
+        let detail = detail.to_string();
+        self.db.call(move |conn| {
+            conn.execute(
+                "INSERT INTO gatekeeper_audit (tool, allowed, reason, detail) VALUES (?1, ?2, ?3, ?4)",
+                [&tool, &allowed, &reason, &detail],
+            )?;
+            Ok(())
+        }).await.map_err(|e| e.into())
+    }
+
+    /// Get recent gatekeeper audit entries.
+    pub async fn get_gatekeeper_audit(&self, limit: usize) -> Result<Vec<(String, bool, String, String)>, Box<dyn std::error::Error>> {
+        self.db.call(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT tool, allowed, reason, detail FROM gatekeeper_audit ORDER BY timestamp DESC LIMIT ?"
+            )?;
+            let mut rows = stmt.query([limit as i64])?;
+            let mut entries = Vec::new();
+            while let Some(row) = rows.next()? {
+                let tool: String = row.get(0)?;
+                let allowed: String = row.get(1)?;
+                let reason: String = row.get(2)?;
+                let detail: String = row.get(3)?;
+                entries.push((tool, allowed == "true", reason, detail));
+            }
+            entries.reverse();
+            Ok(entries)
+        }).await.map_err(|e| e.into())
+    }
+
+    /// Also append to AGENTS.md in the current working directory (the work
+    /// root when running in-guest, or the daemon CWD host-side).
+    pub async fn log_macro_memory(&self, milestone: &str, context: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let milestone_str = milestone.to_string();
+        let context_str = context.to_string();
+
+        {
+            let (m, c) = (milestone_str.clone(), context_str.clone());
+            self.db.call(move |conn| {
+                conn.execute(
+                    "INSERT INTO macro_memory (milestone, context) VALUES (?1, ?2)",
+                    (&m, &c),
+                )?;
+                Ok(())
+            }).await?;
+        }
+
+        let append_content = format!("\n## Milestone: {}\n\n{}\n", milestone_str, context_str);
+        match std::fs::read_to_string("AGENTS.md") {
+            Ok(existing) if !existing.contains(&milestone_str) => write_agents_append(append_content)?,
+            Ok(_) => {}
+            Err(_) => write_agents_append(append_content)?,
+        }
+
+        Ok(())
     }
 }
 
@@ -190,4 +305,26 @@ pub async fn evaluate_and_process(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_network_policy_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let engine = MemoryEngine::new(db_path.to_str().unwrap()).await.unwrap();
+
+        // Initially not allowed
+        assert!(!engine.is_domain_allowed("global", "example.com").await.unwrap());
+
+        // Allow it
+        engine.allow_domain("global", "example.com").await.unwrap();
+        assert!(engine.is_domain_allowed("global", "example.com").await.unwrap());
+
+        // Different scope not affected
+        assert!(!engine.is_domain_allowed("session:123", "example.com").await.unwrap());
+    }
 }
