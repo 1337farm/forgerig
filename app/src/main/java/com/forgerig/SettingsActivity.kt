@@ -8,6 +8,7 @@ import android.content.res.ColorStateList
 import android.os.Build
 import android.os.Bundle
 import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup
 import android.widget.ArrayAdapter
 import android.widget.Button
@@ -87,14 +88,39 @@ class SettingsActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_YES)
         super.onCreate(savedInstanceState)
+        // The default action bar is light-gray and clashes with the neon
+        // theme: hide it and draw our own title in-layout instead.
+        supportActionBar?.hide()
         registerFinishReceiver()
         val current = SettingsStore.load(this)
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(20), dp(20), dp(20))
-            setBackgroundColor(0xFF1b1f27.toInt())
+            setBackgroundColor(0xFF151221.toInt())
         }
+        root.addView(TextView(this).apply {
+            text = "ForgeRig Settings"
+            textSize = 20f
+            setTextColor(0xFFd946ef.toInt())
+            setPadding(0, 0, 0, dp(4))
+        })
+
+        fun spinnerAdapter(): ArrayAdapter<String> =
+            object : ArrayAdapter<String>(this, android.R.layout.simple_spinner_item, mutableListOf()) {
+                override fun getView(position: Int, convertView: View?, parent: ViewGroup): View =
+                    (super.getView(position, convertView, parent) as TextView).apply {
+                        textSize = 14f
+                        setTextColor(0xFFe6e6e6.toInt())
+                    }
+
+                override fun getDropDownView(position: Int, convertView: View?, parent: ViewGroup): View =
+                    (super.getDropDownView(position, convertView, parent) as TextView).apply {
+                        textSize = 14f
+                        setSingleLine(false)
+                        setTextColor(0xFFe6e6e6.toInt())
+                    }
+            }
 
         fun label(text: String): TextView = TextView(this).apply {
             this.text = text
@@ -105,11 +131,9 @@ class SettingsActivity : AppCompatActivity() {
 
         root.addView(label("Provider"))
         val spinner = Spinner(this).apply {
-            adapter = ArrayAdapter(
-                this@SettingsActivity,
-                android.R.layout.simple_spinner_dropdown_item,
-                providerOptions.map { it.first },
-            )
+            adapter = spinnerAdapter().apply {
+                addAll(providerOptions.map { it.first })
+            }
             val idx = providerOptions.indexOfFirst { it.second == current.provider }
             setSelection(if (idx >= 0) idx else 0)
         }
@@ -135,13 +159,10 @@ class SettingsActivity : AppCompatActivity() {
         val modelFilterEdit = editText("", "Filter models by name…")
         root.addView(modelFilterEdit)
         val modelSpinner = Spinner(this).apply {
-            adapter = ArrayAdapter(
-                this@SettingsActivity,
-                android.R.layout.simple_spinner_dropdown_item,
-                mutableListOf<String>(),
-            )
+            adapter = spinnerAdapter()
         }
         root.addView(modelSpinner)
+        root.addView(modelEdit)
         var refreshingModels = false
         fun refreshModels() {
             if (refreshingModels) return
@@ -184,25 +205,23 @@ class SettingsActivity : AppCompatActivity() {
         })
         root.addView(label("Evaluation model (blank = same as chat)"))
         val evalEdit = editText(current.evalModel, "cheap model for background memory evaluation")
+        root.addView(evalEdit)
         root.addView(label("Base URL (blank = provider default; required for custom)"))
         val urlEdit = editText(current.baseUrl, "https://host/api (OpenAI-compatible)")
+        root.addView(urlEdit)
         root.addView(label("API key"))
         val keyEdit = editText(current.apiKey, "stored encrypted on this device")
+        root.addView(keyEdit)
         root.addView(label("Max output tokens (blank = provider default)"))
         val maxTokensEdit = editText(current.maxTokens, "e.g. 2000").apply {
             inputType = android.text.InputType.TYPE_CLASS_NUMBER
         }
-
-        root.addView(modelEdit)
-        root.addView(evalEdit)
-        root.addView(urlEdit)
-        root.addView(keyEdit)
         root.addView(maxTokensEdit)
         refreshModels()
 
         root.addView(Button(this).apply {
             text = "Save"
-            setBackgroundColor(0xFF3498db.toInt())
+            setBackgroundColor(0xFF9333ea.toInt())
             setTextColor(0xFFFFFFFF.toInt())
             setOnClickListener {
                 SettingsStore.save(
@@ -263,7 +282,7 @@ class SettingsActivity : AppCompatActivity() {
         })
 
         setContentView(ScrollView(this).apply {
-            setBackgroundColor(0xFF1b1f27.toInt())
+            setBackgroundColor(0xFF151221.toInt())
             addView(root)
         })
     }

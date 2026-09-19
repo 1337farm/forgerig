@@ -149,7 +149,21 @@
       var x = document.createElement('button');
       x.className = 'tab-close';
       x.textContent = '×';
-      x.onclick = function (e) { e.stopPropagation(); removeSession(s.id); };
+      // NOTE: window.confirm() is dead in this WebView (no WebChromeClient),
+      // so deletion uses a two-tap arm/disarm on the button itself.
+      x.onclick = function (e) {
+        e.stopPropagation();
+        if (x.getAttribute('data-armed') === '1') {
+          removeSession(s.id);
+        } else {
+          x.setAttribute('data-armed', '1');
+          x.textContent = 'Sure?';
+          setTimeout(function () {
+            x.removeAttribute('data-armed');
+            x.textContent = '×';
+          }, 3000);
+        }
+      };
       el.appendChild(label);
       el.appendChild(x);
       sessionsEl.appendChild(el);
@@ -158,6 +172,7 @@
 
   function openSession(id) {
     activeId = id;
+    renderTabs();
     call('session_history', { session_id: id }, function (err, s) {
       if (err || !s) return;
       activeThread = s.messages || [];
@@ -181,7 +196,6 @@
   }
 
   function removeSession(id) {
-    if (!confirm('Delete this conversation?')) return;
     call('session_delete', { session_id: id }, function () {
       sessions = sessions.filter(function (s) { return s.id !== id; });
       if (activeId === id) { activeId = null; activeThread = []; }
