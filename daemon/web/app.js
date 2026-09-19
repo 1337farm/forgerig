@@ -97,7 +97,7 @@
     if (d.method === 'chat_chunk') onStreamChunk(sid, p.delta || '');
     else if (d.method === 'chat_phase') onStreamPhase(sid, p.phase || 'thinking');
     else if (d.method === 'chat_tool') onStreamTool(sid, p);
-    else if (d.method === 'chat_done') onStreamDone(sid);
+    else if (d.method === 'chat_done') onStreamDone(sid, p.reply || '');
     else if (d.method === 'chat_error') {
       failFlight(sid, (p.error && (p.error.message || p.error)) || p.error || 'unknown error');
     }
@@ -190,7 +190,7 @@
     scrollToBottom();
   }
 
-  function onStreamDone(sid) {
+  function onStreamDone(sid, reply) {
     if (flightTimer[sid]) { clearTimeout(flightTimer[sid]); delete flightTimer[sid]; }
     delete inflight[sid];
     delete streamBuf[sid];
@@ -198,9 +198,26 @@
     delete pendEl[sid];
     if (currentFlight === sid) currentFlight = null;
     updateSendButton();
+    reportAgentStatus('Container running');
+    // Ping the Android notification drawer when the app is backgrounded so
+    // the user knows the agent is done and ready for more messages.
+    try {
+      if (typeof document !== 'undefined' && document.hidden &&
+          window.NativeHost && window.NativeHost.notifyAgentDone) {
+        window.NativeHost.notifyAgentDone(String(reply || '').slice(0, 240));
+      }
+    } catch (_) {}
     if (!activeId || activeId === sid) openSession(sid);
     else { tabFlag[sid] = 'unread'; refreshSessionsAfterChat(); }
     drainQueue();
+  }
+
+  function reportAgentStatus(text) {
+    try {
+      if (window.NativeHost && window.NativeHost.reportAgentStatus) {
+        window.NativeHost.reportAgentStatus(text);
+      }
+    } catch (_) {}
   }
 
   // ---------- state ----------
@@ -276,6 +293,7 @@
       if (err || !list) return;
       sessions = list;
       renderTabs();
+      updateHistoryBadge();
       // Open the most recent session if none is active.
       if (!activeId && sessions.length) openSession(sessions[0].id);
     });
@@ -402,6 +420,10 @@
       if (activeId === id) { activeId = null; activeThread = []; }
       renderTabs();
       render();
+      // Live history: if the closed-tabs panel is open, refresh it so the
+      // just-closed tab appears without reopening the clock.
+      if (closedPanel.style.display === 'block') renderClosedList();
+      else updateHistoryBadge();
     });
   }
 
@@ -434,6 +456,7 @@
     currentFlight = sid;
     renderTabs();
     updateSendButton();
+    reportAgentStatus('Agent working…');
     // Client-side bound matching the server's 300s cap: a hung reply
     // becomes a recoverable error instead of a stuck pending bubble.
     flightTimer[sid] = setTimeout(function () {
@@ -549,6 +572,9 @@
 
     var meta = document.createElement('div');
     meta.className = 'meta';
+    // Action menu (Copy / Fork / Undo) stays hidden until the message is
+    // tapped: single tap toggles it, keeping the thread clean.
+    meta.style.display = 'none';
 
     if (turn.kind === 'assistant' && visibleIndex >= 0) {
       var fork = document.createElement('button');
@@ -571,13 +597,28 @@
       meta.appendChild(undo);
     }
 
-    wrap.onclick = function () { copyText(turn.content); };
-    wrap.title = 'Tap to copy';
+    wrap.onclick = function (e) {
+      if (e && e.stopPropagation) e.stopPropagation();
+      toggleMetaMenu(wrap, meta);
+    };
+    wrap.title = 'Tap for actions';
 
     wrap.appendChild(head);
     wrap.appendChild(body);
     wrap.appendChild(meta);
     return wrap;
+  }
+
+  // Single-tap menu: reveal this message's actions, collapse all others.
+  function toggleMetaMenu(wrap, meta) {
+    var show = meta.style.display === 'none';
+    var kids = messagesEl.children || [];
+    for (var i = 0; i < kids.length; i++) {
+      var m = childByClass(kids[i], 'meta');
+      if (m) m.style.display = 'none';
+    }
+    void wrap;
+    meta.style.display = show ? 'flex' : 'none';
   }
 
   function copyText(text) {
@@ -678,12 +719,19 @@
     });
   }
 
-  // ---------- wire events ----------
-  newBtn.onclick = newSession;
-  historyBtn.onclick = function () {
-    if (closedPanel.style.display === 'block') { closedPanel.style.display = 'none'; return; }
+  // History clock: badge shows the closed-tab count; the panel refreshes
+  // live on close/restore instead of only when opened.
+  function updateHistoryBadge() {
     call('session_closed', {}, function (err, list) {
       if (err || !list) return;
+      historyBtn.textContent = list.length ? ('🕘 ' + list.length) : '🕘';
+    });
+  }
+
+  function renderClosedList() {
+    call('session_closed', {}, function (err, list) {
+      if (err || !list) return;
+      historyBtn.textContent = list.length ? ('🕘 ' + list.length) : '🕘';
       closedList.innerHTML = '';
       if (!list.length) {
         var em = document.createElement('div');
@@ -704,6 +752,7 @@
             closedPanel.style.display = 'none';
             sessions.unshift({ id: f.id, title: f.title, message_count: (f.messages || []).length });
             openSession(f.id);
+            updateHistoryBadge();
           });
         };
         row.appendChild(t);
@@ -712,6 +761,12 @@
       });
       closedPanel.style.display = 'block';
     });
+  }
+  // ---------- wire events ----------
+  newBtn.onclick = newSession;
+  historyBtn.onclick = function () {
+    if (closedPanel.style.display === 'block') { closedPanel.style.display = 'none'; return; }
+    renderClosedList();
   };
   sendBtn.onclick = function () {
     if (currentFlight && inflight[currentFlight]) {
@@ -744,6 +799,15 @@
       }
     }
   });
+
+  // Bridge for Android notification replies: the app injects the reply
+  // text here and it flows through the normal queue/send path.
+  window.ForgeRigReply = function (text) {
+    if (!text || !String(text).trim()) return;
+    composerEl.value = String(text);
+    queueMessage(composerEl.value);
+    try { composerEl.focus(); } catch (_) {}
+  };
 
   // Re-render when the daemon connection drops/returns so a reconnected page
   // re-syncs the active session.
