@@ -178,8 +178,22 @@
     return refs;
   }
 
+  // Last phase label per session, so streamed chunks can re-render the
+  // pinned header (label + triple-dot animation) above the tokens without
+  // needing DOM queries the test stub does not implement.
+  var phaseLabel = {}; // sid -> 'Thinking' | 'Reviewing' | 'Researching' | 'Ready'
+
+  function phaseHeaderHtml(sid) {
+    var label = phaseLabel[sid] || 'Thinking';
+    return '<span class="phase">' + label +
+      '<span class="typing"><span></span><span></span><span></span></span></span>';
+  }
+
   function onStreamPhase(sid, phase) {
     if (stoppedSid[sid]) return;
+    phaseLabel[sid] = phase === 'reviewing' ? 'Reviewing' :
+      phase === 'researching' ? 'Researching' :
+      phase === 'ready' ? 'Ready' : 'Thinking';
     if (activeId !== sid) {
       if (!tabFlag[sid]) tabFlag[sid] = 'unread';
       renderTabs();
@@ -187,10 +201,11 @@
     }
     var refs = streamBubble(sid);
     if (!refs || !refs.body) return;
-    var label = phase === 'reviewing' ? 'Reviewing…' :
-      phase === 'researching' ? 'Researching…' :
-      phase === 'ready' ? 'Ready' : 'Thinking…';
-    refs.body.innerHTML = '<span class="phase">' + label + '</span>';
+    // Keep the phase label pinned above the streamed tokens with the
+    // triple-dot pending animation the whole time tokens flow.
+    var text = streamBuf[sid] ? Markdown.render(streamBuf[sid]) : '';
+    refs.body.innerHTML = phaseHeaderHtml(sid) +
+      (text ? '<div class="stream-text">' + text + '</div>' : '');
     scrollToBottom();
   }
 
@@ -203,7 +218,11 @@
       return;
     }
     var refs = streamBubble(sid);
-    if (refs.body) refs.body.innerHTML = Markdown.render(streamBuf[sid]);
+    // Preserve the pinned phase header while tokens stream underneath it.
+    if (refs.body) {
+      refs.body.innerHTML = phaseHeaderHtml(sid) +
+        '<div class="stream-text">' + Markdown.render(streamBuf[sid]) + '</div>';
+    }
     scrollToBottom();
   }
 
@@ -238,6 +257,7 @@
   function teardownLive(sid) {
     if (flightTimer[sid]) { clearTimeout(flightTimer[sid]); delete flightTimer[sid]; }
     delete streamBuf[sid];
+    delete phaseLabel[sid];
     var refs = streamEls[sid];
     if (refs && refs.wrap) removeNode(refs.wrap);
     delete streamEls[sid];
@@ -264,6 +284,7 @@
     if (flightTimer[sid]) { clearTimeout(flightTimer[sid]); delete flightTimer[sid]; }
     delete inflight[sid];
     delete streamBuf[sid];
+    delete phaseLabel[sid];
     delete streamEls[sid];
     delete pendEl[sid];
     if (currentFlight === sid) currentFlight = null;

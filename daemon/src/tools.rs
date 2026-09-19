@@ -70,7 +70,18 @@ fn build_cmd_binds(command: &str, sandbox: bool, binds: &[String]) -> Command {
     let rootfs = std::env::var("CONTAINER_ROOTFS").ok();
     if let (Some(proot), Some(rootfs)) = (proot, rootfs) {
         let mut cmd = Command::new(&proot);
-        cmd.kill_on_drop(true)
+        cmd.kill_on_drop(true);
+        // proot itself is dynamically linked (DT_NEEDED libtalloc.so.2 +
+        // libandroid-shmem.so with a Termux RUNPATH that does not exist on
+        // device). The daemon inherits the app's LD_LIBRARY_PATH, and
+        // .env_clear() below would drop it — so re-attach it explicitly.
+        // Without this, execve fails with: library "libtalloc.so.2" not found.
+        if let Ok(ld) = std::env::var("LD_LIBRARY_PATH") {
+            if !ld.is_empty() {
+                cmd.env("LD_LIBRARY_PATH", ld);
+            }
+        }
+        cmd
             // Never leak host secrets into the guest: the daemon inherits
             // FORGERIG_* provider keys, but guest shells only get an
             // allowlisted env. Brokered network (net_fetch) attaches keys
