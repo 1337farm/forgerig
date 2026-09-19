@@ -288,6 +288,17 @@ fn dns_probe(host: &str) {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
+    if let Err(e) = run().await {
+        // Exact startup failure with its chain: the app surfaces this line
+        // in the install log, so a dead daemon is diagnosable on-device.
+        eprintln!("daemon: FATAL startup error: {e:#}");
+        return Err(e);
+    }
+    Ok(())
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
+
     dns_probe("github.com");
     // Termux-style fallback: if the daemon cannot resolve, at least surface
     // that fact for every HTTP-dependent feature up-front.
@@ -296,11 +307,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = format!("127.0.0.1:{}", port);
 
     let backend = Arc::new(provider::Backend::resolve().await);
-    let memory_engine = Arc::new(MemoryEngine::new("oss_memory.db").await?);
+    let memory_engine = Arc::new(
+        MemoryEngine::new("oss_memory.db")
+            .await
+            .map_err(|e| format!("open memory db oss_memory.db: {e}"))?,
+    );
     let sessions = Arc::new(sessions::SessionManager::new());
     println!("Listening on: {} ({})", addr, backend.describe());
 
-    let listener = TcpListener::bind(&addr).await?;
+    let listener = TcpListener::bind(&addr)
+        .await
+        .map_err(|e| format!("bind {addr}: {e}"))?;
 
     while let Ok((stream, _)) = listener.accept().await {
         let backend = Arc::clone(&backend);

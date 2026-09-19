@@ -34,6 +34,22 @@ jobs:
       - name: Run Android unit tests
         run: ./gradlew :app:testDebugUnitTest -PskipContainerAssetsCheck --stacktrace
 
+      - name: Set up Rust
+        run: |
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Run Rust unit tests (daemon + sentinel-engine)
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          (cd daemon && cargo test --locked)
+          (cd sentinel-engine && cargo test --release --lib)
+
+      - name: Run Web UI unit tests
+        run: node --test daemon/web/tests/markdown.test.js daemon/web/tests/state.test.js daemon/web/tests/tabflow.test.js
+
   package-apk:
     name: apk
     runs-on: ubuntu-latest
