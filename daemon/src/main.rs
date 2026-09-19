@@ -122,7 +122,15 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
                             });
                             ok(json!({ "reply": completion, "session_id": sid }), req.id)
                         }
-                        Err(e) => { eprintln!("chat: error: {}", e); err(-32603, format!("Agent error: {}", e), req.id) }
+                        Err(e) => {
+                            eprintln!("chat: error: {}", e);
+                            // Persist the failed turn anyway: the user DID say
+                            // it, so tab history/titles stay truthful and the
+                            // next send continues the thread instead of
+                            // silently dropping the message.
+                            sessions.set_messages(&sid, messages);
+                            err(-32603, format!("Agent error: {}", e), req.id)
+                        }
                     }
                 }
                 _ => err(-32602, "Missing 'prompt' in params".into(), req.id),

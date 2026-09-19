@@ -520,12 +520,11 @@ async fn probe_lean_version_limited(timeout: Duration) -> Option<String> {
 }
 
 /// Background warm-up, kicked off once per daemon process once lean is present:
-/// first populate the page cache with the big shared libs (so the runtime
-/// loader's mmaps fault in from RAM instead of cold storage — the likely bulk
-/// of the cold 60s+ cost), then run a warm `lean --version` with a generous cap
-/// to capture a real banner and measure the cache-warm cost. This tells us on
-/// the log whether the bottleneck is storage (warm run is fast) or ptrace.
-async fn warm_lean() {
+/// always populate the page cache with the big shared libs (sub-second), and
+/// only run the slow `lean --version` probe when no banner is cached yet —
+/// under proot that probe can take minutes, and re-running it on every
+/// process start is what kept the UI bar spinning.
+async fn warm_lean(need_probe: bool) {
     let t = Instant::now();
     let r = tools::run_trusted_limited(
         "cat /usr/local/lib/lean/*.so* > /dev/null 2>&1 || true",
@@ -537,7 +536,11 @@ async fn warm_lean() {
         t.elapsed().as_secs_f64(),
         r.exit_code
     );
-    let _ = probe_lean_version_limited(LEAN_WARM_PROBE_TIMEOUT).await;
+    if need_probe {
+        let _ = probe_lean_version_limited(LEAN_WARM_PROBE_TIMEOUT).await;
+    } else {
+        eprintln!("lean warm: banner already cached, skipping slow version probe");
+    }
 }
 
 /// Whether the guest has a Lean binary and its cached version banner, if any.
@@ -559,8 +562,9 @@ pub async fn status() -> LeanStatus {
     if !LEAN_WARMED.swap(true, Ordering::Relaxed) {
         LEAN_WARMING.store(true, Ordering::Relaxed);
         LEAN_WARM_STARTED_MS.store(now_ms(), Ordering::Relaxed);
+        let need_probe = cached_lean_version().is_none();
         tokio::spawn(async move {
-            warm_lean().await;
+            warm_lean(need_probe).await;
             LEAN_WARMING.store(false, Ordering::Relaxed);
         });
     }

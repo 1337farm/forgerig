@@ -169,8 +169,13 @@ class ContainerService : Service() {
     private fun acquireLocks() {
         try {
             val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+            // Gatekeeper-style hold: no timeout, released only in onDestroy.
+            // A timed lock lets Doze pause the container mid-run exactly when
+            // the user looks away; the service (START_STICKY + ongoing
+            // notification + dataSync type) already owns the lifetime, so the
+            // lock must match it.
             wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ForgeRig::ContainerWakeLock").apply {
-                acquire(60 * 60 * 1000L)
+                acquire()
             }
 
             val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
