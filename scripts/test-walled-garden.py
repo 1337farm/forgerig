@@ -366,6 +366,52 @@ async def test_secret_scrubbing(tester):
     print("✓ Chat with secret handled")
 
 
+async def test_team_sessions(tester):
+    print("\n=== Testing team sessions (small-team model) ===")
+
+    # Create a parent team session
+    parent = await tester.rpc("session_create", {})
+    parent_id = parent.get("id")
+    assert parent_id, f"No id in session_create: {parent}"
+    assert "workspace" in parent, f"No workspace in session_create: {parent}"
+    assert parent["workspace"].startswith("/root/workspace/"), parent
+    print(f"✓ Team root created ({parent_id})")
+
+    # Spawn a sub-agent member
+    child = await tester.rpc("session_spawn", {
+        "parent_session_id": parent_id,
+        "role": "backend",
+        "goal": "Build the API",
+    })
+    child_id = child.get("id")
+    assert child_id and child_id != parent_id, f"Bad spawn: {child}"
+    assert child.get("parent_id") == parent_id, child
+    assert child.get("role") == "backend", child
+    assert child["workspace"].startswith("/root/workspace/"), child
+    assert child["workspace"] != parent["workspace"], "member must not share root workspace"
+    print(f"✓ Sub-agent spawned ({child_id}, workspace isolated)")
+
+    # Children listing shows the member
+    kids = await tester.rpc("session_children", {"parent_session_id": parent_id})
+    assert isinstance(kids, list) and len(kids) == 1, f"Bad children: {kids}"
+    assert kids[0].get("id") == child_id, kids
+    print("✓ Children listing shows member")
+
+    # Spawn validation: unknown parent / blank role refused
+    try:
+        await tester.rpc("session_spawn", {"parent_session_id": "nope", "role": "qa"})
+        assert False, "spawn under unknown parent should fail"
+    except Exception:
+        print("✓ Unknown parent refused")
+
+    # Merge rolls the member's work into the team goal and archives it
+    merged = await tester.rpc("session_merge", {"child_session_id": child_id})
+    assert merged.get("id") == parent_id, f"Bad merge: {merged}"
+    kids = await tester.rpc("session_children", {"parent_session_id": parent_id})
+    assert kids == [], f"merged child still listed: {kids}"
+    print("✓ Merge rolls member into team goal, archives child")
+
+
 async def main():
     print("=" * 60)
     print("FORGERIG WALLED GARDEN GATE TEST SUITE")
@@ -390,6 +436,7 @@ async def main():
         await test_network_policy(tester)
         await test_net_fetch(tester)
         await test_secret_scrubbing(tester)
+        await test_team_sessions(tester)
 
         print("\n" + "=" * 60)
         print("ALL GATE TESTS PASSED ✓")

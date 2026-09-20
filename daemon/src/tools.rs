@@ -197,6 +197,28 @@ pub async fn run_trusted_binds_limited(command: &str, binds: &[String], limit: D
     run_shell_binds(command, false, limit, binds).await
 }
 
+/// Best-effort creation of one team member's isolated guest workspace.
+/// Called on session create/spawn so the directory exists before any tool
+/// runs there. Never fails the caller: a missing dir surfaces as an ordinary
+/// tool error later, and the gatekeeper still jails every path.
+/// Skipped when the daemon runs without a proot guest (local dev / tests):
+/// there the "guest" paths don't exist and mkdir would pollute the host.
+pub async fn ensure_session_workspace(session_id: &str) {
+    if std::env::var("CONTAINER_ROOTFS").ok().filter(|v| !v.is_empty()).is_none() {
+        return;
+    }
+    let dir = crate::gatekeeper::session_workspace(session_id);
+    // The dir is gatekeeper-derived (sanitized), but quote anyway.
+    let r = run_trusted_limited(
+        &format!("mkdir -p {}", sh_quote(&dir)),
+        Duration::from_secs(30),
+    )
+    .await;
+    if r.exit_code != Some(0) {
+        eprintln!("ensure_session_workspace: mkdir {} exit {:?}", dir, r.exit_code);
+    }
+}
+
 /// Lean typecheck runner: jailed to the workspace like sandboxed shells, but
 /// without the 512 MiB `ulimit -v` cap (Lean loads ~500 MB of shared libs and
 /// would die under it). Wall-clock still bounded; secrets never enter the guest.

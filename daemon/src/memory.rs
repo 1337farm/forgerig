@@ -21,6 +21,19 @@ impl MemoryEngine {
                 )",
                 [],
             )?;
+            // Team sessions: partition traces per session so sub-agent
+            // members never read each other's raw context. The orchestrator
+            // aggregates explicitly; the global evaluator keeps working over
+            // the unpartitioned view. `IF NOT EXISTS`-style migration: ignore
+            // the error when the column already exists on old databases.
+            let _ = conn.execute(
+                "ALTER TABLE execution_traces ADD COLUMN session_id TEXT NOT NULL DEFAULT ''",
+                [],
+            );
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_traces_session ON execution_traces(session_id, timestamp)",
+                [],
+            )?;
 
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS macro_memory (
@@ -66,14 +79,18 @@ impl MemoryEngine {
         })
     }
 
-    pub async fn log_trace(&self, prompt: &str, completion: &str) -> Result<(), Box<dyn std::error::Error>> {
+    /// Log one turn, partitioned by session. Each team member's raw context
+    /// stays in its own partition; cross-member insight flows only through
+    /// explicit merges and the shared macro-memory the evaluator distills.
+    pub async fn log_trace(&self, session_id: &str, prompt: &str, completion: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let session_str = session_id.to_string();
         let prompt_str = prompt.to_string();
         let completion_str = completion.to_string();
 
         self.db.call(move |conn| {
             conn.execute(
-                "INSERT INTO execution_traces (prompt, completion) VALUES (?1, ?2)",
-                (&prompt_str, &completion_str),
+                "INSERT INTO execution_traces (session_id, prompt, completion) VALUES (?1, ?2, ?3)",
+                (&session_str, &prompt_str, &completion_str),
             )?;
             Ok(())
         }).await?;
@@ -84,6 +101,26 @@ impl MemoryEngine {
         self.db.call(move |conn| {
             let mut stmt = conn.prepare("SELECT id, prompt, completion FROM execution_traces ORDER BY timestamp DESC LIMIT ?")?;
             let mut rows = stmt.query([limit as i64])?;
+
+            let mut traces = Vec::new();
+            while let Some(row) = rows.next()? {
+                let id: i64 = row.get(0)?;
+                let prompt: String = row.get(1)?;
+                let completion: String = row.get(2)?;
+                traces.push((id, prompt, completion));
+            }
+            // Reverse so they are in chronological order
+            traces.reverse();
+            Ok(traces)
+        }).await.map_err(|e| e.into())
+    }
+
+    /// Chronological (oldest-first) traces for one team member.
+    pub async fn get_recent_traces_for_session(&self, session_id: &str, limit: usize) -> Result<Vec<(i64, String, String)>, Box<dyn std::error::Error>> {
+        let session_str = session_id.to_string();
+        self.db.call(move |conn| {
+            let mut stmt = conn.prepare("SELECT id, prompt, completion FROM execution_traces WHERE session_id = ? ORDER BY timestamp DESC LIMIT ?")?;
+            let mut rows = stmt.query(rusqlite::params![session_str, limit as i64])?;
 
             let mut traces = Vec::new();
             while let Some(row) = rows.next()? {
@@ -310,6 +347,26 @@ pub async fn evaluate_and_process(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn traces_partition_by_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let engine = MemoryEngine::new(db_path.to_str().unwrap()).await.unwrap();
+
+        engine.log_trace("s1", "p1", "c1").await.unwrap();
+        engine.log_trace("s2", "p2", "c2").await.unwrap();
+        engine.log_trace("s1", "p3", "c3").await.unwrap();
+
+        let s1 = engine.get_recent_traces_for_session("s1", 10).await.unwrap();
+        assert_eq!(s1.len(), 2);
+        assert_eq!(s1[0].1, "p1");
+        assert_eq!(s1[1].1, "p3");
+        let s2 = engine.get_recent_traces_for_session("s2", 10).await.unwrap();
+        assert_eq!(s2.len(), 1);
+        // Global evaluator view still sees everything.
+        assert_eq!(engine.get_recent_traces(10).await.unwrap().len(), 3);
+    }
 
     #[tokio::test]
     async fn test_network_policy_allowlist() {

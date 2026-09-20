@@ -171,7 +171,7 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
                             Ok(completion) => {
                                 eprintln!("chat: completion (len={})", completion.len());
                                 let (sc, _) = gatekeeper::scrub_secrets(&completion);
-                                let _ = memory2.log_trace(&p, &sc).await;
+                                let _ = memory2.log_trace(&sid2, &p, &sc).await;
                                 // Persist the extended thread as the reusable session cache.
                                 sessions2.set_messages(&sid2, messages);
                                 // Detached: every 5th trace, evaluate recent traces for
@@ -230,7 +230,56 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
         "session_list" => ok(json!(sessions.list()), req.id),
         "session_create" => {
             let s = sessions.create(provider::system_message());
-            ok(json!({ "id": s.id, "title": s.title, "messages": s.thread() }), req.id)
+            tools::ensure_session_workspace(&s.id).await;
+            ok(json!({ "id": s.id, "title": s.title, "messages": s.thread(), "workspace": s.workspace() }), req.id)
+        }
+        "session_spawn" => {
+            let parent = req.params.as_ref().and_then(|p| p.get("parent_session_id")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
+            let role = req.params.as_ref().and_then(|p| p.get("role")).and_then(|s| s.as_str()).unwrap_or("member").to_string();
+            let goal = req.params.as_ref().and_then(|p| p.get("goal")).and_then(|s| s.as_str()).unwrap_or("").to_string();
+            if parent.is_empty() {
+                return err(-32602, "Missing 'parent_session_id' in params".into(), req.id);
+            }
+            if role.trim().is_empty() || role.len() > 40 {
+                return err(-32602, "role must be 1-40 chars".into(), req.id);
+            }
+            if goal.len() > 2000 {
+                return err(-32602, "goal too long (2000 chars max)".into(), req.id);
+            }
+            match sessions.spawn_subagent(&parent, &role, &goal, system_message_with_memory(memory).await) {
+                Some(s) => {
+                    tools::ensure_session_workspace(&s.id).await;
+                    gatekeeper::log_verdict("session_spawn", true, "sub-agent spawned", &format!("{parent} -> {}", s.id));
+                    ok(json!({ "id": s.id, "title": s.title, "parent_id": s.parent_id, "role": s.role, "goal": s.goal, "workspace": s.workspace() }), req.id)
+                }
+                None => {
+                    gatekeeper::log_verdict("session_spawn", false, "unknown parent or blank role", &parent);
+                    err(-32602, format!("cannot spawn under unknown session '{parent}'"), req.id)
+                }
+            }
+        }
+        "session_children" => {
+            let parent = req.params.as_ref().and_then(|p| p.get("parent_session_id")).and_then(|s| s.as_str()).unwrap_or_default();
+            if !sessions.exists(parent) {
+                return err(-32602, format!("unknown session '{parent}'"), req.id);
+            }
+            ok(json!(sessions.subagents(parent)), req.id)
+        }
+        "session_merge" => {
+            let child = req.params.as_ref().and_then(|p| p.get("child_session_id")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
+            if child.is_empty() {
+                return err(-32602, "Missing 'child_session_id' in params".into(), req.id);
+            }
+            match sessions.merge_child(&child) {
+                Some(p) => {
+                    gatekeeper::log_verdict("session_merge", true, "sub-agent merged", &format!("{child} -> {}", p.id));
+                    ok(json!({ "id": p.id, "title": p.title, "messages": p.thread(), "archived_child": child }), req.id)
+                }
+                None => {
+                    gatekeeper::log_verdict("session_merge", false, "unknown/archived child or missing parent", &child);
+                    err(-32602, format!("cannot merge unknown session '{child}'"), req.id)
+                }
+            }
         }
         "session_history" => {
             let id = req.params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str()).unwrap_or_default();
@@ -310,6 +359,19 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
         "lean_provision" => {
             let message = lean::kick_off_provision().await;
             ok(json!({ "message": message }), req.id)
+        }
+        "client_error" => {
+            // WebView JS/HTML errors surfaced by the UI. Written to stderr
+            // so the app pipes them into the shared Downloads error log —
+            // on-device JS failures are otherwise invisible.
+            let p = req.params.as_ref();
+            let kind = p.and_then(|x| x.get("kind")).and_then(|x| x.as_str()).unwrap_or("js");
+            let message = p.and_then(|x| x.get("message")).and_then(|x| x.as_str()).unwrap_or("(no message)");
+            let stack = p.and_then(|x| x.get("stack")).and_then(|x| x.as_str()).unwrap_or("");
+            let url = p.and_then(|x| x.get("url")).and_then(|x| x.as_str()).unwrap_or("");
+            let line = p.and_then(|x| x.get("line")).and_then(|x| x.as_u64()).unwrap_or(0);
+            eprintln!("client error [{kind}] {message} ({url}:{line}){stack}");
+            ok(json!({ "logged": true }), req.id)
         }
         "lean" => {
             let file = req.params.as_ref().and_then(|p| p.get("file").and_then(|f| f.as_str())).map(|s| s.trim().to_string());
