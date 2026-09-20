@@ -267,9 +267,6 @@ class SettingsActivity : AppCompatActivity() {
         }
 
         fun fetchModelsFor(provider: String, base: String, key: String): List<String> {
-            // NVIDIA publishes no model-list endpoint; its public catalog lives
-            // in the NIM docs. Keep the curated NIM list (no network call).
-            if (provider == "nvidia") return emptyList()
             if (provider == "custom" && base.isEmpty()) return emptyList()
             val (url, auth) = when (provider) {
                 "gemini" -> "${base.trimEnd('/')}/v1beta/models?key=$key" to null
