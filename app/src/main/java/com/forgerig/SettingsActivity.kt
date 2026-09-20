@@ -100,8 +100,39 @@ class SettingsActivity : AppCompatActivity() {
         "ollama" to "http://localhost:11434",
     )
 
-    // Live-fetched model IDs merged over the curated catalog (per provider).
+    private companion object {
+        const val EXTRA_MODELS_PREFS = "forgerig_extra_models"
+    }
+
+    // Live-fetched model IDs merged over the curated catalog (per provider)
+    // and persisted so a restart does not lose provider discovery.
     private val extraModels: MutableMap<String, MutableList<String>> = mutableMapOf()
+
+    private fun loadExtraModels() {
+        val stored = getSharedPreferences(EXTRA_MODELS_PREFS, MODE_PRIVATE)
+            .getStringSet("extra_models", emptySet()) ?: emptySet()
+        for (entry in stored.sorted()) {
+            val separator = entry.indexOf('\u0001')
+            if (separator <= 0 || separator >= entry.length - 1) continue
+            val provider = entry.substring(0, separator)
+            val model = entry.substring(separator + 1)
+            if (model.isNotEmpty()) extraModels.getOrPut(provider) { mutableListOf() }.addIfAbsent(model)
+        }
+    }
+
+    private fun persistExtraModels() {
+        val flattened = extraModels.flatMap { (provider, models) ->
+            models.map { "$provider\u0001$it" }
+        }.toSet()
+        getSharedPreferences(EXTRA_MODELS_PREFS, MODE_PRIVATE)
+            .edit()
+            .putStringSet("extra_models", flattened)
+            .apply()
+    }
+
+    private fun MutableList<String>.addIfAbsent(model: String) {
+        if (!contains(model)) add(model)
+    }
 
     private val finishReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -131,6 +162,7 @@ class SettingsActivity : AppCompatActivity() {
         registerFinishReceiver()
 
         val current = SettingsStore.load(this)
+        loadExtraModels()
 
         val scroll = ScrollView(this)
         val root = LinearLayout(this).apply {
@@ -267,38 +299,16 @@ class SettingsActivity : AppCompatActivity() {
         }
 
         fun fetchModelsFor(provider: String, base: String, key: String): List<String> {
-            if (provider == "custom" && base.isEmpty()) return emptyList()
-            val (url, auth) = when (provider) {
-                "gemini" -> "${base.trimEnd('/')}/v1beta/models?key=$key" to null
-                "ollama" -> "${base.trimEnd('/')}/api/tags" to null
-                else -> "${base.trimEnd('/')}/v1/models" to key.ifEmpty { null }
-            }
-            val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+            val query = ModelDiscovery.buildQuery(provider, base, key)
+                ?: return emptyList()
+            val conn = java.net.URL(query.url).openConnection() as java.net.HttpURLConnection
             try {
                 conn.connectTimeout = 15000
                 conn.readTimeout = 15000
-                if (auth != null) conn.setRequestProperty("Authorization", "Bearer $auth")
+                if (query.auth != null) conn.setRequestProperty("Authorization", "Bearer ${query.auth}")
                 if (conn.responseCode !in 200..299) throw java.io.IOException("HTTP ${conn.responseCode}")
                 val body = conn.inputStream.bufferedReader().readText()
-                val json = org.json.JSONObject(body)
-                val ids = mutableListOf<String>()
-                if (provider == "ollama") {
-                    val arr = json.optJSONArray("models") ?: org.json.JSONArray()
-                    for (i in 0 until arr.length()) {
-                        arr.optJSONObject(i)?.optString("name")?.takeIf { it.isNotEmpty() }?.let { ids.add(it) }
-                    }
-                } else if (provider == "gemini") {
-                    val arr = json.optJSONArray("models") ?: org.json.JSONArray()
-                    for (i in 0 until arr.length()) {
-                        arr.optJSONObject(i)?.optString("name")?.removePrefix("models/")?.takeIf { it.isNotEmpty() }?.let { ids.add(it) }
-                    }
-                } else {
-                    val arr = json.optJSONArray("data") ?: org.json.JSONArray()
-                    for (i in 0 until arr.length()) {
-                        arr.optJSONObject(i)?.optString("id")?.takeIf { it.isNotEmpty() }?.let { ids.add(it) }
-                    }
-                }
-                return ids
+                return ModelDiscovery.parseModelIds(provider, body)
             } finally {
                 conn.disconnect()
             }
@@ -324,12 +334,12 @@ class SettingsActivity : AppCompatActivity() {
                             val ids = fetchModelsFor(code, base, key)
                             totalSeen += ids.size
                             val known = extraModels.getOrPut(code) { mutableListOf() }
-                            for (id in ids.sorted()) {
-                                if ((modelCatalog[code] ?: emptyList()).none { it.name == id } && !known.contains(id)) {
-                                    known.add(id)
-                                    totalAdded++
-                                }
-                            }
+                            val curatedNames = (modelCatalog[code] ?: emptyList()).map { it.name }
+                            val merged = ModelDiscovery.mergeDiscovered(curatedNames, ids)
+                            val newOnly = merged.filter { it !in curatedNames && it !in known }
+                            known.addAll(newOnly)
+                            totalAdded += newOnly.size
+                            persistExtraModels()
                         } catch (e: Exception) {
                             failures.add("$code: ${e.message}")
                             AssetExtractor.logShared(this, "WARNING: model refresh failed for $code | $e")
