@@ -342,6 +342,28 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
                 _ => err(-32602, "Missing 'input' in params (and either 'wat' or 'base64_wasm')".into(), req.id),
             }
         }
+        "net_fetch" => {
+            let args = req.params.as_ref().and_then(|p| {
+                let url = p.get("url").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let sha256 = p.get("sha256").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let max_bytes = p.get("max_bytes").and_then(|v| v.as_u64()).unwrap_or(2 * 1024 * 1024);
+                let scope = p.get("scope").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| "global".to_string());
+                if url.is_none() {
+                    return None;
+                }
+                Some((net_fetch::NetFetchArgs { url: url.unwrap(), sha256, max_bytes: max_bytes as usize }, scope))
+            });
+            match args {
+                Some((args, scope)) => {
+                    let tool = net_fetch::NetFetchTool::new(memory.clone(), scope);
+                    match tool.call(args).await {
+                        Ok(result) => ok(json!({ "url": result.url, "status": result.status, "content_type": result.content_type, "body": result.body, "truncated": result.truncated, "sha256": result.sha256 }), req.id),
+                        Err(e) => err(-32603, format!("Net fetch error: {e}"), req.id),
+                    }
+                }
+                _ => err(-32602, "Missing 'url' in params".into(), req.id),
+            }
+        }
         "ingest" => {
             let path = req.params.as_ref().and_then(|p| p.get("workspace_path").and_then(|f| f.as_str())).map(|s| s.trim().to_string());
             match path {

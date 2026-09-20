@@ -160,22 +160,18 @@ impl Tool for NetFetchTool {
             return Err(NetFetchError::Http(format!("HTTP {}", status)));
         }
 
-        // Read with size cap.
+        // Read with size cap. The SHA (when provided) is always verified
+        // against the FULL response body; truncation for model context
+        // happens afterwards so a truncated hash can never pass verification.
         let max_bytes = args.max_bytes.min(MAX_FETCH_BYTES);
         let bytes = resp.bytes().await.map_err(|e| NetFetchError::Network(e.to_string()))?;
-
-        if bytes.len() > max_bytes {
-            gatekeeper::log_verdict("net_fetch", false, "size-exceeded", &format!("{} > {}", bytes.len(), max_bytes));
-            let _ = self.memory.log_gatekeeper_verdict("net_fetch", false, "size-exceeded", url).await;
-            return Err(NetFetchError::SizeMismatch(max_bytes as u64, bytes.len() as u64));
-        }
 
         let mut hasher = sha2::Sha256::new();
         hasher.update(&bytes);
         let total = bytes.len();
         let computed_sha = hex::encode(hasher.finalize());
 
-        // Optional SHA verification.
+        // Optional SHA verification (full body).
         if let Some(expected) = args.sha256 {
             if !expected.eq_ignore_ascii_case(&computed_sha) {
                 gatekeeper::log_verdict("net_fetch", false, "sha-mismatch", &format!("expected {} got {}", expected, computed_sha));
@@ -184,8 +180,17 @@ impl Tool for NetFetchTool {
             }
         }
 
+        let (capped, capped_truncated) = if bytes.len() > max_bytes {
+            gatekeeper::log_verdict("net_fetch", true, "size-capped", &format!("{} > {}", bytes.len(), max_bytes));
+            let _ = self.memory.log_gatekeeper_verdict("net_fetch", true, "size-capped", url).await;
+            (&bytes[..max_bytes], true)
+        } else {
+            (&bytes[..], false)
+        };
+
         // Truncate for model context.
-        let (body_str, truncated) = gatekeeper::truncate_output(&String::from_utf8_lossy(&bytes));
+        let (body_str, model_truncated) = gatekeeper::truncate_output(&String::from_utf8_lossy(capped));
+        let truncated = capped_truncated || model_truncated;
         let (body_str, _) = gatekeeper::scrub_secrets(&body_str);
 
         gatekeeper::log_verdict("net_fetch", true, &format!("http-{}", status), &format!("{} bytes", total));
