@@ -29,7 +29,7 @@ var leanOverlayEl = $('lean-overlay');
   var tabContainerEl = $('tabs');
   var branchPagerEl = $('branch-pager');
   var messageContainerEl = $('messages');
-  var footerContainerEl = typeof document.querySelector === 'function' ? document.querySelector('footer') : null;
+  var footerContainerEl = $('composer-bar');
 
   function setChatAreaVisible(visible) {
     if (tabContainerEl) tabContainerEl.style.display = visible ? 'block' : 'none';
