@@ -391,6 +391,30 @@
     });
   }
 
+  function stopEvent(e) {
+    if (e) {
+      if (e.stopPropagation) e.stopPropagation();
+      if (e.preventDefault) e.preventDefault();
+    }
+  }
+
+  // Tab clicks must work even when the tab strip re-renders mid-tap: bind
+  // one delegated listener on the container instead of per-button handlers
+  // that a concurrent renderTabs() can orphan.
+  function tabAction(el) {
+    if (!el) return null;
+    var node = el;
+    while (node && node !== sessionsEl) {
+      if (node.getAttribute) {
+        var kind = node.getAttribute('data-tab-action');
+        var sid = node.getAttribute('data-session-id');
+        if (kind && sid) return { kind: kind, sid: sid, node: node };
+      }
+      node = node.parentNode;
+    }
+    return null;
+  }
+
   function renderTabs() {
     sessionsEl.innerHTML = '';
     sessions.forEach(function (s) {
@@ -399,29 +423,20 @@
       var label = document.createElement('button');
       label.className = 'tab-label';
       label.textContent = tabGlyph(s.id) + (s.title || '(new)');
-      label.onclick = function () { openSession(s.id); };
+      label.setAttribute('data-tab-action', 'open');
+      label.setAttribute('data-session-id', s.id);
       var edit = document.createElement('button');
       edit.className = 'tab-rename';
-      edit.textContent = '✎';
-      edit.onclick = function (e) { e.stopPropagation(); startRename(s.id, label); };
+      edit.textContent = '\u270E';
+      edit.setAttribute('data-tab-action', 'rename');
+      edit.setAttribute('data-session-id', s.id);
       var x = document.createElement('button');
       x.className = 'tab-close';
-      x.textContent = '×';
+      x.textContent = '\u00D7';
+      x.setAttribute('data-tab-action', 'close');
+      x.setAttribute('data-session-id', s.id);
       // NOTE: window.confirm() is dead in this WebView (no WebChromeClient),
       // so deletion uses a two-tap arm/disarm on the button itself.
-      x.onclick = function (e) {
-        e.stopPropagation();
-        if (x.getAttribute('data-armed') === '1') {
-          removeSession(s.id);
-        } else {
-          x.setAttribute('data-armed', '1');
-          x.textContent = 'Sure?';
-          setTimeout(function () {
-            x.removeAttribute('data-armed');
-            x.textContent = '×';
-          }, 3000);
-        }
-      };
       el.appendChild(label);
       el.appendChild(edit);
       el.appendChild(x);
@@ -429,8 +444,35 @@
     });
   }
 
-  // Inline tab rename: swap the label for an input; Enter commits via
-  // session_rename, Escape/blur cancels. (prompt() is dead here too.)
+  function armCloseButton(btn) {
+    btn.setAttribute('data-armed', '1');
+    btn.textContent = 'Sure?';
+    setTimeout(function () {
+      // The strip may have re-rendered since arming; only reset this node
+      // when it is still armed to avoid clobbering a fresh button.
+      if (btn.getAttribute && btn.getAttribute('data-armed') === '1') {
+        btn.removeAttribute('data-armed');
+        btn.textContent = '\u00D7';
+      }
+    }, 3000);
+  }
+
+  sessionsEl.addEventListener('click', function (e) {
+    var hit = tabAction(e && e.target);
+    if (!hit) return;
+    stopEvent(e);
+    if (hit.kind === 'open') openSession(hit.sid);
+    else if (hit.kind === 'rename') startRename(hit.sid, hit.node);
+    else if (hit.kind === 'close') {
+      if (hit.node.getAttribute('data-armed') === '1') removeSession(hit.sid);
+      else armCloseButton(hit.node);
+    }
+  });
+
+  // Inline tab rename: swap the tab button for an input; Enter commits
+  // via session_rename, Escape/blur cancels. (prompt() is dead here too.)
+  // Tolerates being passed the tab strip button (post-delegation) or the
+  // legacy label element: the input always replaces the action button.
   function startRename(id, labelEl) {
     var cur = '';
     sessions.forEach(function (x) { if (x.id === id) cur = x.title || ''; });
@@ -456,7 +498,17 @@
       else if (e.key === 'Escape') finish(false);
     });
     input.addEventListener('blur', function () { finish(true); });
-    labelEl.parentNode.replaceChild(input, labelEl);
+    if (labelEl && labelEl.className === 'tab-rename' && labelEl.parentNode) {
+      // Delegated rename button: swap the whole tab row for the editor so
+      // the tap target cannot vanish mid-edit on narrow strips.
+      var row = labelEl.parentNode;
+      row.innerHTML = '';
+      row.appendChild(input);
+    } else if (labelEl && labelEl.parentNode) {
+      labelEl.parentNode.replaceChild(input, labelEl);
+    } else {
+      return;
+    }
     input.focus();
     try { input.select(); } catch (_) {}
   }

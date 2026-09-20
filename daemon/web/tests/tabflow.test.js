@@ -15,6 +15,16 @@ function makeEl(id) {
     },
     addEventListener(k, f) { (this._h = this._h || {})[k] = f; },
     fire(k, e) { if (this._h && this._h[k]) this._h[k](e || {}); },
+    click() {
+      let node = this, root = this;
+      while (root.parentNode) root = root.parentNode;
+      const fireOn = (el) => {
+        if (el._h && el._h.click) el._h.click({ target: this, stopPropagation() {}, preventDefault() {} });
+      };
+      fireOn(this);
+      if (this.parentNode && this.parentNode !== root) fireOn(this.parentNode);
+      fireOn(root);
+    },
     setAttribute(k, v) { this.attrs[k] = v; },
     getAttribute(k) { return this.attrs[k]; },
     removeAttribute(k) { delete this.attrs[k]; },
@@ -188,13 +198,13 @@ function msgTexts() {
   assert.deepEqual(tabLabels(), ['first', '(new)'], 'tabs render, titles shown');
 
   // Open B, send, switch mid-flight.
-  els['tab-list'].children[1].children[0].onclick();
+  els['tab-list'].children[1].children[0].click();
   await tick();
   assert.ok(msgTexts().join(' ').includes('q-B'), 'B history shown after switch');
   els.composer.value = 'hello-B2';
   els['send-btn'].onclick();
   assert.ok(tabLabels()[1].startsWith('\u2026'), 'B tab shows waiting glyph');
-  els['tab-list'].children[0].children[0].onclick(); // back to A mid-flight
+  els['tab-list'].children[0].children[0].click(); // back to A mid-flight
   await tick();
   assert.ok(msgTexts().join(' ').includes('a-A'), 'A history intact, no leak from B flight');
 
@@ -206,7 +216,7 @@ function msgTexts() {
   assert.ok(tabLabels()[1].startsWith('\u25cf'), 'B tab flagged unread');
 
   // Open B: reply shown, flag cleared, fork works on canonical indices.
-  els['tab-list'].children[1].children[0].onclick();
+  els['tab-list'].children[1].children[0].click();
   await tick(); await tick();
   assert.ok(msgTexts().join(' ').includes('reply-B2'), 'reply shown after opening B');
   assert.ok(!tabLabels()[1].startsWith('\u25cf'), 'flag cleared on open');
@@ -231,7 +241,7 @@ function msgTexts() {
   assert.ok(bIdx >= 0, 'B tab found');
   const bTab = tabsNow[bIdx];
   const renBtn = bTab.children.find((c) => c.className === 'tab-rename');
-  renBtn.onclick({ stopPropagation() {} });
+  renBtn.click();
   const editor = bTab.children.find((c) => c.className === 'tab-edit');
   assert.ok(editor, 'rename editor appears');
   editor.value = 'Budget chat';
@@ -242,11 +252,19 @@ function msgTexts() {
   server.sock.onmessage({ data: JSON.stringify({ id: renCall.id, result: { id: renCall.params.session_id, title: 'Budget chat' } }) });
   await tick();
   assert.ok(tabLabels().some((t) => t.includes('Budget chat')), 'renamed title shown');
-  const xBtn = bTab.children.find((c) => c.className === 'tab-close');
-  xBtn.onclick({ stopPropagation() {} });
-  assert.equal(xBtn.textContent, 'Sure?', 'first tap arms');
+  const tapClose = () => {
+    const tabs = els['tab-list'].children;
+    const idx = tabs.findIndex((t) => t.children.some((c) => c.textContent.includes('Budget chat')));
+    assert.ok(idx >= 0, 'armed tab still present');
+    tabs[idx].children.find((c) => c.className === 'tab-close').click();
+  };
+  tapClose();
+  const armedBtn = els['tab-list'].children
+    .flatMap((t) => t.children)
+    .find((c) => c.className === 'tab-close' && c.textContent === 'Sure?');
+  assert.ok(armedBtn, 'first tap arms');
   sent.length = 0;
-  xBtn.onclick({ stopPropagation() {} });
+  tapClose();
   await tick();
   assert.ok(sent.find((s) => s.method === 'session_delete'), 'second tap deletes');
   assert.equal(tabLabels().length, 2, 'B tab removed from strip (fork tab + A remain)');
@@ -271,7 +289,7 @@ function msgTexts() {
   // Error path: sent bubble stays, thinking goes away, composer untouched,
   // error bubble carries Retry; the failed turn is NOT persisted server-side.
   const aIdx = tabLabels().findIndex((t) => t.includes('first'));
-  els['tab-list'].children[aIdx].children[0].onclick(); // open A
+  els['tab-list'].children[aIdx].children[0].click(); // open A
   await tick(); await tick();
   els.composer.value = 'doomed-q';
   server.failNextChat = true;
@@ -305,7 +323,7 @@ function msgTexts() {
   els['send-btn'].onclick();
   const bgErr = server.pendingChat.pop();
   const bi = tabLabels().findIndex((t) => t.includes('fork'));
-  els['tab-list'].children[bi].children[0].onclick(); // move to fork tab
+  els['tab-list'].children[bi].children[0].click(); // move to fork tab
   await tick();
   server.pushError(bgErr.params.session_id, 'boom');
   await tick(); await tick();
@@ -343,7 +361,7 @@ function msgTexts() {
   // any pre-reconnect leftovers first, then use the fresh socket's queue.
   server.pendingChat.length = 0;
   const ai = tabLabels().findIndex((t) => t.includes('first'));
-  els['tab-list'].children[ai].children[0].onclick();
+  els['tab-list'].children[ai].children[0].click();
   await tick(); await tick();
   els.composer.value = 'stream me';
   els['send-btn'].onclick();
