@@ -353,10 +353,18 @@
       if (leanTimer) { clearInterval(leanTimer); leanTimer = null; }
       leanStatusEl.textContent = r.version ? ('Lean: ready (' + r.version + ')') : 'Lean: installed';
       leanBtnEl.style.display = 'none';
+    } else if (r.provision_error) {
+      // Failed provision: stop polling, surface the exact error, and keep
+      // the button visible as Retry so the tap always does something.
+      if (leanTimer) { clearInterval(leanTimer); leanTimer = null; }
+      leanStatusEl.textContent = 'Lean: install failed — ' + r.provision_error;
+      leanBtnEl.style.display = '';
+      leanBtnEl.textContent = 'Retry Lean install';
     } else {
       if (leanTimer) { clearInterval(leanTimer); leanTimer = null; }
       leanStatusEl.textContent = 'Lean: ' + (r.message || 'not installed');
       leanBtnEl.style.display = '';
+      leanBtnEl.textContent = 'Download & install Lean (~550 MB)';
     }
   }
 
@@ -1054,12 +1062,19 @@
     }
   };
   leanBtnEl.onclick = function () {
-    var was = leanBtnEl.style.display;
+    // Kick the provision and poll regardless of the reply: the daemon
+    // answers fire-and-forget ("started" / "already running"), and a
+    // dropped reply must not leave the button dead with no progress.
     leanBtnEl.style.display = 'none';
+    leanStatusEl.textContent = 'Lean: starting install…';
     call('lean_provision', {}, function () {
       if (!leanTimer) leanTimer = setInterval(pollTick, POLL_MS);
     });
-    void was;
+    // Belt-and-suspenders: even if the RPC never returns (dead socket),
+    // start polling so the status line reflects reality.
+    setTimeout(function () {
+      if (!leanTimer) leanTimer = setInterval(pollTick, POLL_MS);
+    }, 1500);
   };
   composerEl.addEventListener('keydown', function (e) {
     if (e.key === 'Enter' && !e.shiftKey) {

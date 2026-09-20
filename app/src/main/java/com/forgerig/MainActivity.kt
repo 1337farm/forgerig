@@ -829,7 +829,27 @@ if (installState && typeof window.NativeHost.isInstalled === 'function') {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        setIntent(intent)
         handleIntent(intent)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Reopen path: the daemon port is reallocated per process, and a
+        // stopped-then-reopened app otherwise points the WebView at a dead
+        // port (black/blank page). Reload against the current port whenever
+        // the visible URL no longer matches it.
+        try {
+            if (::webView.isInitialized) {
+                val want = "http://127.0.0.1:$allocatedPort"
+                val cur = try { webView.url } catch (e: Exception) { null }
+                if (cur == null || !cur.startsWith(want)) {
+                    webView.loadUrl(want)
+                }
+            }
+        } catch (e: Exception) {
+            AssetExtractor.logShared(this, "ERROR: resume reload failed | $e")
+        }
     }
 
     /** Feed a notification reply into the chat composer. Probes for the

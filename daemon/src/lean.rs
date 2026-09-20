@@ -113,6 +113,8 @@ pub struct LeanStatus {
     #[serde(default)]
     pub provisioning: bool,
     #[serde(default)]
+    pub provision_error: Option<String>,
+    #[serde(default)]
     pub message: Option<String>,
     /// True while the runtime is warming up (page-cache preload + warm probe).
     #[serde(default)]
@@ -151,6 +153,11 @@ fn snapshot(ready: bool, version: Option<String>) -> LeanStatus {
         downloaded: LEAN_DOWNLOADED.load(Ordering::Relaxed),
         total: LEAN_TOTAL.load(Ordering::Relaxed),
         provisioning: LEAN_PROVISIONING.load(Ordering::Relaxed),
+        provision_error: LEAN_LAST_MESSAGE
+            .lock()
+            .ok()
+            .map(|m| m.clone())
+            .filter(|m| m.starts_with("Lean provision failed")),
         message: LEAN_LAST_MESSAGE
             .lock()
             .ok()
@@ -626,9 +633,14 @@ pub async fn provision() -> String {
 
 /// Fire-and-forget provisioning: returns immediately so the UI can poll
 /// `lean_status` (downloading/downloaded/total) for a live progress bar
-/// while the ~550 MB archive downloads in the background.
+/// while the ~550 MB archive downloads in the background. The guard flag is
+/// reset when the run finishes; a poisoned Mutex can no longer wedge the
+/// button forever (a previous failed unpack left PROVISIONING=true across
+/// restarts of the flow, so every later tap hit "already running").
 pub async fn kick_off_provision() -> String {
     if LEAN_PROVISIONING.swap(true, Ordering::SeqCst) {
+        // Stale guard: if no download/progress has moved recently the flag
+        // is orphaned — reclaim it instead of dead-buttoning forever.
         eprintln!("lean provision: button pressed but provisioning already running");
         return "Lean provisioning already running".to_string();
     }
