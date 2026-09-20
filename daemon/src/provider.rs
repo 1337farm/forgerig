@@ -303,8 +303,7 @@ impl Provider {
 
 pub struct Backend {
     kind: BackendKind,
-    /// True when a real key (not the fallback "dummy-key") was configured.
-    key_present: bool,
+    /// Provider enum for dynamic key resolution.
     provider: Provider,
     chat_model: String,
 }
@@ -840,7 +839,7 @@ async fn run_agent_loop_once(
 }
 
 impl Backend {
-    pub async fn resolve(memory: Arc<MemoryEngine>) -> Backend {
+    pub async fn resolve(memory: Arc<MemoryEngine>) -> Self {
         let provider = Provider::from_env();
         let key = resolve_key(provider);
         let key_present = !key.is_empty() && key != "dummy-key";
@@ -911,7 +910,7 @@ impl Backend {
             BackendKind::Compat { model, tools, tool_defs, eval }
         };
 
-        Backend { kind, key_present, provider, chat_model }
+        Self { kind, provider, chat_model }
     }
 
     pub async fn chat_session(
@@ -1007,11 +1006,14 @@ impl Backend {
     }
 
     pub fn describe(&self) -> String {
+        // Re-read the key dynamically so key status updates without restart
+        let key = resolve_key(self.provider);
+        let key_present = !key.is_empty() && key != "dummy-key";
         format!(
             "provider={} model={} key={}",
             self.provider.name(),
             self.chat_model,
-            if self.key_present { "set" } else { "missing" }
+            if key_present { "set" } else { "missing" }
         )
     }
 }
