@@ -69,17 +69,17 @@ fn build_cmd_binds(command: &str, sandbox: bool, binds: &[String]) -> Command {
     let proot = std::env::var("CONTAINER_PROOT").ok();
     let rootfs = std::env::var("CONTAINER_ROOTFS").ok();
     if let (Some(proot), Some(rootfs)) = (proot, rootfs) {
+        // Preserve LD_LIBRARY_PATH before env_clear() — proot needs it to find
+        // libtalloc.so.2 and libandroid-shmem.so (proot itself is dynamically linked).
+        let saved_ld_library_path = std::env::var("LD_LIBRARY_PATH").ok().filter(|s| !s.is_empty());
         let mut cmd = Command::new(&proot);
         cmd.kill_on_drop(true);
         // proot itself is dynamically linked (DT_NEEDED libtalloc.so.2 +
         // libandroid-shmem.so with a Termux RUNPATH that does not exist on
-        // device). The daemon inherits the app's LD_LIBRARY_PATH, and
-        // .env_clear() below would drop it — so re-attach it explicitly.
-        // Without this, execve fails with: library "libtalloc.so.2" not found.
-        if let Ok(ld) = std::env::var("LD_LIBRARY_PATH") {
-            if !ld.is_empty() {
-                cmd.env("LD_LIBRARY_PATH", ld);
-            }
+        // device). The daemon inherits the app's LD_LIBRARY_PATH; we must
+        // preserve it across env_clear().
+        if let Some(ld) = std::env::var("LD_LIBRARY_PATH").ok().filter(|s| !s.is_empty()) {
+            cmd.env("LD_LIBRARY_PATH", ld);
         }
         cmd
             // Never leak host secrets into the guest: the daemon inherits
@@ -87,6 +87,9 @@ fn build_cmd_binds(command: &str, sandbox: bool, binds: &[String]) -> Command {
             // allowlisted env. Brokered network (net_fetch) attaches keys
             // host-side instead.
             .env_clear()
+            // Re-apply LD_LIBRARY_PATH after env_clear() so proot can find
+            // its DT_NEEDED libs (libtalloc.so.2, libandroid-shmem.so).
+            .env("LD_LIBRARY_PATH", std::env::var("LD_LIBRARY_PATH").unwrap_or_default())
             .arg("-r")
             .arg(&rootfs)
             .arg("-0")
