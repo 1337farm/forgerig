@@ -31,6 +31,15 @@ pub struct SessionSummary {
     pub can_undo: bool,
     /// Alternate limbs off the current head (children) plus redo depth.
     pub alt_count: usize,
+    /// Team model: id of the parent session, if this is a sub-agent.
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    /// Sub-agent role within its team ("" for root sessions).
+    #[serde(default)]
+    pub role: String,
+    /// Direct (non-archived) sub-agent count.
+    #[serde(default)]
+    pub child_count: usize,
 }
 
 /// One message node in a session tree.
@@ -61,6 +70,29 @@ pub struct Session {
     pub tree: SessionTree,
     pub archived: bool,
     pub created_ms: u64,
+    /// Team model: parent session id for user-driven sub-agents.
+    /// `None` = root session (a team unto itself). Serde defaults keep
+    /// pre-team on-disk state (v2) parsing without a migration.
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    /// Sub-agent role within its team, e.g. "backend", "qa".
+    #[serde(default)]
+    pub role: String,
+    /// High-level objective this session (or sub-agent) pursues.
+    #[serde(default)]
+    pub goal: String,
+}
+
+impl Session {
+    /// Isolated guest workspace for this session's file work.
+    /// Each team member gets its own directory under the shared garden root,
+    /// so parallel sub-agents never cross-contaminate; the shared orchestrator
+    /// merges results back explicitly (see `merge_child`). The single
+    /// implementation lives in the gatekeeper so path policy and session
+    /// layout can never drift apart.
+    pub fn workspace(&self) -> String {
+        crate::gatekeeper::session_workspace(&self.id)
+    }
 }
 
 impl Session {
@@ -224,6 +256,9 @@ impl SessionManager {
             tree: SessionTree { nodes, root: 0, head, next, redo: Vec::new() },
             archived: false,
             created_ms,
+            parent_id: None,
+            role: String::new(),
+            goal: String::new(),
         }
     }
 
@@ -298,7 +333,25 @@ impl SessionManager {
             archived: s.archived,
             can_undo,
             alt_count,
+            parent_id: s.parent_id.clone(),
+            role: s.role.clone(),
+            // Filled in by list()/children() from the live map.
+            child_count: 0,
         }
+    }
+
+    /// Count direct non-archived children per session id.
+    fn child_counts(sessions: &HashMap<String, Session>) -> HashMap<String, usize> {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for s in sessions.values() {
+            if s.archived {
+                continue;
+            }
+            if let Some(pid) = &s.parent_id {
+                *counts.entry(pid.clone()).or_insert(0) += 1;
+            }
+        }
+        counts
     }
 
     /// Append one message node under the current head. Any new append forks
@@ -333,10 +386,106 @@ impl SessionManager {
             tree: SessionTree { nodes, root: 0, head: 0, next: 1, redo: Vec::new() },
             archived: false,
             created_ms: Self::now_ms(),
+            parent_id: None,
+            role: String::new(),
+            goal: String::new(),
         };
         self.sessions.lock().unwrap().insert(id, session.clone());
         self.persist();
         session
+    }
+
+    /// Spawn a user-driven sub-agent under `parent_id` (the small-team model).
+    ///
+    /// The child gets a fresh thread (system message only), its own isolated
+    /// workspace (`Session::workspace`), and a recorded role + goal. It reads
+    /// nothing from the parent automatically — the shared orchestrator (or the
+    /// user) copies in whatever context the member needs, and merges results
+    /// back explicitly via `merge_child`. Returns None when the parent is
+    /// unknown or the role is blank.
+    pub fn spawn_subagent(&self, parent_id: &str, role: &str, goal: &str, system_message: Value) -> Option<Session> {
+        let role: String = role.trim().chars().take(40).collect();
+        if role.is_empty() {
+            return None;
+        }
+        let goal: String = goal.trim().chars().take(500).collect();
+        if !self.exists(parent_id) {
+            return None;
+        }
+        let id = self.next_id();
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            0,
+            MsgNode { id: 0, parent: None, message: system_message, children: Vec::new() },
+        );
+        let title = if goal.is_empty() {
+            role.clone()
+        } else {
+            let short: String = goal.chars().take(30).collect();
+            format!("{role}: {short}")
+        };
+        let session = Session {
+            id: id.clone(),
+            title,
+            tree: SessionTree { nodes, root: 0, head: 0, next: 1, redo: Vec::new() },
+            archived: false,
+            created_ms: Self::now_ms(),
+            parent_id: Some(parent_id.to_string()),
+            role,
+            goal,
+        };
+        self.sessions.lock().unwrap().insert(id, session.clone());
+        self.persist();
+        Some(session)
+    }
+
+    /// Direct non-archived sub-agents of `parent_id`, newest first.
+    /// (Named `subagents` — `children` already means branch-tree children.)
+    pub fn subagents(&self, parent_id: &str) -> Vec<SessionSummary> {
+        let lock = self.sessions.lock().unwrap();
+        let counts = Self::child_counts(&lock);
+        let mut v: Vec<SessionSummary> = lock
+            .values()
+            .filter(|s| !s.archived && s.parent_id.as_deref() == Some(parent_id))
+            .map(|s| {
+                let mut summary = Self::summary_of(s);
+                summary.child_count = counts.get(&s.id).copied().unwrap_or(0);
+                summary
+            })
+            .collect();
+        v.sort_by_key(|s| std::cmp::Reverse(s.created_ms));
+        v
+    }
+
+    /// Merge a finished sub-agent back into its parent team session.
+    ///
+    /// The child's visible thread (minus its system message) is appended to
+    /// the parent's thread in order, so the parent's singular goal absorbs the
+    /// member's work as ordinary turns. The child is then archived (kept for
+    /// audit, hidden from lists). Returns the updated parent, or None when
+    /// either side is unknown / the child has no parent.
+    pub fn merge_child(&self, child_id: &str) -> Option<Session> {
+        let child = self.get(child_id)?;
+        if child.archived {
+            return None;
+        }
+        let parent_id = child.parent_id.clone()?;
+        let incoming: Vec<Value> = child.thread().into_iter().skip(1).collect();
+        let mut lock = self.sessions.lock().unwrap();
+        {
+            let parent = lock.get_mut(&parent_id)?;
+            for msg in incoming {
+                Self::push_node(parent, msg);
+            }
+            parent.autotitle();
+        }
+        if let Some(child_mut) = lock.get_mut(child_id) {
+            child_mut.archived = true;
+        }
+        let out = lock.get(&parent_id).cloned()?;
+        drop(lock);
+        self.persist();
+        Some(out)
     }
 
     pub fn get(&self, id: &str) -> Option<Session> {
@@ -353,13 +502,16 @@ impl SessionManager {
     }
 
     pub fn list(&self) -> Vec<SessionSummary> {
-        let mut v: Vec<SessionSummary> = self
-            .sessions
-            .lock()
-            .unwrap()
+        let lock = self.sessions.lock().unwrap();
+        let counts = Self::child_counts(&lock);
+        let mut v: Vec<SessionSummary> = lock
             .values()
             .filter(|s| !s.archived)
-            .map(Self::summary_of)
+            .map(|s| {
+                let mut summary = Self::summary_of(s);
+                summary.child_count = counts.get(&s.id).copied().unwrap_or(0);
+                summary
+            })
             .collect();
         v.sort_by_key(|s| std::cmp::Reverse(s.created_ms));
         v
@@ -823,6 +975,67 @@ mod tests {
         assert!(m.set_archived(&s.id, false));
         assert!(!m.trash_list()[0].archived);
         assert!(m.restore(&s.id).is_some());
+    }
+
+    #[test]
+    fn spawn_links_parent_role_goal_and_workspace() {
+        let m = SessionManager::new();
+        let parent = m.create(sys());
+        let child = m.spawn_subagent(&parent.id, "backend", "Build the API", sys()).unwrap();
+        assert_eq!(child.parent_id.as_deref(), Some(parent.id.as_str()));
+        assert_eq!(child.role, "backend");
+        assert_eq!(child.goal, "Build the API");
+        assert!(child.workspace().starts_with("/root/workspace/"));
+        assert!(child.workspace().contains(&child.id));
+        // Parent lists the child; blank role or unknown parent refused.
+        assert_eq!(m.subagents(&parent.id).len(), 1);
+        assert_eq!(m.subagents(&parent.id)[0].role, "backend");
+        assert!(m.spawn_subagent(&parent.id, "  ", "x", sys()).is_none());
+        assert!(m.spawn_subagent("nope", "qa", "x", sys()).is_none());
+    }
+
+    #[test]
+    fn merge_appends_child_thread_and_archives() {
+        let m = SessionManager::new();
+        let parent = m.create(sys());
+        m.set_messages(&parent.id, thread());
+        let child = m.spawn_subagent(&parent.id, "qa", "Verify", sys()).unwrap();
+        m.set_messages(&child.id, vec![sys(), user("check this"), assistant("looks good")]);
+        let merged = m.merge_child(&child.id).unwrap();
+        // Parent gains the child's two non-system turns.
+        let msgs = merged.thread();
+        assert_eq!(msgs.len(), 4 + 2);
+        assert_eq!(msgs[4].get("content").unwrap(), "check this");
+        assert_eq!(msgs[5].get("content").unwrap(), "looks good");
+        // Child archived (audit trail kept, hidden from lists/subagents).
+        assert!(m.get(&child.id).unwrap().archived);
+        assert!(m.subagents(&parent.id).is_empty());
+        assert_eq!(m.list().iter().filter(|s| s.id == child.id).count(), 0);
+        // Merging twice or merging a root is refused (no duplicates).
+        assert!(m.merge_child(&child.id).is_none());
+        assert!(m.merge_child(&parent.id).is_none());
+        assert!(m.merge_child("nope").is_none());
+    }
+
+    #[test]
+    fn team_fields_persist_across_reload() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "forgerig-team-{}.json",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let m = SessionManager::with_persist_path(Some(path.clone()));
+        let parent = m.create(sys());
+        let child = m.spawn_subagent(&parent.id, "devops", "Ship it", sys()).unwrap();
+        drop(m);
+
+        let m2 = SessionManager::with_persist_path(Some(path.clone()));
+        let back = m2.get(&child.id).unwrap();
+        assert_eq!(back.parent_id.as_deref(), Some(parent.id.as_str()));
+        assert_eq!(back.role, "devops");
+        assert_eq!(back.goal, "Ship it");
+        assert_eq!(m2.subagents(&parent.id).len(), 1);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

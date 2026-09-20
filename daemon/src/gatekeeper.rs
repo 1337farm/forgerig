@@ -131,6 +131,16 @@ pub fn validate_guest_path(path: &str) -> Result<String, String> {
     }
 }
 
+/// Isolated guest workspace for one team session (small-team model).
+/// Single implementation backing `Session::workspace`: path policy and
+/// session layout can never drift apart.
+pub fn session_workspace(session_id: &str) -> String {
+    let slug: String =
+        session_id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').take(64).collect();
+    let slug = if slug.is_empty() { "default".to_string() } else { slug };
+    format!("{GUEST_WORKSPACE}/{slug}")
+}
+
 /// Gate a sandboxed shell line before it reaches proot.
 pub fn validate_command(cmd: &str) -> Result<(), String> {
     if cmd.len() > MAX_TOOL_ARG_BYTES {
@@ -417,6 +427,18 @@ mod tests {
         let (t, trunc) = truncate_output(&big);
         assert!(trunc);
         assert!(t.contains("truncated"));
+    }
+
+    #[test]
+    fn session_workspace_is_jailed_and_stable() {
+        // Normal ids map under the garden root and validate as guest paths.
+        let w = session_workspace("s12-345");
+        assert_eq!(w, "/root/workspace/s12-345");
+        assert_eq!(validate_guest_path(&w).unwrap(), w);
+        // Hostile ids are sanitized, never escape, empty falls back.
+        assert_eq!(session_workspace("../../etc"), "/root/workspace/etc");
+        assert_eq!(session_workspace(""), "/root/workspace/default");
+        assert_eq!(session_workspace("a/b"), "/root/workspace/ab");
     }
 
     #[test]
