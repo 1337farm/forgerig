@@ -39,6 +39,20 @@
     padding: .5rem .8rem; border-bottom: 1px solid var(--line);
     flex-shrink: 0;
   }
+  /* Lean install overlay - shown while Lean is provisioning */
+  #lean-overlay {
+    position: fixed; inset: 0; z-index: 1000;
+    background: var(--bg); color: var(--ink);
+    display: none; flex-direction: column; align-items: center; justify-content: center;
+    gap: 1rem; padding: 1rem;
+  }
+  #lean-overlay.active { display: flex; }
+  #lean-overlay .logo { font-size: 2.5rem; color: var(--accent); }
+  #lean-overlay .title { font-size: 1.1rem; font-weight: 600; }
+  #lean-overlay .detail { font-size: .85rem; color: var(--muted); max-width: 80%; text-align: center; }
+  #lean-overlay .progress-bar { width: 100%; max-width: 320px; height: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  #lean-overlay .progress-fill { height: 100%; width: 0; background: linear-gradient(90deg, var(--accent-deep), var(--accent)); }
+  #lean-overlay .pct { font-size: .8rem; color: var(--ink); }
   .row { display: flex; align-items: center; gap: .5rem; }
   .row.between { justify-content: space-between; }
   h1 { font-size: 1.1rem; margin: 0; font-weight: 600; color: var(--accent); }
@@ -132,6 +146,8 @@
     border-bottom: 1px solid var(--line); background: var(--bg);
     padding: .35rem .6rem; flex-shrink: 0; max-height: 9rem; overflow-y: auto;
   }
+  /* Chat area is gated on Lean readiness — hidden until install completes. */
+  #tabs, #branch-pager, #messages, footer { display: none; }
   .closed-item {
     display: flex; align-items: center; justify-content: space-between; gap: .5rem;
     padding: .3rem 0; font-size: .8rem; color: var(--muted);
@@ -229,6 +245,13 @@
 </style>
 </head>
 <body>
+<div id="lean-overlay">
+  <div class="logo">⚙</div>
+  <div class="title">Installing Lean…</div>
+  <div class="detail" id="lean-overlay-detail">Preparing installation</div>
+  <div class="progress-bar"><div class="progress-fill" id="lean-overlay-fill"></div></div>
+  <div class="pct" id="lean-overlay-pct">0%</div>
+</div>
 <header>
   <div class="row between">
     <div class="brand"><span class="dot" id="conn-dot"></span><h1>ForgeRig</h1><span id="status-pill">Connecting…</span></div>
@@ -247,7 +270,7 @@
 <div id="branch-pager"></div>
 <div id="closed-panel" style="display:none"><div id="closed-list"></div></div>
 <main id="messages"></main>
-<footer>
+<footer id="composer-bar">
   <textarea id="composer" placeholder="Ask anything… (Enter to send, Shift+Enter for newline, !cmd runs in the container)" autofocus></textarea>
   <button id="send-btn">Send</button>
 </footer>

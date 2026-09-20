@@ -95,7 +95,7 @@ class SettingsActivity : AppCompatActivity() {
         "nvidia" to "https://integrate.api.nvidia.com",
         "groq" to "https://api.groq.com/openai",
         "deepseek" to "https://api.deepseek.com",
-        "mistral" to "https://api.mistral.ai/v1",
+        "mistral" to "https://api.mistral.ai",
         "gemini" to "https://generativelanguage.googleapis.com",
         "ollama" to "http://localhost:11434",
     )

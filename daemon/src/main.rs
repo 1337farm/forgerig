@@ -534,6 +534,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .map_err(|e| format!("bind {addr}: {e}"))?;
 
+    // Lean is part of the environment install/startup step: begin provisioning
+    // automatically on daemon boot so the UI can poll progress as soon as it
+    // connects (no manual "Download & install" tap required).
+    let _ = lean::kick_off_provision().await;
+
     while let Ok((stream, _)) = listener.accept().await {
         let backend = Arc::clone(&backend);
         let memory = Arc::clone(&memory_engine);
