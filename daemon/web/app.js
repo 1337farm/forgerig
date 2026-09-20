@@ -22,6 +22,21 @@
   var leanBarEl = $('lean-bar');
   var leanFillEl = $('lean-fill');
   var leanPctEl = $('lean-pct');
+var leanOverlayEl = $('lean-overlay');
+  var leanOverlayDetailEl = $('lean-overlay-detail');
+  var leanOverlayFillEl = $('lean-overlay-fill');
+  var leanOverlayPctEl = $('lean-overlay-pct');
+  var tabContainerEl = $('tabs');
+  var branchPagerEl = $('branch-pager');
+  var messageContainerEl = $('messages');
+  var footerContainerEl = typeof document.querySelector === 'function' ? document.querySelector('footer') : null;
+
+  function setChatAreaVisible(visible) {
+    if (tabContainerEl) tabContainerEl.style.display = visible ? 'block' : 'none';
+    if (branchPagerEl) branchPagerEl.style.display = visible ? 'block' : 'none';
+    if (messageContainerEl) messageContainerEl.style.display = visible ? 'block' : 'none';
+    if (footerContainerEl) footerContainerEl.style.display = visible ? 'block' : 'none';
+  }
 
   // ---------- RPC client (id-keyed, supports concurrency) ----------
   var ws = null;
@@ -322,7 +337,14 @@
   var currentFlight = null;
 
   function refreshLean() {
-    call('lean_status', {}, function (err, r) { if (!err) renderLean(r); });
+    call('lean_status', {}, function (err, r) {
+      if (err || !r) return;
+      renderLean(r);
+      // Auto-provision if Lean is not installed and not already in progress.
+      if (!r.ready && !r.provisioning && !r.downloading && !r.warming && !r.provision_error) {
+        call('lean_provision', {}, function () {});
+      }
+    });
   }
 
   function pollTick() {
@@ -342,6 +364,32 @@
   function renderLean(r) {
     if (!r) return;
     updateLeanBar(r);
+    var isInstalling = r.provisioning || r.downloading || r.warming;
+    // Show/hide install overlay.
+    if (leanOverlayEl) {
+      leanOverlayEl.style.display = isInstalling ? 'flex' : 'none';
+    }
+    // Update overlay detail and progress.
+    if (isInstalling && leanOverlayDetailEl && leanOverlayFillEl && leanOverlayPctEl) {
+      if (r.downloading && r.total > 0) {
+        var dpct = Math.floor(r.downloaded * 100 / r.total);
+        leanOverlayDetailEl.textContent = 'Downloading Lean… ' + dpct + '%';
+        leanOverlayFillEl.style.width = dpct + '%';
+        leanOverlayPctEl.textContent = dpct + '%';
+      } else if (r.provisioning) {
+        leanOverlayDetailEl.textContent = 'Extracting Lean into container…';
+        leanOverlayFillEl.style.width = '100%';
+        leanOverlayPctEl.textContent = 'working…';
+      } else if (r.warming) {
+        var pct = (r.warm_timeout > 0) ? Math.min(100, Math.floor((r.warm_elapsed || 0) * 100 / r.warm_timeout)) : 0;
+        leanOverlayDetailEl.textContent = 'Warming up Lean runtime… ' + (r.warm_elapsed || 0) + 's';
+        leanOverlayFillEl.style.width = pct + '%';
+        leanOverlayPctEl.textContent = pct + '%';
+      }
+    }
+    // Gate chat area on Lean readiness.
+    setChatAreaVisible(r.ready);
+    // Existing header status updates.
     if (r.provisioning || r.downloading) {
       leanBtnEl.style.display = 'none';
       if (!leanTimer) leanTimer = setInterval(pollTick, POLL_MS);
@@ -354,8 +402,6 @@
       leanStatusEl.textContent = r.version ? ('Lean: ready (' + r.version + ')') : 'Lean: installed';
       leanBtnEl.style.display = 'none';
     } else if (r.provision_error) {
-      // Failed provision: stop polling, surface the exact error, and keep
-      // the button visible as Retry so the tap always does something.
       if (leanTimer) { clearInterval(leanTimer); leanTimer = null; }
       leanStatusEl.textContent = 'Lean: install failed — ' + r.provision_error;
       leanBtnEl.style.display = '';
