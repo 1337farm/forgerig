@@ -81,9 +81,8 @@ class ContainerService : Service() {
                 // after process death): run the container when the environment
                 // is present, resume an interrupted download when partials
                 // exist, otherwise stay foreground-idle.
-                val root = File(filesDir, "ubuntu_rootfs")
                 when {
-                    File(root, "bin/sh").exists() -> startContainerProcess()
+                    rootfsComplete() -> startContainerProcess()
                     hasPartialDownload() -> {
                         AssetExtractor.logShared(this, "Resuming interrupted install after restart")
                         startInstall()
@@ -106,13 +105,24 @@ class ContainerService : Service() {
         }
     }
 
+    /**
+     * True only when the guest can actually boot: /bin/sh AND /usr/bin/sh must
+     * both resolve (/bin is a usrmerge symlink → /usr/bin on Ubuntu). A bare
+     * dir-exists check lets a partial extraction boot a broken guest, whose
+     * every exec then fails with proot execve("/usr/bin/sh") ENOENT.
+     */
+    private fun rootfsComplete(): Boolean {
+        val root = File(filesDir, "ubuntu_rootfs")
+        return File(root, "bin/sh").exists() && File(root, "usr/bin/sh").exists()
+    }
+
     private var lastInstallNotif = ""
     /** Last agent-status text mirrored to the notification (dedup key). */
     private var lastAgentStatus = ""
 
     /** Runs extraction inside the service so it survives the activity going away. */
     private fun startInstall() {
-        if (File(filesDir, "ubuntu_rootfs/bin/sh").exists()) {
+        if (rootfsComplete()) {
             startContainerProcess()
             return
         }
@@ -140,6 +150,12 @@ class ContainerService : Service() {
                     override fun onStep(step: Int) {
                         InstallState.step = step
                         InstallState.lastProgressAt = System.currentTimeMillis()
+                        // Step transitions don't change percent/stage text, so
+                        // force a rebuild: the checklist rows derive from the
+                        // step, not the one-line text.
+                        val stage = InstallState.stage.ifEmpty { "Working…" }
+                        lastInstallNotif = "Installing… ${InstallState.percent}% — $stage"
+                        updateNotification(lastInstallNotif)
                     }
 
                     override fun onError(message: String, detail: String) {
@@ -265,7 +281,7 @@ class ContainerService : Service() {
         // Tapping opens the app; Open/Stop actions ride on every rebuild so
         // status updates never strip them. Ongoing => not dismissible while
         // the service runs.
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("ForgeRig")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
@@ -277,7 +293,57 @@ class ContainerService : Service() {
             .setOnlyAlertOnce(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .build()
+        if (InstallState.phase == "installing" || InstallState.phase == "extracted") {
+            // Expanded view carries the same done/remaining checklist as the
+            // install screen, plus a progress bar — the collapsed one-liner
+            // stays as-is.
+            builder.setStyle(NotificationCompat.BigTextStyle().bigText(installChecklistText()))
+            if (InstallState.phase == "installing") {
+                builder.setProgress(100, InstallState.percent.coerceIn(0, 100), false)
+            }
+        }
+        return builder.build()
+    }
+
+    /**
+     * Multi-line install status for the expanded notification: one row per
+     * install step (done / current / pending) followed by the live stage and
+     * detail, mirroring the install screen's checklist.
+     */
+    private fun installChecklistText(): String {
+        val labels = listOf(
+            "Prepare runtime",
+            "Download payload",
+            "Unpack container files",
+            "Finalize environment",
+            "Start container"
+        )
+        val failed = InstallState.phase == "failed"
+        val active = when {
+            InstallState.phase == "extracted" || InstallState.step >= 3 -> 4
+            InstallState.step == 2 -> 3
+            InstallState.step == 1 -> 2
+            InstallState.step == 0 && InstallState.stage.startsWith("Downloading") -> 1
+            else -> 0
+        }
+        val sb = StringBuilder()
+        for (i in labels.indices) {
+            val mark = when {
+                failed && i == active -> "✗"
+                i < active -> "✓"
+                i == active -> "▶"
+                else -> "○"
+            }
+            sb.append(mark).append(' ').append(labels[i])
+            if (i == active && InstallState.phase == "installing") {
+                sb.append(" — ").append(InstallState.percent.coerceIn(0, 100)).append('%')
+            }
+            sb.append('\n')
+        }
+        if (InstallState.stage.isNotEmpty()) sb.append(InstallState.stage)
+        if (InstallState.detail.isNotEmpty()) sb.append('\n').append(InstallState.detail.take(200))
+        if (failed && InstallState.error.isNotEmpty()) sb.append('\n').append(InstallState.error)
+        return sb.toString().trim()
     }
 
     private fun startForegroundService() {
@@ -390,7 +456,14 @@ class ContainerService : Service() {
         if (!prootBin.exists()) missing.add("libproot.so (native lib)")
         if (!loaderBin.exists()) missing.add("libproot_loader.so (native lib)")
         if (!tallocBin.exists()) missing.add("libtalloc.so.2 (asset dep)")
-        if (!rootFsDir.exists()) missing.add("ubuntu_rootfs (extract first)")
+        if (!rootFsDir.exists()) {
+            missing.add("ubuntu_rootfs (extract first)")
+        } else if (!rootfsComplete()) {
+            // Partial extraction: booting it fails every guest exec with
+            // proot execve("/usr/bin/sh") ENOENT. Refuse and let the user
+            // reinstall instead of starting a broken container.
+            missing.add("ubuntu_rootfs (incomplete — reinstall)")
+        }
         if (missing.isNotEmpty()) {
             val message = "Container files missing: ${missing.joinToString(", ")}. Please run install first."
             AssetExtractor.logShared(this, "ERROR: $message")

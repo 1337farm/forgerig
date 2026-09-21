@@ -26,6 +26,7 @@ var leanOverlayEl = $('lean-overlay');
   var leanOverlayDetailEl = $('lean-overlay-detail');
   var leanOverlayFillEl = $('lean-overlay-fill');
   var leanOverlayPctEl = $('lean-overlay-pct');
+  var leanStepsListEl = $('lean-steps-list');
   var tabContainerEl = $('tabs');
   var branchPagerEl = $('branch-pager');
   var messageContainerEl = $('messages');
@@ -36,6 +37,33 @@ var leanOverlayEl = $('lean-overlay');
     if (branchPagerEl) branchPagerEl.style.display = visible ? 'block' : 'none';
     if (messageContainerEl) messageContainerEl.style.display = visible ? 'block' : 'none';
     if (footerContainerEl) footerContainerEl.style.display = visible ? 'block' : 'none';
+  }
+
+  // Install checklist phases, in order. Marks steps before the active one
+  // done, the active one current, the rest pending — the same done/remaining
+  // language as the startup checklist. Auto-scrolls the current step into
+  // view inside the (scrollable) list only when it is out of view, so user
+  // scrolling is never fought.
+  var LEAN_STEPS = ['download', 'extract', 'ldconfig', 'probe', 'warm'];
+  function updateLeanSteps(activeStep) {
+    if (!leanStepsListEl || typeof leanStepsListEl.querySelectorAll !== 'function') return;
+    var nodes = leanStepsListEl.querySelectorAll('.step');
+    if (!nodes || typeof nodes.forEach !== 'function') return;
+    var activeIdx = LEAN_STEPS.indexOf(activeStep);
+    nodes.forEach(function (step) {
+      var name = step.getAttribute ? step.getAttribute('data-step') : null;
+      var idx = LEAN_STEPS.indexOf(name);
+      if (step.classList) {
+        step.classList.remove('done', 'current');
+        if (idx >= 0 && idx < activeIdx) step.classList.add('done');
+        else if (idx === activeIdx) step.classList.add('current');
+      }
+    });
+    var current = (typeof leanStepsListEl.querySelector === 'function')
+      ? leanStepsListEl.querySelector('.step.current') : null;
+    if (current && typeof current.scrollIntoView === 'function') {
+      try { current.scrollIntoView({ block: 'nearest' }); } catch (e) {}
+    }
   }
 
   // ---------- RPC client (id-keyed, supports concurrency) ----------
@@ -369,15 +397,23 @@ var leanOverlayEl = $('lean-overlay');
     if (leanOverlayEl) {
       leanOverlayEl.style.display = isInstalling ? 'flex' : 'none';
     }
-    // Update overlay detail and progress.
+    // Update overlay detail, progress, and install checklist. The daemon
+    // reports the exact phase (provision_step); older builds fall back to
+    // the downloading/provisioning/warming flags.
     if (isInstalling && leanOverlayDetailEl && leanOverlayFillEl && leanOverlayPctEl) {
+      var phase = (r.provision_step && LEAN_STEPS.indexOf(r.provision_step) >= 0) ? r.provision_step
+        : r.downloading ? 'download'
+        : r.provisioning ? 'extract'
+        : r.warming ? 'warm' : null;
       if (r.downloading && r.total > 0) {
         var dpct = Math.floor(r.downloaded * 100 / r.total);
         leanOverlayDetailEl.textContent = 'Downloading Lean… ' + dpct + '%';
         leanOverlayFillEl.style.width = dpct + '%';
         leanOverlayPctEl.textContent = dpct + '%';
       } else if (r.provisioning) {
-        leanOverlayDetailEl.textContent = 'Extracting Lean into container…';
+        leanOverlayDetailEl.textContent = phase === 'ldconfig' ? 'Registering Lean shared libraries…'
+          : phase === 'probe' ? 'Verifying Lean runtime…'
+          : 'Extracting Lean into container…';
         leanOverlayFillEl.style.width = '100%';
         leanOverlayPctEl.textContent = 'working…';
       } else if (r.warming) {
@@ -386,6 +422,7 @@ var leanOverlayEl = $('lean-overlay');
         leanOverlayFillEl.style.width = pct + '%';
         leanOverlayPctEl.textContent = pct + '%';
       }
+      if (phase) updateLeanSteps(phase);
     }
     // Gate chat area on Lean readiness.
     setChatAreaVisible(r.ready);
