@@ -25,6 +25,14 @@ object ModelDiscovery {
         }
     }
 
+    /**
+     * Per-provider key resolution for refresh-all: a provider's own saved
+     * key wins; the typed field is only a fallback. This keeps one
+     * provider's key from causing phantom 401s on every other provider.
+     */
+    fun resolveProviderKey(scopedKey: String, typedKey: String): String =
+        scopedKey.ifBlank { typedKey }
+
     fun discoverModels(provider: String, body: String): List<DiscoveredModel> {
         val ids = parseModelIds(provider, body)
         return ids.map { DiscoveredModel(it, inferFree(provider, it)) }

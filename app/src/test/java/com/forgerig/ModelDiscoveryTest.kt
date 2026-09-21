@@ -111,4 +111,12 @@ class ModelDiscoveryTest {
         assertEquals(2, counts.total)
         assertEquals("1 free / 2 models", counts.label())
     }
+
+    @Test
+    fun scopedKeyWinsOverTypedKey() {
+        assertEquals("scoped", ModelDiscovery.resolveProviderKey("scoped", "typed"))
+        assertEquals("typed", ModelDiscovery.resolveProviderKey("", "typed"))
+        assertEquals("", ModelDiscovery.resolveProviderKey("", ""))
+        assertEquals("scoped", ModelDiscovery.resolveProviderKey("scoped", ""))
+    }
 }

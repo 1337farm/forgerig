@@ -338,6 +338,12 @@ class SettingsActivity : AppCompatActivity() {
         root.addView(label("API key"))
         val keyEdit = editText(current.apiKey, "stored encrypted on this device")
         root.addView(keyEdit)
+        root.addView(TextView(this).apply {
+            text = "The key is saved per provider — refresh-all queries each provider with its own saved key."
+            setTextColor(0xFF999999.toInt())
+            textSize = 12f
+            setPadding(0, dp(2), 0, 0)
+        })
         root.addView(label("Max output tokens (blank = provider default)"))
         val maxTokensEdit = editText(current.maxTokens, "e.g. 2000").apply {
             setInputType(android.text.InputType.TYPE_CLASS_NUMBER)
@@ -351,6 +357,34 @@ class SettingsActivity : AppCompatActivity() {
                 evalEdit.setText(item.removeSuffix(FREE_SUFFIX))
             }
             override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+        }
+
+        fun storedKeyFor(provider: String, base: String): String {
+            return try {
+                val scope = if (provider == "custom" && base.isNotBlank()) {
+                    SettingsStore.customScope(base)
+                } else {
+                    SettingsStore.llmScope(provider)
+                }
+                SettingsStore.getKey(this@SettingsActivity, scope)
+            } catch (e: Exception) {
+                // Keystore unavailable: fail closed to blank (callers then
+                // report auth/connection failures instead of crashing).
+                ""
+            }
+        }
+
+        fun keyFor(provider: String, base: String, typedKey: String): String =
+            ModelDiscovery.resolveProviderKey(storedKeyFor(provider, base), typedKey)
+
+        fun prefillKeyFor(provider: String) {
+            if (keyEdit.text.toString().isBlank()) {
+                val saved = storedKeyFor(
+                    provider,
+                    if (provider == "custom") urlEdit.text.toString().trim() else "",
+                )
+                if (saved.isNotBlank()) keyEdit.setText(saved)
+            }
         }
 
         fun fetchModelsFor(provider: String, base: String, key: String): List<ModelDiscovery.DiscoveredModel> {
@@ -370,13 +404,10 @@ class SettingsActivity : AppCompatActivity() {
         }
 
         fun fetchModels() {
-            // `current` above is the loaded Settings snapshot; this shadows it
-            // with the selected provider code so the name no longer collides.
-            val selectedProvider = providerOptions[spinner.selectedItemPosition].second
             Toast.makeText(this, "Refreshing all providers…", Toast.LENGTH_SHORT).show()
             Thread {
                 try {
-                    val key = keyEdit.text.toString().trim()
+                    val typedKey = keyEdit.text.toString().trim()
                     val customBase = urlEdit.text.toString().trim()
                     var totalAdded = 0
                     var totalSeen = 0
@@ -395,6 +426,11 @@ class SettingsActivity : AppCompatActivity() {
                             skipped.add("ollama: local server not configured")
                             continue
                         }
+                        // Per-provider keys: the single typed field belongs to
+                        // the selected provider only. Other providers use their
+                        // own saved key so one provider's key never causes
+                        // phantom 401s elsewhere.
+                        val key = keyFor(code, base, typedKey)
                         try {
                             val discovered = fetchModelsFor(code, base, key)
                             totalSeen += discovered.size
@@ -429,6 +465,17 @@ class SettingsActivity : AppCompatActivity() {
             setTextColor(0xFFe6e6e6.toInt())
             setOnClickListener { fetchModels() }
         })
+        // Prefill the key field from the selected provider's own saved key
+        // (legacy single key as fallback). Switching providers never
+        // clobbers typed text — only a blank field is filled in.
+        prefillKeyFor(providerOptions[spinner.selectedItemPosition].second)
+        spinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: android.view.View?, position: Int, id: Long) {
+                prefillKeyFor(providerOptions[position].second)
+                refreshModels()
+            }
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+        }
         refreshModels()
 
         // Network Allowlist section
@@ -451,10 +498,11 @@ class SettingsActivity : AppCompatActivity() {
             setTextColor(0xFFFFFFFF.toInt())
             setOnClickListener {
                 try {
+                    val selectedProvider = providerOptions[spinner.selectedItemPosition].second
                     SettingsStore.save(
                         this@SettingsActivity,
                         Settings(
-                            provider = providerOptions[spinner.selectedItemPosition].second,
+                            provider = selectedProvider,
                             model = modelEdit.text.toString(),
                             evalModel = evalEdit.text.toString(),
                             baseUrl = urlEdit.text.toString(),
@@ -462,6 +510,23 @@ class SettingsActivity : AppCompatActivity() {
                             maxTokens = maxTokensEdit.text.toString(),
                         ),
                     )
+                    // Persist the typed key under the selected provider's own
+                    // scope so refresh-all and the daemon use per-provider
+                    // keys (legacy single-key field stays as fallback).
+                    try {
+                        val typedKey = keyEdit.text.toString().trim()
+                        if (typedKey.isNotEmpty()) {
+                            val typedBase = urlEdit.text.toString().trim()
+                            val scope = if (selectedProvider == "custom" && typedBase.isNotEmpty()) {
+                                SettingsStore.customScope(typedBase)
+                            } else {
+                                SettingsStore.llmScope(selectedProvider)
+                            }
+                            SettingsStore.setKey(this@SettingsActivity, scope, typedKey)
+                        }
+                    } catch (e: Exception) {
+                        AssetExtractor.logShared(this@SettingsActivity, "WARNING: per-provider key save failed | $e")
+                    }
                 } catch (e: Exception) {
                     AssetExtractor.logShared(this@SettingsActivity, "ERROR: settings save refused (fail-closed) | $e")
                     Toast.makeText(this@SettingsActivity, "Secure storage unavailable — key NOT saved.", Toast.LENGTH_LONG).show()
