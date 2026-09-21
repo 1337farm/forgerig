@@ -1,8 +1,5 @@
 package com.forgerig
 
-import org.json.JSONArray
-import org.json.JSONObject
-
 /**
  * Provider model-list discovery without Android UI dependencies.
  *
@@ -12,6 +9,12 @@ import org.json.JSONObject
 object ModelDiscovery {
     data class ModelQuery(val url: String, val auth: String?)
 
+    data class DiscoveredModel(val id: String, val free: Boolean)
+
+    data class ProviderCounts(val code: String, val free: Int, val total: Int) {
+        fun label(): String = "$free free / $total models"
+    }
+
     fun buildQuery(provider: String, base: String, key: String): ModelQuery? {
         if (provider == "custom" && base.isEmpty()) return null
         val normalizedBase = base.trimEnd('/')
@@ -20,6 +23,40 @@ object ModelDiscovery {
             "ollama" -> ModelQuery("$normalizedBase/api/tags", null)
             else -> ModelQuery("$normalizedBase/v1/models", key.ifEmpty { null })
         }
+    }
+
+    fun discoverModels(provider: String, body: String): List<DiscoveredModel> {
+        val ids = parseModelIds(provider, body)
+        return ids.map { DiscoveredModel(it, inferFree(provider, it)) }
+    }
+
+    /**
+     * Provider-aware free-model classification.
+     *
+     * The `/v1/models` payloads do not expose pricing/entitlement consistently:
+     * - NVIDIA returns a browsable catalog where “callable with credits” does
+     *   not mean “free”.
+     * - OpenRouter marks genuinely free endpoints with `:free`; every other
+     *   vendor-prefixed ID is billable even when it has a free-looking name.
+     * - Gemini/Ollama/local catalog entries are covered by their free tiers or
+     *   local execution, so names alone cannot disqualify them here.
+     */
+    fun inferFree(provider: String, modelId: String): Boolean {
+        if (modelId.endsWith(":free")) return true
+        // OpenRouter's `openrouter/auto` router can land on free endpoints
+        // (and honors the account's free routing); every other vendor ID is
+        // billable unless it carries the explicit `:free` suffix.
+        if (provider == "openrouter" && modelId == "openrouter/auto") return true
+        return when (provider) {
+            "openrouter" -> false
+            "nvidia" -> modelId == "nvidia/llama-3.1-nemotron-70b-instruct"
+            else -> false
+        }
+    }
+
+    fun providerCounts(code: String, options: List<Pair<String, Boolean>>): ProviderCounts {
+        val unique = options.distinctBy { it.first }
+        return ProviderCounts(code, unique.count { it.second }, unique.size)
     }
 
     fun parseModelIds(provider: String, body: String): List<String> {
