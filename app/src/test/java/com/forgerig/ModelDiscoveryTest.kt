@@ -1,6 +1,7 @@
 package com.forgerig
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -66,5 +67,48 @@ class ModelDiscoveryTest {
             merged,
         )
         assertTrue(merged.contains("nvidia/llama-3.1-nemotron-70b-instruct"))
+    }
+
+    @Test
+    fun nvidiaCatalogIdsAreNotAllFree() {
+        assertTrue(ModelDiscovery.inferFree("nvidia", "nvidia/llama-3.1-nemotron-70b-instruct"))
+        assertFalse(ModelDiscovery.inferFree("nvidia", "meta/llama-3.1-405b-instruct"))
+        assertFalse(ModelDiscovery.inferFree("nvidia", "mistralai/mixtral-8x22b-instruct-v0.1"))
+        assertFalse(ModelDiscovery.inferFree("nvidia", "deepseek-ai/deepseek-r1"))
+        assertFalse(ModelDiscovery.inferFree("nvidia", "nvidia/nemotron-4-340b-instruct"))
+    }
+
+    @Test
+    fun openRouterOnlyMarksFreeSuffixedModelsFree() {
+        assertTrue(ModelDiscovery.inferFree("openrouter", "openrouter/auto"))
+        assertTrue(ModelDiscovery.inferFree("openrouter", "nvidia/nemotron-3.5-lightning:free"))
+        assertFalse(ModelDiscovery.inferFree("openrouter", "meta-llama/llama-3.3-70b-instruct"))
+        assertFalse(ModelDiscovery.inferFree("openrouter", "google/gemma-3-27b-it"))
+    }
+
+    @Test
+    fun discoverModelsCarriesProviderFreeFlags() {
+        val models = ModelDiscovery.discoverModels(
+            "nvidia",
+            """{"data":[{"id":"nvidia/llama-3.1-nemotron-70b-instruct"},{"id":"nvidia/nemotron-4-340b-instruct"}]}""",
+        )
+        assertEquals(2, models.size)
+        assertTrue(models.first { it.id == "nvidia/llama-3.1-nemotron-70b-instruct" }.free)
+        assertFalse(models.first { it.id == "nvidia/nemotron-4-340b-instruct" }.free)
+    }
+
+    @Test
+    fun providerCountsLabelShowsFreeOverTotal() {
+        val counts = ModelDiscovery.providerCounts(
+            "nvidia",
+            listOf(
+                "nvidia/llama-3.1-nemotron-70b-instruct" to true,
+                "nvidia/nemotron-4-340b-instruct" to false,
+                "nvidia/llama-3.1-nemotron-70b-instruct" to true,
+            ),
+        )
+        assertEquals(1, counts.free)
+        assertEquals(2, counts.total)
+        assertEquals("1 free / 2 models", counts.label())
     }
 }
