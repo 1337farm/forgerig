@@ -45,6 +45,54 @@ pub fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Resolve the host scratch dir proot needs (PROOT_TMP_DIR), creating it.
+///
+/// Loud on failure: a missing/unwritable scratch dir surfaces downstream as
+/// cryptic proot "can't chmod ... proot-tmp" + execve failures deep inside
+/// installs, so log exactly what went wrong instead of silently falling back
+/// to proot's built-in default (a Termux $PREFIX/tmp path that exists nowhere
+/// on a device).
+fn ensure_proot_tmp_dir() -> Option<String> {
+    let cache = std::env::var("CONTAINER_CACHE").ok().filter(|s| !s.is_empty());
+    let cache = match cache {
+        Some(c) => c,
+        None => {
+            eprintln!("proot tmp: CONTAINER_CACHE unset, PROOT_TMP_DIR not set (proot falls back to its built-in default)");
+            return None;
+        }
+    };
+    let tmp = format!("{cache}/proot-tmp");
+    match std::fs::create_dir_all(&tmp) {
+        Ok(()) => Some(tmp),
+        Err(e) => {
+            eprintln!("proot tmp: cannot create {tmp}: {e} (guest commands are likely to fail; check app storage)");
+            None
+        }
+    }
+}
+
+/// Cheap guest-shell readiness check through the same proot wrapping installs
+/// use. Lets callers fail fast with an actionable message (incomplete rootfs
+/// / broken proot scratch) instead of burning a ~550 MB download and then
+/// dumping raw proot errors.
+pub async fn guest_shell_ready() -> Result<(), String> {
+    let r = run_trusted_limited("true", Duration::from_secs(30)).await;
+    if r.timed_out {
+        return Err("guest shell probe timed out after 30s".to_string());
+    }
+    if r.exit_code == Some(0) {
+        return Ok(());
+    }
+    // Truncate: proot dumps multi-line help text on failure.
+    let first: Vec<&str> = r.stderr.lines().take(4).collect();
+    let detail = if first.is_empty() {
+        format!("exit {:?}", r.exit_code)
+    } else {
+        format!("exit {:?}: {}", r.exit_code, first.join(" | "))
+    };
+    Err(detail)
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct BashExecutor;
 
@@ -103,13 +151,10 @@ fn build_cmd_binds(command: &str, sandbox: bool, binds: &[String]) -> Command {
         // device. Point PROOT_TMP_DIR at a real dir in the app's cache so the
         // warnings disappear and binds of large archives always have scratch.
         // TMPDIR=/tmp is for tools running INSIDE the guest (Ubuntu has /tmp).
-        if let Ok(cache) = std::env::var("CONTAINER_CACHE") {
-            if !cache.is_empty() {
-                let tmp = format!("{cache}/proot-tmp");
-                if std::fs::create_dir_all(&tmp).is_ok() {
-                    cmd.env("PROOT_TMP_DIR", &tmp);
-                }
-            }
+        // Failures are logged loudly by the helper (a missing scratch dir
+        // breaks every guest exec with a cryptic proot dump).
+        if let Some(tmp) = ensure_proot_tmp_dir() {
+            cmd.env("PROOT_TMP_DIR", &tmp);
         }
         cmd.env("TMPDIR", "/tmp");
         // Bind the host-generated resolv.conf so guest tools (apt/git/gh) can

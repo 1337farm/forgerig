@@ -65,6 +65,17 @@ static LEAN_WARMED: AtomicBool = AtomicBool::new(false);
 static LEAN_WARMING: AtomicBool = AtomicBool::new(false);
 /// Epoch millis when the current warm-up started (for elapsed-time display).
 static LEAN_WARM_STARTED_MS: AtomicU64 = AtomicU64::new(0);
+/// Current install phase for the UI checklist: one of "download", "extract",
+/// "ldconfig", "probe", "warm" ("" when idle). Tells the overlay exactly which
+/// step is running so done/remaining is obvious without parsing log text.
+static LEAN_PROVISION_STEP: Mutex<String> = Mutex::new(String::new());
+
+fn set_provision_step(step: &str) {
+    if let Ok(mut s) = LEAN_PROVISION_STEP.lock() {
+        s.clear();
+        s.push_str(step);
+    }
+}
 
 /// RAII guard: marks the download active on creation and inactive on drop,
 ///
@@ -125,6 +136,10 @@ pub struct LeanStatus {
     /// Warm-up cap in seconds (elapsed is measured against this). 0 = unknown.
     #[serde(default)]
     pub warm_timeout: u64,
+    /// Current install phase for the UI checklist ("download" | "extract" |
+    /// "ldconfig" | "probe" | "warm"). Absent when idle.
+    #[serde(default)]
+    pub provision_step: Option<String>,
 }
 
 fn now_ms() -> u64 {
@@ -166,6 +181,11 @@ fn snapshot(ready: bool, version: Option<String>) -> LeanStatus {
         warming,
         warm_elapsed,
         warm_timeout: LEAN_WARM_PROBE_TIMEOUT.as_secs(),
+        provision_step: LEAN_PROVISION_STEP
+            .lock()
+            .ok()
+            .map(|s| s.clone())
+            .filter(|s| !s.is_empty()),
     }
 }
 
@@ -427,6 +447,7 @@ pub async fn extract_in_guest(archive: &Path) -> Result<(), LeanError> {
 
     // ---- Step 1/3: unpack ----
     eprintln!("lean install step 1/3: unpacking archive into /usr/local");
+    set_provision_step("extract");
     let t0 = Instant::now();
     let cmd = format!(
         "mkdir -p /usr/local/bin && zstd -d -c {} | tar -x --strip-components=1 -C /usr/local",
@@ -475,6 +496,7 @@ pub async fn extract_in_guest(archive: &Path) -> Result<(), LeanError> {
 
     // ---- Step 2/3: ldconfig so the loader finds libInit_shared.so etc. ----
     eprintln!("lean install step 2/3: running ldconfig");
+    set_provision_step("ldconfig");
     let t1 = Instant::now();
     let r = tools::run_trusted_limited(
         &format!("ldconfig {} 2>/dev/null || true", LEAN_LIB),
@@ -498,6 +520,7 @@ pub async fn extract_in_guest(archive: &Path) -> Result<(), LeanError> {
     if !r3.stdout.trim().is_empty() {
         eprintln!("lean install step 3/3: extracted lean tree:\n{}", r3.stdout.trim());
     }
+    set_provision_step("probe");
     probe_lean_version().await;
     Ok(())
 }
@@ -557,6 +580,7 @@ async fn probe_lean_version_limited(timeout: Duration) -> Option<String> {
 /// process start is what kept the UI bar spinning.
 async fn warm_lean(need_probe: bool) {
     let t = Instant::now();
+    set_provision_step("warm");
     let r = tools::run_trusted_limited(
         "cat /usr/local/lib/lean/*.so* > /dev/null 2>&1 || true",
         LEAN_PRELOAD_TIMEOUT,
@@ -609,13 +633,15 @@ pub async fn provision() -> String {
     // Gate on binary presence (status() is a cheap test -x, NOT a lean run):
     // the version banner may be uncached (probe timed out), so keying on it
     // would reinstall a working toolchain every time.
-    if status().await.ready {
-        let ver = status().await.version.unwrap_or_else(|| "unknown version".to_string());
+    let st = status().await;
+    if st.ready {
+        let ver = st.version.unwrap_or_else(|| "unknown version".to_string());
         println!("lean provision: already installed ({ver})");
         return format!("Lean already installed ({ver})");
     }
     println!("lean provision: starting download + install");
-    match provision_inner().await {
+    set_provision_step("download");
+    let out = match provision_inner().await {
         Ok(msg) => {
             // One bounded probe populates the cached banner before this reads it,
             // but tolerate it being uncached if the probe was slow/timed out.
@@ -628,7 +654,11 @@ pub async fn provision() -> String {
             eprintln!("{msg}");
             msg
         }
-    }
+    };
+    // Install settled (success or failure): the overlay hides, so clear the
+    // step marker for the next run.
+    set_provision_step("");
+    out
 }
 
 /// Fire-and-forget provisioning: returns immediately so the UI can poll
@@ -657,6 +687,15 @@ pub async fn kick_off_provision() -> String {
 }
 
 async fn provision_inner() -> Result<String, LeanError> {
+    // Fail fast on a broken guest BEFORE the ~550 MB download: a partial
+    // rootfs (or broken proot scratch) makes every guest exec fail with raw
+    // proot dumps (e.g. execve("/usr/bin/sh"): No such file or directory).
+    // Surfacing that here keeps the retry message actionable.
+    if let Err(detail) = tools::guest_shell_ready().await {
+        return Err(LeanError::Install(format!(
+            "container guest shell unavailable ({detail}) — the environment install may be incomplete; reinstall the environment, then retry the Lean install"
+        )));
+    }
     let entry = tokio::task::spawn_blocking(fetch_lean_entry)
         .await
         .map_err(|e| LeanError::Manifest(format!("join: {e}")))??;

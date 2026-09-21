@@ -43,16 +43,35 @@
   #lean-overlay {
     position: fixed; inset: 0; z-index: 1000;
     background: var(--bg); color: var(--ink);
-    display: none; flex-direction: column; align-items: center; justify-content: center;
-    gap: 1rem; padding: 1rem;
+    display: none; flex-direction: column; align-items: center; justify-content: flex-start;
+    gap: .7rem; padding: 1.2rem 1rem; overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
   }
   #lean-overlay.active { display: flex; }
-  #lean-overlay .logo { font-size: 2.5rem; color: var(--accent); }
-  #lean-overlay .title { font-size: 1.1rem; font-weight: 600; }
-  #lean-overlay .detail { font-size: .85rem; color: var(--muted); max-width: 80%; text-align: center; }
-  #lean-overlay .progress-bar { width: 100%; max-width: 320px; height: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  #lean-overlay .logo { font-size: 2.5rem; color: var(--accent); flex: 0 0 auto; }
+  #lean-overlay .title { font-size: 1.1rem; font-weight: 600; flex: 0 0 auto; }
+  #lean-overlay .detail { font-size: .85rem; color: var(--muted); max-width: 80%; text-align: center; flex: 0 0 auto; }
+  #lean-overlay .progress-bar { width: 100%; max-width: 320px; height: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; flex: 0 0 auto; }
   #lean-overlay .progress-fill { height: 100%; width: 0; background: linear-gradient(90deg, var(--accent-deep), var(--accent)); }
-  #lean-overlay .pct { font-size: .8rem; color: var(--ink); }
+  #lean-overlay .pct { font-size: .8rem; color: var(--ink); flex: 0 0 auto; }
+  /* Install checklist: done/current/remaining at a glance. Scrollable on
+     small screens; the current step auto-scrolls into view (user scroll
+     otherwise untouched). */
+  #lean-overlay .steps-list {
+    width: 100%; max-width: 320px; max-height: 38vh; overflow-y: auto;
+    -webkit-overflow-scrolling: touch; text-align: left; flex: 0 1 auto;
+  }
+  #lean-overlay .steps-list .step {
+    padding: .35rem .55rem; margin: .25rem 0; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 6px; font-size: .78rem; color: var(--muted);
+  }
+  #lean-overlay .steps-list .step.done { color: var(--ok); text-decoration: line-through; }
+  #lean-overlay .steps-list .step.current { color: var(--ink); font-weight: 600; border-color: var(--accent-soft); }
+  #lean-overlay .steps-list .step.current .dot {
+    display: inline-block; width: 9px; height: 9px; margin-right: 6px;
+    border-radius: 50%; background-color: var(--accent); animation: tblink 1.2s infinite;
+  }
+  @keyframes tblink { 50% { opacity: 0.25; } }
   .row { display: flex; align-items: center; gap: .5rem; }
   .row.between { justify-content: space-between; }
   h1 { font-size: 1.1rem; margin: 0; font-weight: 600; color: var(--accent); }
@@ -251,6 +270,13 @@
   <div class="detail" id="lean-overlay-detail">Preparing installation</div>
   <div class="progress-bar"><div class="progress-fill" id="lean-overlay-fill"></div></div>
   <div class="pct" id="lean-overlay-pct">0%</div>
+  <div class="steps-list" id="lean-steps-list">
+    <div class="step" data-step="download">Download Lean archive (~550 MB)</div>
+    <div class="step" data-step="extract">Extract into container (/usr/local)</div>
+    <div class="step" data-step="ldconfig">Register shared libraries (ldconfig)</div>
+    <div class="step" data-step="probe">Verify Lean runtime (lean --version)</div>
+    <div class="step" data-step="warm">Warm up runtime (page-cache preload)</div>
+  </div>
 </div>
 <header>
   <div class="row between">
