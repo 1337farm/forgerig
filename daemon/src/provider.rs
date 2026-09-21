@@ -256,7 +256,7 @@ impl Provider {
             Provider::Nvidia => Some("https://integrate.api.nvidia.com"),
             Provider::Groq => Some("https://api.groq.com/openai"),
             Provider::DeepSeek => Some("https://api.deepseek.com"),
-            Provider::Mistral => Some("https://api.mistral.ai/v1"),
+            Provider::Mistral => Some("https://api.mistral.ai"),
             Provider::Ollama => Some("http://localhost:11434"),
             Provider::Gemini | Provider::Custom => None,
         }
@@ -265,7 +265,10 @@ impl Provider {
     fn default_chat_model(self) -> &'static str {
         match self {
             Provider::OpenAi => "gpt-4o-mini",
-            Provider::OpenRouter => "meta-llama/llama-3.3-70b-instruct:free",
+            // `openrouter/auto` always resolves (the curated `:free` slugs
+            // rot out of the catalog); it routes near the low cost band by
+            // default and supports tool calling like any selected model.
+            Provider::OpenRouter => "openrouter/auto",
             Provider::Nvidia => "nvidia/llama-3.1-nemotron-70b-instruct",
             Provider::Groq => "llama-3.3-70b-versatile",
             Provider::DeepSeek => "deepseek-chat",
@@ -346,11 +349,33 @@ struct LoggedOpenAiModel {
     base_url: String,
     api_key: String,
     model: String,
+    /// Extra headers (e.g. OpenRouter attribution). Never logged.
+    extra_headers: Vec<(String, String)>,
+}
+
+/// Join a provider base URL to the OpenAI-compatible chat path without
+/// doubling a trailing `/v1` (the Mistral `/v1/v1/...` bug).
+fn chat_completions_url(base_url: &str) -> String {
+    format!("{}/v1/chat/completions", base_url.trim_end_matches('/'))
+}
+
+/// Attribution headers OpenRouter uses for app ranking/discoverability.
+/// Only sent to OpenRouter; other OpenAI-compatible providers ignore them.
+fn openrouter_headers() -> Vec<(String, String)> {
+    vec![
+        ("HTTP-Referer".to_string(), "https://github.com/1337farm/forgerig".to_string()),
+        ("X-Title".to_string(), "ForgeRig".to_string()),
+    ]
 }
 
 impl LoggedOpenAiModel {
     fn new(http: reqwest::Client, base_url: String, api_key: String, model: String) -> Self {
-        Self { http, base_url, api_key, model }
+        Self { http, base_url, api_key, model, extra_headers: Vec::new() }
+    }
+
+    fn with_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.extra_headers = headers;
+        self
     }
 
     /// POST that returns the raw streaming response (caller reads SSE).
@@ -359,17 +384,21 @@ impl LoggedOpenAiModel {
         &self,
         body: &serde_json::Value,
     ) -> Result<reqwest::Response, completion::CompletionError> {
-        let url = format!("{}/v1/chat/completions", self.base_url.trim_end_matches('/'));
+        let url = chat_completions_url(&self.base_url);
         let request_json = serde_json::to_string(body).map_err(completion::CompletionError::JsonError)?;
         eprintln!("chat http: -> POST {url} (model={}, stream)", self.model);
         eprintln!("chat http: request {request_json}");
         let t0 = std::time::Instant::now();
-        let resp = self
+        let mut req = self
             .http
             .post(&url)
             .bearer_auth(&self.api_key)
             .header("Connection", "close")
-            .header("Accept", "text/event-stream")
+            .header("Accept", "text/event-stream");
+        for (k, v) in &self.extra_headers {
+            req = req.header(k, v);
+        }
+        let resp = req
             .json(body)
             .send()
             .await;
@@ -395,13 +424,13 @@ impl LoggedOpenAiModel {
         &self,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, completion::CompletionError> {
-        let url = format!("{}/v1/chat/completions", self.base_url.trim_end_matches('/'));
+        let url = chat_completions_url(&self.base_url);
         let request_json = serde_json::to_string(body).map_err(completion::CompletionError::JsonError)?;
         eprintln!("chat http: -> POST {url} (model={})", self.model);
         eprintln!("chat http: request {request_json}");
 
         let t0 = std::time::Instant::now();
-        let send_result = self
+        let mut req = self
             .http
             .post(&url)
             .bearer_auth(&self.api_key)
@@ -410,7 +439,11 @@ impl LoggedOpenAiModel {
             // may have half-closed, which hangs the *second* call until our
             // timeout ("operation timed out") — the classic first-works-
             // second-hangs symptom.
-            .header("Connection", "close")
+            .header("Connection", "close");
+        for (k, v) in &self.extra_headers {
+            req = req.header(k, v);
+        }
+        let send_result = req
             .json(body)
             .send()
             .await;
@@ -876,10 +909,19 @@ impl Backend {
                 .timeout(std::time::Duration::from_secs(180))
                 .build()
                 .expect("reqwest client should build");
-            let model = LoggedOpenAiModel::new(http.clone(), base.to_string(), key.clone(), chat_model.clone());
+            let extra = if provider == Provider::OpenRouter {
+                openrouter_headers()
+            } else {
+                Vec::new()
+            };
+            let model = LoggedOpenAiModel::new(http.clone(), base.to_string(), key.clone(), chat_model.clone())
+                .with_headers(extra.clone());
             let eval: Extractor<LoggedOpenAiModel, EvaluationResult> =
-                ExtractorBuilder::new(LoggedOpenAiModel::new(http, base.to_string(), key.clone(), eval_model.clone()))
-                    .build();
+                ExtractorBuilder::new(
+                    LoggedOpenAiModel::new(http, base.to_string(), key.clone(), eval_model.clone())
+                        .with_headers(extra),
+                )
+                .build();
 
             let mut tools = ToolSet::default();
             tools.add_tool(BashExecutor::default());
@@ -1083,5 +1125,45 @@ mod tests {
         assert!(!is_stopped(&flag));
         flag.store(true, std::sync::atomic::Ordering::SeqCst);
         assert!(is_stopped(&flag));
+    }
+
+    #[test]
+    fn chat_url_never_doubles_api_version() {
+        // Regression: the Mistral base once ended in `/v1`, producing
+        // `.../v1/v1/chat/completions` on every chat call.
+        assert_eq!(
+            chat_completions_url("https://api.mistral.ai"),
+            "https://api.mistral.ai/v1/chat/completions"
+        );
+        for provider in [
+            Provider::OpenAi,
+            Provider::OpenRouter,
+            Provider::Nvidia,
+            Provider::Groq,
+            Provider::DeepSeek,
+            Provider::Mistral,
+            Provider::Ollama,
+        ] {
+            let base = provider.default_base_url().unwrap();
+            let url = chat_completions_url(base);
+            assert!(
+                !url.contains("/v1/v1/"),
+                "{base} joined to {url} doubles the version"
+            );
+        }
+    }
+
+    #[test]
+    fn openrouter_default_model_always_resolves() {
+        // Curated `:free` slugs rot out of the catalog (404); the auto
+        // router slug is stable and routes near the low cost band.
+        assert_eq!(Provider::OpenRouter.default_chat_model(), "openrouter/auto");
+    }
+
+    #[test]
+    fn openrouter_headers_carry_attribution() {
+        let headers = openrouter_headers();
+        assert!(headers.iter().any(|(k, v)| k == "HTTP-Referer" && v.contains("forgerig")));
+        assert!(headers.iter().any(|(k, v)| k == "X-Title" && !v.is_empty()));
     }
 }
