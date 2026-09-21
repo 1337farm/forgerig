@@ -106,15 +106,11 @@ class ContainerService : Service() {
     }
 
     /**
-     * True only when the guest can actually boot: /bin/sh AND /usr/bin/sh must
-     * both resolve (/bin is a usrmerge symlink → /usr/bin on Ubuntu). A bare
+     * True only when the guest can actually boot (see [RootfsCheck]): a bare
      * dir-exists check lets a partial extraction boot a broken guest, whose
      * every exec then fails with proot execve("/usr/bin/sh") ENOENT.
      */
-    private fun rootfsComplete(): Boolean {
-        val root = File(filesDir, "ubuntu_rootfs")
-        return File(root, "bin/sh").exists() && File(root, "usr/bin/sh").exists()
-    }
+    private fun rootfsComplete(): Boolean = RootfsCheck.isComplete(filesDir)
 
     private var lastInstallNotif = ""
     /** Last agent-status text mirrored to the notification (dedup key). */
@@ -594,9 +590,9 @@ class ContainerService : Service() {
      * release the TCP port before rebinding.
      */
     private fun restartContainer(reason: String) {
-        if (!File(filesDir, "ubuntu_rootfs/bin/sh").exists()) {
-            AssetExtractor.logShared(this, "restart requested but environment not installed; ignoring ($reason)")
-            notifyMessage("ForgeRig", "Environment not installed yet — install first.", 2)
+        if (!RootfsCheck.isComplete(filesDir)) {
+            AssetExtractor.logShared(this, "restart requested but environment incomplete; ignoring ($reason)")
+            notifyMessage("ForgeRig", "Environment incomplete — reinstall first.", 2)
             return
         }
         AssetExtractor.logShared(this, "Restarting container: $reason")

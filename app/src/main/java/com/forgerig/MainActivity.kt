@@ -644,12 +644,11 @@ if (installState && typeof window.NativeHost.isInstalled === 'function') {
             startServiceAction(ContainerService.ACTION_INSTALL)
         }
 
-        /** True once the Ubuntu rootfs has been extracted (environment installed). */
+        /** True once the Ubuntu rootfs is complete enough to boot. */
         @JavascriptInterface
         fun isInstalled(): Boolean {
             return try {
-                val sh = File(context.filesDir, "ubuntu_rootfs/bin/sh")
-                sh.exists()
+                RootfsCheck.isComplete(context.filesDir)
             } catch (e: Exception) {
                 false
             }
