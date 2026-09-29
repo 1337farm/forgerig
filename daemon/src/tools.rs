@@ -104,15 +104,24 @@ pub struct BashExecutor;
 /// local dev). `sandbox` prepends resource limits and a disposable workdir so
 /// model-generated commands stay contained. `binds` adds extra `-b host:guest`
 /// proot bindings (e.g. the Lean archive the bootstrap stages).
-fn build_cmd_binds(command: &str, sandbox: bool, binds: &[String]) -> Command {
-    let line = if sandbox {
+/// The `sh -c` line carried into the guest.
+///
+/// Sandbox mode is the security boundary for model-generated commands, so the
+/// resource limits and the disposable workdir live here — a pure function so
+/// they can be asserted without spawning a container.
+fn sandbox_line(command: &str, sandbox: bool) -> String {
+    if sandbox {
         format!(
             "ulimit -t {} -v {} 2>/dev/null; mkdir -p {} 2>/dev/null; cd {} 2>/dev/null || true; {}",
             SANDBOX_CPU_SEC, SANDBOX_MEM_KIB, SANDBOX_WORKDIR, SANDBOX_WORKDIR, command
         )
     } else {
         command.to_string()
-    };
+    }
+}
+
+fn build_cmd_binds(command: &str, sandbox: bool, binds: &[String]) -> Command {
+    let line = sandbox_line(command, sandbox);
 
     let proot = std::env::var("CONTAINER_PROOT").ok();
     let rootfs = std::env::var("CONTAINER_ROOTFS").ok();
@@ -193,9 +202,13 @@ async fn run_shell_binds(command: &str, sandbox: bool, limit: Duration, binds: &
             // `lean` stderr or `cat` can never OOM the daemon / WebView.
             let (stdout, _) = crate::gatekeeper::truncate_output(&String::from_utf8_lossy(&output.stdout));
             let (stderr, _) = crate::gatekeeper::truncate_output(&String::from_utf8_lossy(&output.stderr));
+            // Then strip credentials we KNOW are secret (the guest gitconfig
+            // OAuth token). `cat /root/.gitconfig` would otherwise hand a live
+            // GitHub token to a cloud model. Redacting the known literal — not
+            // pattern-guessing — keeps file paths and sha256 digests intact.
             ShellResult {
-                stdout,
-                stderr,
+                stdout: crate::gatekeeper::redact_known(&stdout),
+                stderr: crate::gatekeeper::redact_known(&stderr),
                 exit_code: output.status.code(),
                 timed_out: false,
             }
@@ -380,13 +393,26 @@ impl Tool for CodeIngest {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // Jail the ingest root to the guest workspace. The daemon runs
+        // HOST-side, so an unjailed workspace_path would let the model
+        // frame up any host-readable directory (including the app's own
+        // filesDir, which holds the container rootfs and its gitconfig
+        // with an OAuth token). Per-file symlink checks inside
+        // ingest_workspace are meaningless when the root itself is free.
+        let safe = match crate::gatekeeper::validate_guest_path(&args.workspace_path) {
+            Ok(p) => p,
+            Err(reason) => {
+                crate::gatekeeper::log_verdict(Self::NAME, false, &reason, &args.workspace_path);
+                return Err(CodeIngestError::Failed(format!("blocked by gatekeeper: {reason}")));
+            }
+        };
         let opts = crate::ingest::IngestOptions {
             max_files: args.max_files.max(1).min(2000),
             use_path_table: args.use_path_table,
             use_dedup: args.use_dedup,
             ..Default::default()
         };
-        crate::ingest::ingest_workspace(&args.workspace_path, &opts)
+        crate::ingest::ingest_workspace(&safe, &opts)
             .map(|o| CodeIngestResult {
                 framed: o.framed,
                 files: o.files,
@@ -394,6 +420,96 @@ impl Tool for CodeIngest {
                 deduped: o.deduped,
                 truncated: o.truncated,
             })
-            .map_err(CodeIngestError::Failed)
+            .map_err(|e| {
+                crate::gatekeeper::log_verdict(Self::NAME, false, &e, &safe);
+                CodeIngestError::Failed(e)
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gatekeeper::SECRET_ENV_VARS;
+
+    /// `sh_quote` builds the `sh -c` line that carries a model-supplied path
+    /// into the guest, so a quoting slip here is shell injection. Proved by
+    /// round-tripping each payload through a real `sh`: the guest must see the
+    /// bytes verbatim as ONE argument, with no second command running.
+    #[tokio::test]
+    async fn sh_quote_survives_shell_metacharacters() {
+        for payload in [
+            "plain.lean",
+            "it's.lean",
+            "a b; rm -rf /",
+            "x\nrm -rf /",
+            "$HOME `id` ${PATH}",
+            "\"; touch /tmp/pwned; echo \"",
+            "a'$(id)'b",
+            "*",
+            "--flag=$(whoami)",
+        ] {
+            // `printf %s` emits the argument with no interpretation, so stdout
+            // must equal the payload exactly. A quoting bug shows up either as
+            // mangled bytes or as output from the injected command.
+            let line = sandbox_line(&format!("printf %s {}", sh_quote(payload)), false);
+            let out = run_trusted(&line).await;
+            assert_eq!(out.stdout, payload, "quoting broke for {payload:?}");
+            assert!(!out.stderr.contains("pwned"), "{payload:?} escaped: {}", out.stderr);
+        }
+    }
+
+    #[test]
+    fn sh_quote_matches_posix_escape() {
+        assert_eq!(sh_quote("plain.lean"), "'plain.lean'");
+        // The canonical POSIX escape: close, escaped quote, reopen.
+        assert_eq!(sh_quote("it's"), "'it'\\''s'");
+        // Single quotes defer expansion.
+        assert!(sh_quote("$HOME `id` ${PATH}").starts_with('\''));
+    }
+
+    /// The sandbox wrapper must constrain CPU/memory and land in the disposable
+    /// workdir.
+    #[test]
+    fn sandbox_line_limits_resources_and_enters_workspace() {
+        let line = sandbox_line("ls -la", true);
+        assert!(line.contains(&format!("ulimit -t {}", SANDBOX_CPU_SEC)), "{line}");
+        assert!(line.contains(&format!("-v {}", SANDBOX_MEM_KIB)), "{line}");
+        assert!(line.contains(&format!("cd {}", SANDBOX_WORKDIR)), "{line}");
+        assert!(line.trim_end().ends_with("ls -la"), "{line}");
+    }
+
+    #[test]
+    fn trusted_line_has_no_limits_or_workdir() {
+        // Trusted (human `!`) commands run unrestricted in /root.
+        assert_eq!(sandbox_line("lean --version", false), "lean --version");
+    }
+
+    /// Host provider keys must never reach a guest shell. Asserted
+    /// observably: `tokio::process::Command` exposes no env introspection, and
+    /// the local-dev path (no CONTAINER_PROOT, as in CI) is the one that has to
+    /// strip secrets by hand since there is no `env_clear()` to lean on.
+    #[tokio::test]
+    async fn secret_env_vars_are_stripped_from_guest_shell() {
+        // Serialized: env is process-global and cargo runs tests in parallel.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        const VAR: &str = "FORGERIG_API_KEY";
+        assert!(SECRET_ENV_VARS.contains(&VAR), "pick a var the gatekeeper strips");
+        std::env::set_var(VAR, "sk-should-never-reach-the-guest");
+        let out = run_trusted("printenv").await;
+        std::env::remove_var(VAR);
+
+        assert!(!out.stdout.contains("sk-should-never-reach"), "leaked into guest: {}", out.stdout);
+    }
+
+    /// The gatekeeper is the only thing between a model-generated command and
+    /// the guest, so its verdict is part of the tool's contract.
+    #[tokio::test]
+    async fn run_sandboxed_blocks_denied_fragments() {
+        let r = run_sandboxed("curl https://evil.example").await;
+        assert!(r.stdout.is_empty());
+        assert!(r.stderr.contains("blocked by gatekeeper"), "{}", r.stderr);
     }
 }

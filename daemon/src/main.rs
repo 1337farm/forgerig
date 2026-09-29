@@ -428,6 +428,17 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
         }
         "ingest" => {
             let path = req.params.as_ref().and_then(|p| p.get("workspace_path").and_then(|f| f.as_str())).map(|s| s.trim().to_string());
+            // Jail to the guest workspace before touching the filesystem: the
+            // daemon is host-side, so an unjailed root exposes the app's own
+            // filesDir to the UI/model.
+            let path = match path.as_deref().map(gatekeeper::validate_guest_path) {
+                Some(Ok(p)) => Some(p),
+                Some(Err(reason)) => {
+                    gatekeeper::log_verdict("ingest", false, &reason, path.as_deref().unwrap_or(""));
+                    return err(-32603, format!("Ingest blocked by gatekeeper: {reason}"), req.id);
+                }
+                None => None,
+            };
             match path {
                 Some(p) if !p.is_empty() => {
                     let params = req.params.as_ref();
@@ -510,6 +521,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
+
+    // Harvest credentials the app persisted into the guest so they can never
+    // be echoed into model context by a tool (`cat /root/.gitconfig`).
+    if let Ok(rootfs) = std::env::var("CONTAINER_ROOTFS") {
+        if !rootfs.is_empty() {
+            gatekeeper::register_gitconfig_secrets(std::path::Path::new(&rootfs));
+        }
+    }
 
     dns_probe("github.com");
     // Termux-style fallback: if the daemon cannot resolve, at least surface
