@@ -187,10 +187,11 @@ const SYSTEM_PREAMBLE: &str = "\
 You are an autonomous orchestrator daemon running in a Linux userland inside an \
 Android app. Your tools are: `bash_executor` (run shell commands in the work \
 container), `lean_executor` (type-check a `.lean` file already written into \
-`/root/workspace`), `code_ingest` (frame a workspace directory into context \
+your session workspace), `code_ingest` (frame a workspace directory into context \
 with path tables and dedup), `net_fetch` (fetch an allowlisted https URL), and \
 `wasm_transformer` (run a sandboxed WASM `transform(i32)->i32`). All file paths \
-are jailed to `/root/workspace`; raw network tools like curl/wget are denied, so \
+are jailed to your own session workspace (its absolute path is in the session \
+context below); raw network tools like curl/wget are denied, so \
 use `net_fetch` for the network. Be concise and action-oriented. Format replies \
 as Markdown. Formatting contract (the client parses this output, so follow it \
 exactly): use fenced code blocks with a language tag for all code, inline code \
@@ -315,17 +316,23 @@ pub struct Backend {
     /// Provider enum for dynamic key resolution.
     provider: Provider,
     chat_model: String,
+    /// Held so each turn can build a tool set bound to the talking session's
+    /// workspace. Tools are constructed per turn (they are cheap structs) —
+    /// a process-wide set cannot know which session is talking.
+    memory: Arc<MemoryEngine>,
 }
 
 enum BackendKind {
     Compat {
         model: LoggedOpenAiModel,
-        tools: ToolSet,
         tool_defs: Vec<serde_json::Value>,
         eval: Extractor<LoggedOpenAiModel, EvaluationResult>,
     },
     Gemini {
-        agent: rig::agent::Agent<gemini::completion::CompletionModel>,
+        /// Kept so the agent can be rebuilt per turn with session-bound tools.
+        key: String,
+        model: String,
+        max_tokens: Option<u64>,
         eval: Extractor<gemini::completion::CompletionModel, EvaluationResult>,
     },
 }
@@ -891,20 +898,8 @@ impl Backend {
 
         let kind = if provider == Provider::Gemini {
             let client = gemini::Client::new(&key);
-            let builder = client
-                .agent(&chat_model)
-                .preamble(SYSTEM_PREAMBLE)
-                .tool(BashExecutor::default())
-                .tool(WasmTransformer::default())
-                .tool(LeanExecutor::default())
-                .tool(CodeIngest::default())
-                .tool(NetFetchTool::new(memory.clone(), "global".to_string()));
-            let agent = match max_tokens_limit() {
-                Some(mt) => builder.max_tokens(mt).build(),
-                None => builder.build(),
-            };
             let eval = client.extractor::<EvaluationResult>(&eval_model).build();
-            BackendKind::Gemini { agent, eval }
+            BackendKind::Gemini { key: key.clone(), model: chat_model.clone(), max_tokens: max_tokens_limit(), eval }
         } else {
             let base = base_url.as_deref().unwrap_or("https://api.openai.com");
             eprintln!("provider={} base_url={} model={} eval_model={}", provider.name(), base, chat_model, eval_model);
@@ -929,13 +924,6 @@ impl Backend {
                 )
                 .build();
 
-            let mut tools = ToolSet::default();
-            tools.add_tool(BashExecutor::default());
-            tools.add_tool(WasmTransformer::default());
-            tools.add_tool(LeanExecutor::default());
-            tools.add_tool(CodeIngest::default());
-            tools.add_tool(NetFetchTool::new(memory.clone(), "global".to_string()));
-
             let bash_def = BashExecutor::default().definition(String::new()).await;
             let wasm_def = WasmTransformer::default().definition(String::new()).await;
             let lean_def = LeanExecutor::default().definition(String::new()).await;
@@ -955,26 +943,66 @@ impl Backend {
                 })
                 .collect();
 
-            BackendKind::Compat { model, tools, tool_defs, eval }
+            BackendKind::Compat { model, tool_defs, eval }
         };
 
-        Self { kind, provider, chat_model }
+        Self { kind, provider, chat_model, memory }
+    }
+
+    /// Build the model-facing tool set for one session.
+    ///
+    /// The filesystem tools are bound to that session's own workspace, so two
+    /// sessions never share a cwd, an ingest root, or a Lean source path.
+    /// `net_fetch` deliberately stays on the `global` network-policy scope: the
+    /// allowlist is an app concern, not a per-session one.
+    fn tools_for_session(&self, session: &str) -> ToolSet {
+        let mut tools = ToolSet::default();
+        tools.add_tool(BashExecutor::for_session(session));
+        tools.add_tool(WasmTransformer::default());
+        tools.add_tool(LeanExecutor::for_session(session));
+        tools.add_tool(CodeIngest::for_session(session));
+        tools.add_tool(NetFetchTool::new(self.memory.clone(), "global".to_string()));
+        tools
+    }
+
+    /// Rebuild the Gemini agent for one session (its tools carry the session
+    /// workspace; a process-wide agent built at startup cannot).
+    fn gemini_agent(&self, session: &str) -> rig::agent::Agent<gemini::completion::CompletionModel> {
+        let BackendKind::Gemini { key, model, max_tokens, .. } = &self.kind else {
+            unreachable!("gemini_agent called on a non-Gemini backend");
+        };
+        let client = gemini::Client::new(key);
+        let builder = client
+            .agent(model)
+            .preamble(SYSTEM_PREAMBLE)
+            .tool(BashExecutor::for_session(session))
+            .tool(WasmTransformer::default())
+            .tool(LeanExecutor::for_session(session))
+            .tool(CodeIngest::for_session(session))
+            .tool(NetFetchTool::new(self.memory.clone(), "global".to_string()));
+        match max_tokens {
+            Some(mt) => builder.max_tokens(*mt).build(),
+            None => builder.build(),
+        }
     }
 
     pub async fn chat_session(
         &self,
         messages: &mut Vec<serde_json::Value>,
         prompt: &str,
+        session: &str,
     ) -> Result<String, String> {        // The compat model bounds each HTTP round-trip with a 15s connect +
         // 180s read timeout (see LoggedOpenAiModel); this outer cap bounds the
         // whole tool loop (up to MAX_TOOL_TURNS round-trips).
+        let tools = self.tools_for_session(session);
         let fut = match &self.kind {
-            BackendKind::Compat { model, tools, tool_defs, .. } => {
+            BackendKind::Compat { model, tool_defs, .. } => {
                 futures_util::future::Either::Left(async move {
-                    run_agent_loop(model, tools, tool_defs, messages, prompt).await.map_err(|e| e.to_string())
+                    run_agent_loop(model, &tools, tool_defs, messages, prompt).await.map_err(|e| e.to_string())
                 })
             }
-            BackendKind::Gemini { agent, .. } => {
+            BackendKind::Gemini { .. } => {
+                let agent = self.gemini_agent(session);
                 // Gemini has no exposed multi-turn history; flatten the prior
                 // user/assistant turns into a single transcript.
                 let transcript = messages
@@ -1011,16 +1039,19 @@ impl Backend {
         prompt: &str,
         emit: &tokio::sync::mpsc::UnboundedSender<StreamEvent>,
         stop: &StopFlag,
+        session: &str,
     ) -> Result<String, String> {
+        let tools = self.tools_for_session(session);
         let fut = match &self.kind {
-            BackendKind::Compat { model, tools, tool_defs, .. } => {
+            BackendKind::Compat { model, tool_defs, .. } => {
                 futures_util::future::Either::Left(async move {
-                    run_agent_loop_streaming(model, tools, tool_defs, messages, prompt, emit, stop)
+                    run_agent_loop_streaming(model, &tools, tool_defs, messages, prompt, emit, stop)
                         .await
                         .map_err(|e| e.to_string())
                 })
             }
-            BackendKind::Gemini { agent, .. } => {
+            BackendKind::Gemini { .. } => {
+                let agent = self.gemini_agent(session);
                 let transcript = messages
                     .iter()
                     .filter_map(|m| match (m.get("role").and_then(|r| r.as_str()), m.get("content").and_then(|c| c.as_str())) {

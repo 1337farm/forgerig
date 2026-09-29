@@ -107,8 +107,12 @@ pub fn is_sensitive_dir(name: &str) -> bool {
 }
 
 /// Normalize a guest path lexically (no I/O) and require it to stay under
-/// `GUEST_WORKSPACE`. Rejects `..` escapes and non-absolute paths.
-pub fn validate_guest_path(path: &str) -> Result<String, String> {
+/// `root`. Rejects `..` escapes and non-absolute paths.
+///
+/// `root` is the caller's jail. Session-bound tools pass
+/// `session_workspace(id)` so one session cannot read or write another
+/// session's files; trusted daemon-internal callers pass `GUEST_WORKSPACE`.
+pub fn validate_guest_path_in(root: &str, path: &str) -> Result<String, String> {
     let p = path.trim();
     if p.is_empty() {
         return Err("empty path".to_string());
@@ -128,11 +132,40 @@ pub fn validate_guest_path(path: &str) -> Result<String, String> {
         }
     }
     let normalized = format!("/{}", parts.join("/"));
-    let prefix = format!("{}/", GUEST_WORKSPACE);
-    if normalized == GUEST_WORKSPACE || normalized.starts_with(&prefix) {
+    let root = root.trim_end_matches('/');
+    let prefix = format!("{root}/");
+    if normalized == root || normalized.starts_with(&prefix) {
         Ok(normalized)
     } else {
-        Err(format!("path escapes workspace: {p}"))
+        Err(format!("path escapes workspace {root}: {p}"))
+    }
+}
+
+/// Normalize a guest path against the shared global workspace root.
+pub fn validate_guest_path(path: &str) -> Result<String, String> {
+    validate_guest_path_in(GUEST_WORKSPACE, path)
+}
+
+/// Prefix a guest path with the container root to get the HOST path that
+/// actually holds it.
+///
+/// The daemon runs host-side against `CONTAINER_ROOTFS`, so guest
+/// `/root/workspace/x` is really `<rootfs>/root/workspace/x` on the host.
+/// Tools that read the filesystem directly instead of going through proot
+/// (`code_ingest`, the `ingest` RPC) must translate first, or they look for
+/// `/root/...` on Android and fail. Without a rootfs set (local dev, where the
+/// daemon is itself in-guest) the path is returned unchanged.
+pub fn guest_to_host(guest: &str) -> std::path::PathBuf {
+    map_guest_path(std::env::var("CONTAINER_ROOTFS").ok().as_deref(), guest)
+}
+
+/// Pure core of `guest_to_host`, so the mapping is testable without mutating
+/// the process environment.
+fn map_guest_path(rootfs: Option<&str>, guest: &str) -> std::path::PathBuf {
+    let guest = guest.trim();
+    match rootfs.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(rootfs) => std::path::Path::new(rootfs).join(guest.trim_start_matches('/')),
+        None => std::path::PathBuf::from(guest),
     }
 }
 
@@ -539,6 +572,44 @@ mod tests {
         assert_eq!(session_workspace("../../etc"), "/root/workspace/etc");
         assert_eq!(session_workspace(""), "/root/workspace/default");
         assert_eq!(session_workspace("a/b"), "/root/workspace/ab");
+    }
+
+    /// The session jail is the point of the small-team model: a session must
+    /// not read a sibling's files, and must not fall back to the shared root
+    /// that holds them all.
+    #[test]
+    fn session_jail_excludes_siblings_and_the_global_root() {
+        let a = session_workspace("alpha");
+        let b = session_workspace("beta");
+        // Your own directory and subdirectories are fine.
+        assert_eq!(validate_guest_path_in(&a, &a).unwrap(), a);
+        assert_eq!(validate_guest_path_in(&a, &format!("{a}/src/main.rs")).unwrap(), format!("{a}/src/main.rs"));
+        // A sibling session's files are refused...
+        assert!(validate_guest_path_in(&a, &format!("{b}/secrets.txt")).is_err());
+        // ...as is the shared root and anything under it.
+        assert!(validate_guest_path_in(&a, GUEST_WORKSPACE).is_err());
+        assert!(validate_guest_path_in(&a, &format!("{GUEST_WORKSPACE}/beta")).is_err());
+        // `..` cannot climb out of the session back to the root.
+        assert!(validate_guest_path_in(&a, &format!("{a}/../beta")).is_err());
+    }
+
+    /// The daemon is host-side, so guest paths must be prefixed with the
+    /// rootfs before any direct filesystem read (`code_ingest`).
+    #[test]
+    fn guest_to_host_prefixes_the_rootfs_only_when_set() {
+        assert_eq!(
+            map_guest_path(Some("/data/app/root"), "/root/workspace/a").to_string_lossy(),
+            "/data/app/root/root/workspace/a"
+        );
+        // Trailing slash on the root must not double up.
+        assert_eq!(
+            map_guest_path(Some("/data/app/root/"), "/root/workspace/a").to_string_lossy(),
+            "/data/app/root/root/workspace/a"
+        );
+        // No rootfs (daemon in-guest / local dev): identity.
+        assert_eq!(map_guest_path(None, "/root/workspace/a").to_string_lossy(), "/root/workspace/a");
+        // Blank rootfs behaves as unset rather than producing `//root/...`.
+        assert_eq!(map_guest_path(Some("  "), "/root/x").to_string_lossy(), "/root/x");
     }
 
     #[test]
