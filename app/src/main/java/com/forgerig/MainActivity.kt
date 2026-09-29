@@ -247,7 +247,7 @@ class MainActivity : AppCompatActivity() {
                                     // partial download files resumes the install.
                                     // Re-entry guards live on the native side
                                     // (shared state), so repeated ticks are no-ops.
-if (installState && typeof window.NativeHost.isInstalled === 'function') {
+                                    if (installState && typeof window.NativeHost.isInstalled === 'function') {
                                     var inst = window.NativeHost.isInstalled();
                                     if (inst && (installState.phase === 'idle' ||
                                         installState.phase === 'extracted' ||
@@ -265,7 +265,16 @@ if (installState && typeof window.NativeHost.isInstalled === 'function') {
                                 }
                                 }
                                 renderInstall();
-                                setTimeout(pollInstall, 300);
+                                // "ready" hands off to the workspace and "failed" is a
+                                // terminal error page, so neither needs more ticks. Every
+                                // other phase (notably "idle", which re-attaches to a
+                                // service that may still be starting) must keep polling.
+                                if (installState &&
+                                    (installState.phase === 'ready' ||
+                                     installState.phase === 'failed')) {
+                                    return;
+                                }
+                                setTimeout(pollInstall, 1000);
                             }
 
                             function renderSteps(failedStep) {
@@ -752,30 +761,36 @@ if (installState && typeof window.NativeHost.isInstalled === 'function') {
                 }
                 step = 4
                 stage = "Connecting to daemon…"
-                val maxAttempts = 60
-                var attempt = 0
-                var ready = false
                 val statusFile = File(context.filesDir, "ubuntu_rootfs/.forgerig-status")
-                while (attempt < maxAttempts && phase == "installing") {
+                var lastStatusMtime: Long = -1
+                var ready = false
+
+                for (attempt in 1..ProbeHelper.MAX_ATTEMPTS) {
+                    if (phase != "installing") break
+
                     try {
-                        if (statusFile.exists()) {
-                            val status = statusFile.readText().trim()
-                            if (status.startsWith("exit:") || status.startsWith("missing:") || status.startsWith("exec-denied:")) {
-                                AssetExtractor.logShared(context, "ERROR: Container status: $status")
-                                phase = "failed"
-                                error = "Container exited early"
-                                errorDetail = "Container status: $status. See Downloads/${AssetExtractor.sharedLogFileName()} for details."
-                                InstallState.phase = "failed"
-                                InstallState.error = error
-                                InstallState.errorDetail = errorDetail
-                                break
+                        if (ProbeHelper.statusDirty(statusFile, lastStatusMtime)) {
+                            if (statusFile.exists()) {
+                                val status = statusFile.readText().trim()
+                                if (status.startsWith("exit:") || status.startsWith("missing:") || status.startsWith("exec-denied:")) {
+                                    AssetExtractor.logShared(context, "ERROR: Container status: $status")
+                                    phase = "failed"
+                                    error = "Container exited early"
+                                    errorDetail = "Container status: $status. See Downloads/${AssetExtractor.sharedLogFileName()} for details."
+                                    InstallState.phase = "failed"
+                                    InstallState.error = error
+                                    InstallState.errorDetail = errorDetail
+                                    stopContainerService()
+                                    return@thread
+                                }
                             }
+                            lastStatusMtime = statusFile.lastModified()
                         }
                     } catch (e: Exception) {
                         // Status unreadable; keep probing HTTP.
                     }
-                    attempt++
-                    detail = "Probing daemon on 127.0.0.1:${MainActivity.allocatedPort} (attempt $attempt/$maxAttempts)…"
+
+                    detail = "Probing daemon on 127.0.0.1:${MainActivity.allocatedPort} (attempt $attempt/${ProbeHelper.MAX_ATTEMPTS})…"
                     try {
                         val url = URL("http://127.0.0.1:${MainActivity.allocatedPort}/")
                         val conn = url.openConnection() as HttpURLConnection
@@ -790,12 +805,16 @@ if (installState && typeof window.NativeHost.isInstalled === 'function') {
                             ready = true
                             break
                         }
-                        AssetExtractor.logShared(context, "Probe attempt $attempt/$maxAttempts: HTTP $code")
+                        AssetExtractor.logShared(context, "Probe attempt $attempt/${ProbeHelper.MAX_ATTEMPTS}: HTTP $code")
                     } catch (e: Exception) {
-                        AssetExtractor.logShared(context, "Probe attempt $attempt/$maxAttempts failed: ${e.message}")
+                        AssetExtractor.logShared(context, "Probe attempt $attempt/${ProbeHelper.MAX_ATTEMPTS} failed: ${e.message}")
                     }
-                    Thread.sleep(1000)
+
+                    if (attempt < ProbeHelper.MAX_ATTEMPTS) {
+                        Thread.sleep(ProbeHelper.delayBefore(attempt))
+                    }
                 }
+
                 if (ready) {
                     AssetExtractor.logShared(context, "DONE: Container ready, opening workspace")
                     percent = 100
@@ -803,10 +822,10 @@ if (installState && typeof window.NativeHost.isInstalled === 'function') {
                     InstallState.percent = 100
                     InstallState.phase = "ready"
                 } else if (phase == "installing") {
-                    AssetExtractor.logShared(context, "ERROR: Container did not respond after $maxAttempts attempts")
+                    AssetExtractor.logShared(context, "ERROR: Container did not respond after ${ProbeHelper.MAX_ATTEMPTS} attempts")
                     phase = "failed"
                     error = "Container did not respond in time"
-                    errorDetail = "Timed out after $maxAttempts attempts probing " +
+                    errorDetail = "Timed out after ${ProbeHelper.MAX_ATTEMPTS} attempts probing " +
                         "http://127.0.0.1:${MainActivity.allocatedPort}/. The service started but " +
                         "nothing serves HTTP. See Downloads/${AssetExtractor.sharedLogFileName()} for details."
                     InstallState.phase = "failed"

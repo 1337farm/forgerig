@@ -573,7 +573,7 @@ class AssetExtractor(private val context: Context) {
                             }
                             val detail = String.format(Locale.US, "%d files (%s)", done, entry.name)
                             progress.onProgress(percent, "Unpacking container files…", detail)
-                            if (done % 500 == 0) {
+                            if (done % 5000 == 0) {
                                 log("PROGRESS [$percent%] Unpacking container files… - $detail")
                             }
                             entry = tarStream.nextTarEntry
