@@ -203,8 +203,25 @@ pub struct LeanExecutorArgs {
     pub file: String,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct LeanExecutor;
+#[derive(Clone, Debug)]
+pub struct LeanExecutor {
+    /// Guest workspace the `.lean` file path is jailed to. `Default` is the
+    /// shared workspace; a session-bound instance uses its own directory.
+    workdir: String,
+}
+
+impl Default for LeanExecutor {
+    fn default() -> Self {
+        Self { workdir: crate::gatekeeper::GUEST_WORKSPACE.to_string() }
+    }
+}
+
+impl LeanExecutor {
+    /// Bind this tool to one session's isolated workspace.
+    pub fn for_session(session_id: &str) -> Self {
+        Self { workdir: crate::gatekeeper::session_workspace(session_id) }
+    }
+}
 
 #[derive(Deserialize, Clone, Debug)]
 struct LeanEntry {
@@ -777,6 +794,13 @@ fn cached_lean_version() -> Option<String> {
 /// refused (typecheck only — no execution gate bypass), and output is
 /// truncated by the shared runner.
 pub async fn run_on_file(file: &str) -> ShellResult {
+    run_on_file_in(crate::gatekeeper::GUEST_WORKSPACE, file).await
+}
+
+/// As `run_on_file`, but jailing the source path to `workdir` and starting the
+/// typecheck there. A session-bound `LeanExecutor` passes its own workspace so
+/// it cannot typecheck (and thereby read) another session's sources.
+pub async fn run_on_file_in(workdir: &str, file: &str) -> ShellResult {
     if !status().await.ready {
         eprintln!("lean run_on_file: Lean not installed");
         return ShellResult {
@@ -786,7 +810,7 @@ pub async fn run_on_file(file: &str) -> ShellResult {
             timed_out: false,
         };
     }
-    let safe = match crate::gatekeeper::validate_guest_path(file) {
+    let safe = match crate::gatekeeper::validate_guest_path_in(workdir, file) {
         Ok(p) => p,
         Err(reason) => {
             crate::gatekeeper::log_verdict("lean_executor", false, &reason, file);
@@ -807,7 +831,7 @@ pub async fn run_on_file(file: &str) -> ShellResult {
             timed_out: false,
         };
     }
-    let r = tools::run_lean_jailed(&format!("LD_LIBRARY_PATH={} {} {}", LEAN_LIB, LEAN_BIN, tools::sh_quote(&safe)), LEAN_TIMEOUT).await;
+    let r = tools::run_lean_jailed_in(workdir, &format!("LD_LIBRARY_PATH={} {} {}", LEAN_LIB, LEAN_BIN, tools::sh_quote(&safe)), LEAN_TIMEOUT).await;
     if r.exit_code != Some(0) {
         eprintln!("lean run_on_file: exit {:?} file={}", r.exit_code, file);
     }
@@ -839,13 +863,22 @@ impl Tool for LeanExecutor {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        Ok(run_on_file(&args.file).await)
+        Ok(run_on_file_in(&self.workdir, &args.file).await)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session-bound Lean tool type-checks inside that session's workspace;
+    /// an unbound one keeps the shared root for the UI-driven `lean` RPC.
+    #[test]
+    fn lean_executor_binds_session_workdir() {
+        let ws = crate::gatekeeper::session_workspace("sess-1");
+        assert_eq!(LeanExecutor::for_session("sess-1").workdir, ws);
+        assert_eq!(LeanExecutor::default().workdir, crate::gatekeeper::GUEST_WORKSPACE);
+    }
 
     #[test]
     fn manifest_parse_picks_linux_aarch64_entry() {

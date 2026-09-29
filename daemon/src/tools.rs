@@ -93,8 +93,26 @@ pub async fn guest_shell_ready() -> Result<(), String> {
     Err(detail)
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct BashExecutor;
+#[derive(Clone, Debug)]
+pub struct BashExecutor {
+    /// Guest directory the command starts in. `Default` is the shared
+    /// workspace (trusted/tests callers); the model-facing path binds one
+    /// session's own directory via `for_session`.
+    workdir: String,
+}
+
+impl Default for BashExecutor {
+    fn default() -> Self {
+        Self { workdir: SANDBOX_WORKDIR.to_string() }
+    }
+}
+
+impl BashExecutor {
+    /// Bind this tool to one session's isolated workspace.
+    pub fn for_session(session_id: &str) -> Self {
+        Self { workdir: crate::gatekeeper::session_workspace(session_id) }
+    }
+}
 
 /// Build the host `Command` that runs `command` in the work guest.
 ///
@@ -107,21 +125,23 @@ pub struct BashExecutor;
 /// The `sh -c` line carried into the guest.
 ///
 /// Sandbox mode is the security boundary for model-generated commands, so the
-/// resource limits and the disposable workdir live here — a pure function so
-/// they can be asserted without spawning a container.
-fn sandbox_line(command: &str, sandbox: bool) -> String {
+/// resource limits and the workdir live here — a pure function so they can be
+/// asserted without spawning a container. `workdir` is the jail the command
+/// starts in: the shared workspace for trusted daemon-internal callers, or a
+/// session's own directory for model-facing tools.
+fn sandbox_line(command: &str, sandbox: bool, workdir: &str) -> String {
     if sandbox {
         format!(
             "ulimit -t {} -v {} 2>/dev/null; mkdir -p {} 2>/dev/null; cd {} 2>/dev/null || true; {}",
-            SANDBOX_CPU_SEC, SANDBOX_MEM_KIB, SANDBOX_WORKDIR, SANDBOX_WORKDIR, command
+            SANDBOX_CPU_SEC, SANDBOX_MEM_KIB, workdir, workdir, command
         )
     } else {
         command.to_string()
     }
 }
 
-fn build_cmd_binds(command: &str, sandbox: bool, binds: &[String]) -> Command {
-    let line = sandbox_line(command, sandbox);
+fn build_cmd_binds(command: &str, sandbox: bool, binds: &[String], workdir: &str) -> Command {
+    let line = sandbox_line(command, sandbox, workdir);
 
     let proot = std::env::var("CONTAINER_PROOT").ok();
     let rootfs = std::env::var("CONTAINER_ROOTFS").ok();
@@ -192,8 +212,15 @@ async fn run_shell(command: &str, sandbox: bool, limit: Duration) -> ShellResult
 }
 
 async fn run_shell_binds(command: &str, sandbox: bool, limit: Duration, binds: &[String]) -> ShellResult {
+    run_shell_binds_in(SANDBOX_WORKDIR, command, sandbox, limit, binds).await
+}
+
+/// As `run_shell_binds`, but starting in `workdir` instead of the shared
+/// workspace. Model-facing tools pass their session's own directory so two
+/// concurrent sessions cannot see or clobber each other's files.
+async fn run_shell_binds_in(workdir: &str, command: &str, sandbox: bool, limit: Duration, binds: &[String]) -> ShellResult {
     let fut = async {
-        let output = build_cmd_binds(command, sandbox, binds).output().await?;
+        let output = build_cmd_binds(command, sandbox, binds, workdir).output().await?;
         Ok::<_, std::io::Error>(output)
     };
     match timeout(limit, fut).await {
@@ -231,6 +258,13 @@ async fn run_shell_binds(command: &str, sandbox: bool, limit: Duration, binds: &
 /// Model-facing, sandboxed shell (resource limits + disposable workdir).
 /// Fail-closed: oversized or exfil-shaped commands are rejected before proot.
 pub async fn run_sandboxed(command: &str) -> ShellResult {
+    run_sandboxed_in(SANDBOX_WORKDIR, command).await
+}
+
+/// As `run_sandboxed`, but starting in `workdir`. This is what binds a model
+/// session to its own files: the cwd decides which session's workspace a
+/// relative path resolves against.
+pub async fn run_sandboxed_in(workdir: &str, command: &str) -> ShellResult {
     if let Err(reason) = crate::gatekeeper::validate_command(command) {
         crate::gatekeeper::log_verdict("bash_executor", false, &reason, command);
         return ShellResult {
@@ -240,7 +274,7 @@ pub async fn run_sandboxed(command: &str) -> ShellResult {
             timed_out: false,
         };
     }
-    run_shell(command, true, SANDBOX_TIMEOUT).await
+    run_shell_binds_in(workdir, command, true, SANDBOX_TIMEOUT, &[]).await
 }
 
 /// Trusted shell for user `!` commands (no limits, longer timeout).
@@ -284,11 +318,17 @@ pub async fn ensure_session_workspace(session_id: &str) {
 /// without the 512 MiB `ulimit -v` cap (Lean loads ~500 MB of shared libs and
 /// would die under it). Wall-clock still bounded; secrets never enter the guest.
 pub async fn run_lean_jailed(command: &str, limit: Duration) -> ShellResult {
+    run_lean_jailed_in(SANDBOX_WORKDIR, command, limit).await
+}
+
+/// As `run_lean_jailed`, but starting in `workdir` (a session's own workspace
+/// for model-facing typechecks).
+pub async fn run_lean_jailed_in(workdir: &str, command: &str, limit: Duration) -> ShellResult {
     let line = format!(
         "mkdir -p {} 2>/dev/null; cd {} 2>/dev/null || true; {}",
-        SANDBOX_WORKDIR, SANDBOX_WORKDIR, command
+        workdir, workdir, command
     );
-    run_shell_binds(&line, false, limit, &[]).await
+    run_shell_binds_in(workdir, &line, false, limit, &[]).await
 }
 
 impl Tool for BashExecutor {
@@ -315,7 +355,7 @@ impl Tool for BashExecutor {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        Ok(run_sandboxed(&args.command).await)
+        Ok(run_sandboxed_in(&self.workdir, &args.command).await)
     }
 }
 
@@ -353,8 +393,25 @@ pub struct CodeIngestResult {
     pub truncated: bool,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct CodeIngest;
+#[derive(Clone, Debug)]
+pub struct CodeIngest {
+    /// The jail `workspace_path` is validated against. `Default` is the shared
+    /// workspace; a session-bound instance rejects sibling sessions' dirs.
+    workdir: String,
+}
+
+impl Default for CodeIngest {
+    fn default() -> Self {
+        Self { workdir: SANDBOX_WORKDIR.to_string() }
+    }
+}
+
+impl CodeIngest {
+    /// Bind this tool to one session's isolated workspace.
+    pub fn for_session(session_id: &str) -> Self {
+        Self { workdir: crate::gatekeeper::session_workspace(session_id) }
+    }
+}
 
 impl Tool for CodeIngest {
     const NAME: &'static str = "code_ingest";
@@ -393,16 +450,22 @@ impl Tool for CodeIngest {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        // Jail the ingest root to the guest workspace. The daemon runs
-        // HOST-side, so an unjailed workspace_path would let the model
-        // frame up any host-readable directory (including the app's own
-        // filesDir, which holds the container rootfs and its gitconfig
-        // with an OAuth token). Per-file symlink checks inside
-        // ingest_workspace are meaningless when the root itself is free.
-        let safe = match crate::gatekeeper::validate_guest_path(&args.workspace_path) {
+        // Jail the ingest root to THIS session's workspace. The daemon runs
+        // HOST-side, so an unjailed workspace_path would let the model frame up
+        // any host-readable directory (including the app's own filesDir, which
+        // holds the container rootfs and its gitconfig with an OAuth token) —
+        // and against the shared root it could read every OTHER session's
+        // files. Per-file symlink checks inside ingest_workspace are
+        // meaningless when the root itself is free.
+        let requested = if args.workspace_path.trim().is_empty() {
+            self.workdir.clone()
+        } else {
+            args.workspace_path.clone()
+        };
+        let safe = match crate::gatekeeper::validate_guest_path_in(&self.workdir, &requested) {
             Ok(p) => p,
             Err(reason) => {
-                crate::gatekeeper::log_verdict(Self::NAME, false, &reason, &args.workspace_path);
+                crate::gatekeeper::log_verdict(Self::NAME, false, &reason, &requested);
                 return Err(CodeIngestError::Failed(format!("blocked by gatekeeper: {reason}")));
             }
         };
@@ -412,7 +475,10 @@ impl Tool for CodeIngest {
             use_dedup: args.use_dedup,
             ..Default::default()
         };
-        crate::ingest::ingest_workspace(&safe, &opts)
+        // ingest_workspace reads the filesystem directly, so it needs the HOST
+        // path the validated guest path maps to.
+        let host = crate::gatekeeper::guest_to_host(&safe).to_string_lossy().into_owned();
+        crate::ingest::ingest_workspace(&host, &opts)
             .map(|o| CodeIngestResult {
                 framed: o.framed,
                 files: o.files,
@@ -452,7 +518,7 @@ mod tests {
             // `printf %s` emits the argument with no interpretation, so stdout
             // must equal the payload exactly. A quoting bug shows up either as
             // mangled bytes or as output from the injected command.
-            let line = sandbox_line(&format!("printf %s {}", sh_quote(payload)), false);
+            let line = sandbox_line(&format!("printf %s {}", sh_quote(payload)), false, SANDBOX_WORKDIR);
             let out = run_trusted(&line).await;
             assert_eq!(out.stdout, payload, "quoting broke for {payload:?}");
             assert!(!out.stderr.contains("pwned"), "{payload:?} escaped: {}", out.stderr);
@@ -472,17 +538,44 @@ mod tests {
     /// workdir.
     #[test]
     fn sandbox_line_limits_resources_and_enters_workspace() {
-        let line = sandbox_line("ls -la", true);
+        let line = sandbox_line("ls -la", true, SANDBOX_WORKDIR);
         assert!(line.contains(&format!("ulimit -t {}", SANDBOX_CPU_SEC)), "{line}");
         assert!(line.contains(&format!("-v {}", SANDBOX_MEM_KIB)), "{line}");
         assert!(line.contains(&format!("cd {}", SANDBOX_WORKDIR)), "{line}");
         assert!(line.trim_end().ends_with("ls -la"), "{line}");
     }
 
+    /// A session-bound sandbox must start in that session's directory, not the
+    /// shared root — the cwd is what isolates two sessions' relative paths.
+    #[test]
+    fn sandbox_line_honours_a_session_workdir() {
+        let ws = crate::gatekeeper::session_workspace("sess-42");
+        let line = sandbox_line("ls -la", true, &ws);
+        assert!(line.contains(&format!("mkdir -p {ws}")), "{line}");
+        assert!(line.contains(&format!("cd {ws}")), "{line}");
+        assert!(!line.contains(&format!("cd {SANDBOX_WORKDIR} ")), "{line}");
+    }
+
     #[test]
     fn trusted_line_has_no_limits_or_workdir() {
         // Trusted (human `!`) commands run unrestricted in /root.
-        assert_eq!(sandbox_line("lean --version", false), "lean --version");
+        assert_eq!(sandbox_line("lean --version", false, SANDBOX_WORKDIR), "lean --version");
+    }
+
+    /// A session-bound tool must carry that session's directory, while an
+    /// unbound one keeps the shared root for trusted/tests callers.
+    #[test]
+    fn session_bound_tools_use_the_session_workspace() {
+        let ws = crate::gatekeeper::session_workspace("sess-1");
+        assert_eq!(BashExecutor::for_session("sess-1").workdir, ws);
+        assert_eq!(CodeIngest::for_session("sess-1").workdir, ws);
+        assert_eq!(BashExecutor::default().workdir, SANDBOX_WORKDIR);
+        assert_eq!(CodeIngest::default().workdir, SANDBOX_WORKDIR);
+        // Two different sessions never collide.
+        assert_ne!(BashExecutor::for_session("alpha").workdir, BashExecutor::for_session("beta").workdir);
+        // The two spellings of the shared workspace must name one directory:
+        // an unbound tool's cwd is also the gatekeeper's jail root.
+        assert_eq!(crate::gatekeeper::GUEST_WORKSPACE, SANDBOX_WORKDIR);
     }
 
     /// Host provider keys must never reach a guest shell. Asserted

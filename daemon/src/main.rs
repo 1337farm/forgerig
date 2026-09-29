@@ -76,8 +76,21 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-async fn system_message_with_memory(memory: &Arc<MemoryEngine>) -> Value {
+/// Build the session's system message, with permanent project memory appended.
+///
+/// `session` is `Some` once the session id is known: the absolute workspace
+/// path is then injected so the model addresses files in its own directory.
+async fn system_message_with_memory(memory: &Arc<MemoryEngine>, session: Option<&str>) -> Value {
     let mut sys = provider::system_message();
+    if let Some(sid) = session {
+        // Name the exact jail: the tools are bound to this directory, so an
+        // absolute path outside it is refused by the gatekeeper.
+        let dir = gatekeeper::session_workspace(sid);
+        let base = sys.get("content").and_then(|c| c.as_str()).unwrap_or_default();
+        sys["content"] = json!(format!(
+            "{base}\n\nYour session workspace is `{dir}`. It already exists; `cd` into it and keep every file you create there."
+        ));
+    }
     if let Ok(mems) = memory.get_macro_memories(5).await {
         if !mems.is_empty() {
             let body = mems
@@ -133,7 +146,7 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
                     // Reuse an existing session's cached thread, or start a new one.
                     let sid = match session_id.filter(|s| sessions.exists(s)) {
                         Some(id) => id,
-                        None => sessions.create(system_message_with_memory(memory).await).id,
+                        None => sessions.create(system_message_with_memory(memory, None).await).id,
                     };
                     // Commit the user message to the tab immediately (before
                     // the provider is even contacted) so the tab exists, has
@@ -141,9 +154,10 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
                     sessions.append_message(&sid, json!({ "role": "user", "content": p }));
                     let mut messages = sessions.thread(&sid).unwrap_or_else(|| vec![provider::system_message()]);
                     // Keep the session's system message synced with the latest
-                    // permanent project memory (spans sessions/projects).
+                    // permanent project memory (spans sessions/projects) and
+                    // with this session's workspace path.
                     if let Some(first) = messages.first_mut() {
-                        *first = system_message_with_memory(memory).await;
+                        *first = system_message_with_memory(memory, Some(&sid)).await;
                     }
                     eprintln!("chat: session={sid} prompt_len={}", p.len());
                     // Streaming: acknowledge immediately so the UI can paint
@@ -167,7 +181,7 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
                     let push2 = Arc::clone(push);
                     let sid2 = sid.clone();
                     tokio::spawn(async move {
-                        match backend2.chat_session_streaming(&mut messages, &p, &etx, &stop).await {
+                        match backend2.chat_session_streaming(&mut messages, &p, &etx, &stop, &sid2).await {
                             Ok(completion) => {
                                 eprintln!("chat: completion (len={})", completion.len());
                                 let (sc, _) = gatekeeper::scrub_secrets(&completion);
@@ -246,7 +260,10 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
             if goal.len() > 2000 {
                 return err(-32602, "goal too long (2000 chars max)".into(), req.id);
             }
-            match sessions.spawn_subagent(&parent, &role, &goal, system_message_with_memory(memory).await) {
+            // The spawn's own id is what the sub-agent will use, so its system
+            // message must not name the parent's workspace. It is filled in on
+            // the sub-agent's first turn, once its id is known.
+            match sessions.spawn_subagent(&parent, &role, &goal, system_message_with_memory(memory, None).await) {
                 Some(s) => {
                     tools::ensure_session_workspace(&s.id).await;
                     gatekeeper::log_verdict("session_spawn", true, "sub-agent spawned", &format!("{parent} -> {}", s.id));
@@ -430,9 +447,10 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
             let path = req.params.as_ref().and_then(|p| p.get("workspace_path").and_then(|f| f.as_str())).map(|s| s.trim().to_string());
             // Jail to the guest workspace before touching the filesystem: the
             // daemon is host-side, so an unjailed root exposes the app's own
-            // filesDir to the UI/model.
+            // filesDir to the UI/model. `guest_to_host` then translates, since
+            // `ingest_workspace` walks the HOST filesystem directly.
             let path = match path.as_deref().map(gatekeeper::validate_guest_path) {
-                Some(Ok(p)) => Some(p),
+                Some(Ok(p)) => Some(gatekeeper::guest_to_host(&p)),
                 Some(Err(reason)) => {
                     gatekeeper::log_verdict("ingest", false, &reason, path.as_deref().unwrap_or(""));
                     return err(-32603, format!("Ingest blocked by gatekeeper: {reason}"), req.id);
@@ -448,7 +466,7 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
                         use_dedup: params.and_then(|x| x.get("use_dedup")).and_then(|x| x.as_bool()).unwrap_or(true),
                         ..Default::default()
                     };
-                    match ingest::ingest_workspace(&p, &opts) {
+                    match ingest::ingest_workspace(&p.to_string_lossy(), &opts) {
                         Ok(o) => ok(json!({ "framed": o.framed, "files": o.files, "bytes": o.bytes, "deduped": o.deduped, "truncated": o.truncated }), req.id),
                         Err(e) => err(-32603, format!("Ingest error: {e}"), req.id),
                     }
