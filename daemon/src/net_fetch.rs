@@ -67,6 +67,32 @@ impl NetFetchTool {
     }
 }
 
+/// Extract the host that the NetworkPolicy must be asked about.
+///
+/// Split out from `call` so the scheme/host rules are unit-testable without a
+/// database or a socket — this is the only thing standing between a
+/// model-supplied string and the allowlist, so the parsing must be done by a
+/// real URL parser and never by string splitting. `https://github.com@evil.com/`
+/// is the case that punishes a naive split: its host is `evil.com`, not
+/// `github.com`.
+fn https_host(url: &str) -> Result<String, NetFetchError> {
+    let url = url.trim();
+    if !url.starts_with("https://") {
+        return Err(NetFetchError::NotAllowed("only https:// URLs allowed".to_string()));
+    }
+    let parsed = url::Url::parse(url)
+        .map_err(|_| NetFetchError::NotAllowed("invalid URL".to_string()))?;
+    // Reject a port-less-but-scheme-relative or schemeless parse the prefix
+    // check let through by accident.
+    if parsed.scheme() != "https" {
+        return Err(NetFetchError::NotAllowed("only https:// URLs allowed".to_string()));
+    }
+    parsed
+        .host_str()
+        .map(|h| h.to_string())
+        .ok_or_else(|| NetFetchError::NotAllowed("no host in URL".to_string()))
+}
+
 impl Tool for NetFetchTool {
     const NAME: &'static str = "net_fetch";
 
@@ -100,26 +126,13 @@ impl Tool for NetFetchTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        // Validate URL scheme and extract host.
+        // Scheme + host extraction, then the deny-by-default policy check.
         let url = args.url.trim();
-        if !url.starts_with("https://") {
-            gatekeeper::log_verdict("net_fetch", false, "non-https-url", url);
-            return Err(NetFetchError::NotAllowed("only https:// URLs allowed".to_string()));
-        }
-
-        let parsed = match url::Url::parse(url) {
-            Ok(u) => u,
-            Err(_) => {
-                gatekeeper::log_verdict("net_fetch", false, "invalid-url", url);
-                return Err(NetFetchError::NotAllowed("invalid URL".to_string()));
-            }
-        };
-
-        let host = match parsed.host_str() {
-            Some(h) => h.to_string(),
-            None => {
-                gatekeeper::log_verdict("net_fetch", false, "no-host", url);
-                return Err(NetFetchError::NotAllowed("no host in URL".to_string()));
+        let host = match https_host(url) {
+            Ok(h) => h,
+            Err(e) => {
+                gatekeeper::log_verdict("net_fetch", false, &e.to_string(), url);
+                return Err(e);
             }
         };
 
@@ -215,5 +228,67 @@ pub trait NetFetchExt {
 impl NetFetchExt for Arc<MemoryEngine> {
     fn net_fetch_tool(&self, scope: String) -> NetFetchTool {
         NetFetchTool::new(self.clone(), scope)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only https is brokered. Everything else is refused before any socket
+    /// or policy lookup, so a non-https URL can never reach an allowlisted
+    /// domain over a weaker transport.
+    #[test]
+    fn only_https_is_accepted() {
+        for bad in [
+            "http://github.com/",
+            "file:///etc/passwd",
+            "ftp://example.com/x",
+            "gopher://example.com/",
+            "//github.com/x",
+            "javascript:alert(1)",
+            "",
+        ] {
+            assert!(https_host(bad).is_err(), "accepted {bad:?}");
+        }
+        assert!(https_host("https://github.com/").is_ok());
+    }
+
+    /// The allowlist is keyed on the parsed host, so a userinfo trick must not
+    /// launder an attacker host as an allowlisted one.
+    #[test]
+    fn host_is_parsed_not_split() {
+        // Naive splitting on '/' or '@' would yield "github.com" here.
+        assert_eq!(https_host("https://github.com@evil.com/").unwrap(), "evil.com");
+        assert_eq!(https_host("https://user:pw@evil.com/x").unwrap(), "evil.com");
+        // Subdomains are their own host, not the parent.
+        assert_eq!(https_host("https://api.github.com/v1").unwrap(), "api.github.com");
+        // A lookalike parent domain must not match on a suffix.
+        assert_eq!(https_host("https://notgithub.com/").unwrap(), "notgithub.com");
+        // Explicit ports don't leak into the host key.
+        assert_eq!(https_host("https://github.com:8443/x").unwrap(), "github.com");
+    }
+
+    /// Surrounding whitespace is a realistic model output; it must be trimmed
+    /// rather than rejected.
+    #[test]
+    fn whitespace_is_trimmed() {
+        assert_eq!(https_host("  https://github.com/x \n").unwrap(), "github.com");
+    }
+
+    #[test]
+    fn empty_host_forms_are_refused() {
+        for bad in ["https://", "https://:8443/x"] {
+            assert!(https_host(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    /// `https:///just/a/path` is normalized by the URL spec to host `just`
+    /// (the extra slash collapses), not treated as an empty authority. That is
+    /// fail-closed either way, but it must not be *silently* accepted as a
+    /// hostless URL, so the resolved host is what the allowlist sees.
+    #[test]
+    fn over_slashed_url_resolves_to_a_real_host() {
+        assert_eq!(https_host("https:///just/a/path").unwrap(), "just");
     }
 }
