@@ -5,9 +5,14 @@
 //! in (API keys, tokens, private material) out of model context, guest env,
 //! and logs.
 //!
-//! Pure functions only — no I/O, no new deps — so every tool (bash, lean,
-//! ingest, wasm, provider logging) shares one policy. Fail-closed: any
-//! `Err` means block + retryable, never passthrough.
+//! One choke point for every tool (bash, lean, ingest, wasm, provider
+//! logging). Fail-closed: any `Err` means block + retryable, never
+//! passthrough.
+//!
+//! No I/O here — the caller reads whatever it needs and hands the gatekeeper a
+//! string — so policy stays testable. The one piece of process state is the
+//! known-secret registry, which exists because pattern-guessing cannot be used
+//! on shell output without mangling legitimate paths and hashes.
 
 /// Max accepted sizes (bytes).
 pub const MAX_PROMPT_BYTES: usize = 32 * 1024;
@@ -258,6 +263,101 @@ pub fn scrub_secrets(input: &str) -> (String, usize) {
     (out, redactions)
 }
 
+/// Literals we KNOW are secret (the guest `.gitconfig` OAuth token, any
+/// provider key handed to us), as opposed to literals we guess are secret.
+///
+/// Pattern-guessing is the wrong tool for shell output: `scrub_blobs` treats
+/// any run of >=40 chars as a token, which would redact every file path
+/// (`/root/workspace/sentinel-engine/src/lib.rs`) and every sha256 digest in
+/// build/Lean output — destroying the very logs used to diagnose a failed
+/// install. Matching one known literal is exact and has no false positives.
+static KNOWN_SECRETS: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
+
+fn known_secrets() -> &'static std::sync::Mutex<Vec<String>> {
+    KNOWN_SECRETS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Register a literal secret so [redact_known] strips it from tool output.
+/// Values shorter than 8 chars are ignored: redacting a short literal would
+/// corrupt unrelated text everywhere it appears.
+pub fn register_secret(secret: &str) {
+    let s = secret.trim();
+    if s.len() < 8 {
+        return;
+    }
+    if let Ok(mut guard) = known_secrets().lock() {
+        if !guard.iter().any(|existing| existing == s) {
+            guard.push(s.to_string());
+            // Longest first so an overlapping shorter secret can't partially
+            // consume a longer one and leave a fragment behind.
+            guard.sort_by(|a, b| b.len().cmp(&a.len()));
+        }
+    }
+}
+
+/// Replace every registered secret literal with `[TOKEN_REDACTED]`.
+pub fn redact_known(text: &str) -> String {
+    let Ok(guard) = known_secrets().lock() else {
+        return text.to_string();
+    };
+    if guard.is_empty() {
+        return text.to_string();
+    }
+    let mut out = text.to_string();
+    for secret in guard.iter() {
+        if out.contains(secret.as_str()) {
+            out = out.replace(secret.as_str(), "[TOKEN_REDACTED]");
+        }
+    }
+    out
+}
+
+/// Register every credential embedded in a guest `.gitconfig`.
+///
+/// The app persists the GitHub OAuth token as
+/// `[url "https://<token>@github.com/"]`, which a sandboxed
+/// `cat /root/.gitconfig` can read straight into a cloud model's context.
+/// The daemon runs host-side with the same rootfs, so it can harvest those
+/// credentials at boot without any new app<->daemon plumbing.
+pub fn register_gitconfig_secrets(rootfs: &std::path::Path) {
+    // Same candidate homes the app writes to.
+    let homes = [
+        rootfs.join("home/forgerig"),
+        rootfs.join("root"),
+        rootfs.to_path_buf(),
+    ];
+    for home in homes {
+        let Ok(text) = std::fs::read_to_string(home.join(".gitconfig")) else {
+            continue;
+        };
+        for secret in gitconfig_credentials(&text) {
+            register_secret(&secret);
+        }
+    }
+}
+
+/// Extract the userinfo (password/token) part of every
+/// `https://<credential>@host` URL in a gitconfig body.
+fn gitconfig_credentials(gitconfig: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in gitconfig.lines() {
+        // Only URL-rewrite rules carry an inline credential.
+        if !line.contains("https://") {
+            continue;
+        }
+        let Some(start) = line.find("https://") else { continue };
+        let tail = &line[start + "https://".len()..];
+        let Some(at) = tail.find('@') else { continue };
+        let credential = &tail[..at];
+        // A bare `https://github.com/` has no userinfo; `host@` only counts.
+        if credential.contains('/') || credential.is_empty() {
+            continue;
+        }
+        out.push(credential.to_string());
+    }
+    out
+}
+
 fn scrub_pattern(s: &str, count: &mut usize, mut find: impl FnMut(&str, usize) -> Option<(usize, usize, &str)>) -> String {
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
@@ -449,5 +549,58 @@ mod tests {
         let (a1, d1) = stats();
         assert_eq!(d1, d0 + 1);
         assert_eq!(a1, a0 + 1);
+    }
+
+    const TEST_TOKEN: &str = "gho_testtoken0123456789abcdef";
+
+    #[test]
+    fn gitconfig_credentials_are_extracted() {
+        let cfg = format!(
+            "[url \"https://{TEST_TOKEN}@github.com/\"]\n  insteadOf = https://github.com/\n"
+        );
+        let creds = gitconfig_credentials(&cfg);
+        assert_eq!(creds, vec![TEST_TOKEN.to_string()]);
+    }
+
+    #[test]
+    fn gitconfig_without_userinfo_yields_nothing() {
+        // The common `[url "https://github.com/"]` rewrite has no credential.
+        let cfg = "[url \"https://github.com/\"]\n  insteadOf = https://github.com/\n";
+        assert!(gitconfig_credentials(cfg).is_empty());
+        // A path segment after the host is not userinfo.
+        assert!(gitconfig_credentials("remote = https://github.com/org/repo\n").is_empty());
+    }
+
+    #[test]
+    fn register_and_redact_known_secret() {
+        register_secret(TEST_TOKEN);
+        let out = redact_known(&format!("[url \"https://{TEST_TOKEN}@github.com/\"]"));
+        assert!(!out.contains(TEST_TOKEN), "{out}");
+        assert!(out.contains("[TOKEN_REDACTED]"), "{out}");
+    }
+
+    /// The reason we redact a known literal instead of pattern-guessing:
+    /// `scrub_blobs` would eat these, which is why shell output must not be
+    /// run through `scrub_secrets`.
+    #[test]
+    fn pattern_scrubber_would_mangle_paths_and_hashes() {
+        let path = "/root/workspace/sentinel-engine/src/lib.rs";
+        let digest = "a3f5c9e1b2d84f6a0c7e5d3b1a9f2c4e6d8b0a1c3e5f7d9b1a3c5e7f9d1b3a5c";
+        let (scrubbed, _) = scrub_secrets(&format!("building {path} sha256 {digest}"));
+        assert!(!scrubbed.contains(path), "scrub_secrets destroyed a path: {scrubbed}");
+        assert!(!scrubbed.contains(digest), "scrub_secrets destroyed a digest: {scrubbed}");
+
+        // ...whereas known-secret redaction leaves both untouched.
+        register_secret(TEST_TOKEN);
+        let kept = redact_known(&format!("building {path} sha256 {digest}"));
+        assert!(kept.contains(path));
+        assert!(kept.contains(digest));
+    }
+
+    #[test]
+    fn short_secrets_are_not_registered() {
+        // A 3-char literal would be redacted out of unrelated text everywhere.
+        register_secret("abc");
+        assert_eq!(redact_known("abcdef abc ghi"), "abcdef abc ghi");
     }
 }
