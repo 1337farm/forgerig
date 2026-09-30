@@ -185,11 +185,54 @@ class MainActivity : AppCompatActivity() {
             return super.shouldInterceptRequest(view, request)
         }
 
+        /**
+         * Hand a URL to whatever app handles it instead of loading it here.
+         *
+         * Falls back to the WebView's own error page when no external handler
+         * exists (a bare `tel:` on a tablet with no dialer, a niche scheme):
+         * letting the navigation through silently would defeat the whole
+         * point, so we block and let the page report it.
+         */
+        private fun openExternally(view: WebView?, url: android.net.Uri) {
+            val sent = try {
+                startActivity(
+                    Intent(Intent.ACTION_VIEW, url).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+                true
+            } catch (e: Exception) {
+                false
+            }
+            if (!sent) {
+                try {
+                    view?.loadDataWithBaseURL(
+                        "about:blank",
+                        "<html><body style='font-family:sans-serif;background:#0f1115;color:#e6e6e6;padding:24px'>" +
+                            "<h3>Can't open link</h3><p>No app on this device can open " +
+                            "<code>${android.text.Html.escapeHtml(url.toString()).take(300)}</code>.</p>" +
+                            "</body></html>",
+                        "text/html", "UTF-8", null
+                    )
+                } catch (e2: Exception) {
+                }
+            }
+        }
+
         override fun shouldOverrideUrlLoading(view: WebView?, request: android.webkit.WebResourceRequest?): Boolean {
             val url = request?.url
             if (url != null && url.scheme == "forgerig") {
                 val intent = Intent(Intent.ACTION_VIEW, url)
                 startActivity(intent)
+                return true
+            }
+            // Allow only our own daemon origin to load in the WebView. Anything
+            // else — a link out of a transcript, a 302 from the daemon page, a
+            // javascript:/data: URL — would land a foreign origin inside the
+            // same WebView that the NativeHost bridge is attached to, and the
+            // bridge answers there (see authTokenForPage, which then refuses,
+            // but every other bridge method is page-agnostic). Hand it to a real
+            // browser instead, which has no access to our JS bridge.
+            if (url != null && !isDaemonOrigin(url.toString(), MainActivity.allocatedPort)) {
+                openExternally(view, url)
                 return true
             }
             return super.shouldOverrideUrlLoading(view, request)
@@ -1012,6 +1055,25 @@ class MainActivity : AppCompatActivity() {
 }
 
 /**
+ * True only for the exact origin of the daemon we started.
+ *
+ * The WebView carries the `NativeHost` bridge, which is bound to the *view*,
+ * not to a page — every bridge method resolves for whatever document is
+ * currently loaded. So navigation is the control that matters: a foreign
+ * origin in this WebView is a foreign origin with the bridge. Sharing the
+ * match with [authTokenForPage] keeps "what may navigate here" and "what may
+ * read the token" from drifting apart.
+ */
+internal fun isDaemonOrigin(url: String?, port: Int): Boolean {
+    if (url == null || port <= 0) return false
+    val origin = "http://127.0.0.1:$port"
+    if (!url.startsWith(origin)) return false
+    val rest = url.substring(origin.length)
+    val path = rest.substringBefore('?').substringBefore('#')
+    return path.isEmpty() || path == "/"
+}
+
+/**
  * The auth token, but only for the daemon's own page.
  *
  * The JS bridge is attached to the WebView, not to a page, and
@@ -1019,22 +1081,10 @@ class MainActivity : AppCompatActivity() {
  * link tapped out of a transcript, or a redirect, can put a foreign origin
  * into a context where `NativeHost.getAuthToken()` resolves. That page could
  * then authenticate to the daemon and reach its `exec` RPC plus the decrypted
- * provider keys in the daemon's environment. Scheme + host + port must all
- * match the daemon we started, and no path prefix may sneak past via
- * `http://127.0.0.1:1234.evil.com/` or a query string carrying a different
- * origin.
+ * provider keys in the daemon's environment. The same predicate gates
+ * navigation ([isDaemonOrigin]), so the two cannot disagree about what counts
+ * as our origin.
  */
 internal fun authTokenForPage(url: String?, port: Int): String? {
-    if (url == null || port <= 0) return null
-    val origin = "http://127.0.0.1:$port"
-    if (!url.startsWith(origin)) return null
-    // Query/fragment may trail the path (`/`, `/?x=1`, `/#f`); the path itself
-    // must be empty or "/". Everything else is a different origin wearing ours
-    // as a string prefix, e.g. "http://127.0.0.1:41234.evil.com/".
-    val rest = url.substring(origin.length)
-    val path = rest.substringBefore('?').substringBefore('#')
-    if (path.isEmpty() || path == "/") {
-        return MainActivity.authToken
-    }
-    return null
+    return if (isDaemonOrigin(url, port)) MainActivity.authToken else null
 }
