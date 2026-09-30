@@ -8,8 +8,10 @@ import java.io.RandomAccessFile
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.min
 
 /**
@@ -32,6 +34,18 @@ object ContainerAssets {
     private const val CHUNK = 4L * 1024 * 1024   // 4 MiB per range
     private const val PARALLEL = 4               // concurrent ranges
     private const val MAX_CHUNK_ATTEMPTS = 3     // per-chunk retries for transient network/DNS flakes
+
+    /**
+     * One download per asset at a time, keyed by name.
+     *
+     * Two install threads used to share a `.part` file: both sized it, both
+     * seek-wrote overlapping ranges through their own RandomAccessFile, and
+     * whichever renamed first won — so a second thread could silently
+     * reassemble bytes the other had written. The resume sidecar had the same
+     * problem: both threads rewrote it, so the "already done" set could lose
+     * chunks that were in fact on disk.
+     */
+    private val downloadLocks = ConcurrentHashMap<String, Any>()
 
     data class Asset(val name: String, val sha256: String, val size: Long)
 
@@ -102,16 +116,29 @@ fun fetchManifest(context: Context): Map<String, Asset> {
      * otherwise it is downloaded (chunked + parallel) and sha-verified.
      * [onProgress] reports bytes downloaded so far (called on the worker pool).
      */
+    /**
+     * @param cachedVerified what the caller already learned by hashing this
+     *   exact file against this exact manifest entry. Callers that probe the
+     *   cache first (see `AssetExtractor.openRootfs`) pass the result so the
+     *   payload is not hashed a second time on the way in. `null` means
+     *   "not checked", and the cache is probed here as before.
+     */
     fun ensure(
         context: Context,
         name: String,
         manifest: Map<String, Asset>,
+        cachedVerified: Boolean? = null,
         onProgress: ((Long) -> Unit)? = null,
+        connectionFactory: (URL) -> HttpURLConnection = { url -> url.openConnection() as HttpURLConnection },
     ): File {
         val info = manifest[name] ?: throw IllegalStateException("no manifest entry for $name")
         val file = assetFile(context, name)
-        if (isValid(file, info)) return file
-        download(name, info, file, onProgress)
+        // Re-hashing the whole payload here is not free — this ran twice on
+        // every install, because openRootfs verifies the cached file and then
+        // ensure() hashed those same bytes again to make the same decision.
+        if (cachedVerified == true) return file
+        if (cachedVerified == null && isValid(file, info)) return file
+        download(name, info, file, onProgress, connectionFactory)
         if (!isValid(file, info)) {
             // Corrupt assembly (not a resume candidate): drop part + sidecar
             // so the next attempt starts clean instead of looping on bad bytes.
@@ -125,7 +152,18 @@ fun fetchManifest(context: Context): Map<String, Asset> {
     private fun isValid(file: File, info: Asset): Boolean =
         file.exists() && file.length() == info.size && file.sha256() == info.sha256
 
+    /**
+     * Number of full-payload digests computed since the counter was last reset.
+     *
+     * Exists so a test can pin *how many times* the payload is hashed. Asserting
+     * only that `ensure` returns the right file is not enough: it passes just as
+     * happily whether the cache was checked once or twice, which is exactly the
+     * regression this change is about.
+     */
+    internal val hashReadsForTest = AtomicInteger(0)
+
     private fun File.sha256(): String {
+        hashReadsForTest.incrementAndGet()
         val md = MessageDigest.getInstance("SHA-256")
         inputStream().use { ins ->
             val buf = ByteArray(64 * 1024)
@@ -182,6 +220,26 @@ fun fetchManifest(context: Context): Map<String, Asset> {
         out: File,
         onProgress: ((Long) -> Unit)?,
         connectionFactory: (URL) -> HttpURLConnection = { url -> url.openConnection() as HttpURLConnection },
+    ) {
+        // Serialize per asset: a second thread waits here rather than racing
+        // this one over the same .part and resume sidecar. Re-probe the cache
+        // once we hold the lock — the first thread may have just finished it.
+        val lock = downloadLocks.computeIfAbsent(name) { Any() }
+        synchronized(lock) {
+            if (isValid(out, info)) {
+                deleteResume(out)
+                return
+            }
+            downloadLocked(name, info, out, onProgress, connectionFactory)
+        }
+    }
+
+    private fun downloadLocked(
+        name: String,
+        info: Asset,
+        out: File,
+        onProgress: ((Long) -> Unit)?,
+        connectionFactory: (URL) -> HttpURLConnection,
     ) {
         out.parentFile?.mkdirs()
         val part = File(out.path + ".part")

@@ -369,6 +369,12 @@ class AssetExtractor(private val context: Context) {
             // make every reinstall need the network just to hash a file that is
             // already on disk — and would report "download failed" on a device
             // that is fully installed but offline.
+            // Hashing the cached payload is the expensive part of this decision,
+            // so do it at most once: remember the verdict and hand it to
+            // ensure(), which would otherwise re-read and re-hash the same
+            // megabytes to reach the same answer.
+            var cachedVerified: Boolean? = null
+            var cachedManifest: Map<String, ContainerAssets.Asset>? = null
             ContainerAssets.cachedManifest(context)?.let { manifest ->
                 val cached = ContainerAssets.assetFile(context, ROOTFS_ASSET)
                 if (ContainerAssets.isVerified(cached, manifest[ROOTFS_ASSET])) {
@@ -376,6 +382,8 @@ class AssetExtractor(private val context: Context) {
                     val (stream, comp) = compressionOf(FileInputStream(cached))
                     return RootfsStream(stream, comp, cached.absolutePath, cached.length())
                 }
+                cachedManifest = manifest
+                cachedVerified = false
             }
             // The manifest fetch is network-bound with nothing on screen yet;
             // say so immediately or a DNS stall looks like a hung install.
@@ -383,16 +391,30 @@ class AssetExtractor(private val context: Context) {
             log("Contacting release server for container-manifest.json…")
             val manifest = ContainerAssets.fetchManifest(context)
             val mib = manifest[ROOTFS_ASSET]?.size ?: 0L
-            val file = ContainerAssets.ensure(context, ROOTFS_ASSET, manifest) { bytes ->
-                if (mib > 0) {
-                    val pct = (2 + 5 * bytes / mib).toInt().coerceIn(2, 7)
-                    progress.onProgress(
-                        pct,
-                        "Downloading container payload…",
-                        "${bytes / (1024 * 1024)} / ${mib / (1024 * 1024)} MB"
-                    )
-                }
-            }
+            // Only trust the cached verdict against the *same* manifest entry it
+            // was computed from; a fresh manifest may pin a new payload, in
+            // which case the cache has to be re-probed.
+            val cachedEntry = cachedManifest?.get(ROOTFS_ASSET)
+            val freshEntry = manifest[ROOTFS_ASSET]
+            val reuseVerdict = cachedVerified == false && cachedEntry != null &&
+                freshEntry != null && cachedEntry.sha256 == freshEntry.sha256 &&
+                cachedEntry.size == freshEntry.size
+            val file = ContainerAssets.ensure(
+                context,
+                ROOTFS_ASSET,
+                manifest,
+                cachedVerified = if (reuseVerdict) false else null,
+                onProgress = { bytes ->
+                    if (mib > 0) {
+                        val pct = (2 + 5 * bytes / mib).toInt().coerceIn(2, 7)
+                        progress.onProgress(
+                            pct,
+                            "Downloading container payload…",
+                            "${bytes / (1024 * 1024)} / ${mib / (1024 * 1024)} MB"
+                        )
+                    }
+                },
+            )
             log("Rootfs from container download: ${file.absolutePath} (${file.length()} bytes)")
             val (stream, comp) = compressionOf(FileInputStream(file))
             return RootfsStream(stream, comp, file.absolutePath, file.length())

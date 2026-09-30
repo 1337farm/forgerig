@@ -1,5 +1,7 @@
 package com.forgerig
 
+import android.content.Context
+import android.content.ContextWrapper
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -116,6 +118,156 @@ class ContainerAssetsTest {
         // out of the cache instead of fetching it itself.
         assertEquals(596161714L, m["lean-4.35.0-rc3-linux_aarch64.tar.zst"]!!.size)
     }
+
+    /// ensure() used to hash the cached payload itself even when the caller had
+    /// just hashed it to make the same decision, so every install read and
+    /// hashed the whole rootfs twice. Passing the verdict through must skip the
+    /// second hash — and must never skip the verification that protects the
+    /// bytes we actually install.
+    @Test
+    fun ensureTrustsACallerSuppliedCacheVerdict() {
+        val bytes = ByteArray(4096) { (it % 97).toByte() }
+        val sha = MessageDigest.getInstance("SHA-256").digest(bytes)
+            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        val info = ContainerAssets.Asset("trusted.bin", sha, bytes.size.toLong())
+        val cache = tmp.newFolder("c1")
+        val target = File(File(cache, "container"), "trusted.bin").apply {
+            parentFile.mkdirs(); writeBytes(bytes)
+        }
+        val manifest = mapOf("trusted.bin" to info)
+
+        // The caller says "verified": return immediately, no re-hash, and — the
+        // important half — do not delete or redownload it. A truthy verdict
+        // that silently discarded good bytes would be worse than the slow path.
+        assertEquals(
+            target,
+            ContainerAssets.ensure(ctx(cache), "trusted.bin", manifest, cachedVerified = true),
+        )
+        assertTrue(target.exists())
+        assertArrayEquals(bytes, target.readBytes())
+        assertFalse(File(target.path + ".part").exists())
+    }
+
+    /// A caller that could not confirm the cache must still get a real check:
+    /// `cachedVerified = false` means "I looked and it did not match", so the
+    /// download proceeds rather than trusting a stale payload.
+    @Test
+    fun ensureReDownloadsWhenTheCachedVerdictIsNegative() {
+        val bytes = ByteArray(4096) { (it % 97).toByte() }
+        val sha = MessageDigest.getInstance("SHA-256").digest(bytes)
+            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        val info = ContainerAssets.Asset("stale.bin", sha, bytes.size.toLong())
+        val cache = tmp.newFolder("c2")
+        // A truncated payload from a killed download: length already differs.
+        File(File(cache, "container"), "stale.bin").apply {
+            parentFile.mkdirs(); writeBytes(bytes.copyOf(bytes.size - 10))
+        }
+        val manifest = mapOf("stale.bin" to info)
+
+        val result = ContainerAssets.ensure(
+            ctx(cache),
+            "stale.bin",
+            manifest,
+            cachedVerified = false,
+            onProgress = null,
+            connectionFactory = { url -> ChunkConnection(url, bytes) },
+        )
+        assertArrayEquals(bytes, result.readBytes())
+    }
+
+    /// Two install threads used to share one `.part`, so whichever renamed first
+    /// won and the other could reassemble bytes the first had already written.
+    /// The second caller must wait and then observe a finished, verified file.
+    @Test
+    fun concurrentDownloadsOfTheSameAssetDoNotCorruptEachOther() {
+        val chunk = 4L * 1024 * 1024
+        val size = (chunk * 2 + 999).toInt()
+        val expected = ByteArray(size) { (it % 251).toByte() }
+        val sha = MessageDigest.getInstance("SHA-256").digest(expected)
+            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        val info = ContainerAssets.Asset("race.bin", sha, size.toLong())
+        val out = tmp.newFile("race.bin")
+        val ranges = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val start = java.util.concurrent.CountDownLatch(1)
+        val errors = java.util.Collections.synchronizedList(mutableListOf<Throwable>())
+
+        val threads = (0 until 4).map {
+            Thread {
+                try {
+                    start.await()
+                    ContainerAssets.download("race.bin", info, out, null) { url ->
+                        ChunkConnection(url, expected, ranges)
+                    }
+                } catch (e: Throwable) {
+                    errors.add(e)
+                }
+            }
+        }
+        threads.forEach { it.start() }
+        start.countDown()
+        threads.forEach { it.join(60_000) }
+
+        assertTrue("no thread may fail: ${errors.joinToString("; ")}", errors.isEmpty())
+        // The bytes on disk must be exactly what the manifest describes, even
+        // though four threads raced to produce them.
+        assertArrayEquals(expected, out.readBytes())
+        // And the ranges were fetched once, not four times over: the losers of
+        // the race found a verified file and returned without re-downloading.
+        assertTrue(
+            "expected 3 chunks fetched once each, got ${ranges.size}",
+            ranges.size == 3,
+        )
+    }
+
+    /// Counts full-payload digests instead of inferring them from a mock
+    /// connection, so "the payload is hashed once" is a real assertion.
+    ///
+    /// This needed a seam. The first version asserted only that `ensure`
+    /// returned the right file, which passed with the double-hash still in
+    /// place — it cannot distinguish one digest from two.
+    @Test
+    fun ensureHashesTheCachedPayloadAtMostOnce() {
+        val bytes = ByteArray(4096) { (it % 97).toByte() }
+        val sha = MessageDigest.getInstance("SHA-256").digest(bytes)
+            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        val info = ContainerAssets.Asset("counted.bin", sha, bytes.size.toLong())
+        val cache = tmp.newFolder("c3")
+        val target = File(File(cache, "container"), "counted.bin").apply {
+            parentFile.mkdirs(); writeBytes(bytes)
+        }
+        val manifest = mapOf("counted.bin" to info)
+        // The digest is instrumented for this test, so it must count reads from
+        // zero rather than carrying a count in from setup.
+        ContainerAssets.hashReadsForTest.set(0)
+
+        // A positive verdict means the caller already hashed these bytes, so
+        // ensure must not digest them again; a null verdict means it must do
+        // the check itself. Both are asserted on the count.
+        assertEquals("leaked between tests", 0, ContainerAssets.hashReadsForTest.get().toLong())
+        ContainerAssets.ensure(ctx(cache), "counted.bin", manifest, cachedVerified = true)
+        assertEquals(
+            "ensure re-hashed a payload the caller had already verified",
+            0L,
+            ContainerAssets.hashReadsForTest.get().toLong(),
+        )
+        // ...and with no verdict it must still do the check itself.
+        ContainerAssets.ensure(ctx(cache), "counted.bin", manifest, cachedVerified = null)
+        assertEquals(
+            "ensure skipped, or doubled, the cache check it was asked to do",
+            1L,
+            ContainerAssets.hashReadsForTest.get().toLong(),
+        )
+    }
+
+    /** Minimal Context: these tests only need a filesDir to place the cache. */
+    private fun ctx(dir: File): Context =
+        object : ContextWrapper(null) {
+            override fun getFilesDir(): File = dir
+            override fun getAssets() = throw UnsupportedOperationException()
+            override fun getApplicationContext(): Context = this
+            override fun getPackageName(): String = "com.forgerig"
+            override fun getPackageManager() = throw UnsupportedOperationException()
+        }
 
     /// isVerified is what lets a reinstall skip the network: the payload on
     /// disk must match the manifest byte-for-byte, and anything less (short
