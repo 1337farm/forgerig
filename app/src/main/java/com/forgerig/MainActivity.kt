@@ -35,6 +35,23 @@ class MainActivity : AppCompatActivity() {
     companion object {
         var allocatedPort: Int = 3000
 
+        /**
+         * Per-process shared secret for the daemon socket. The daemon binds an
+         * ephemeral loopback port, but any app on the device can find a
+         * listening loopback port, and the daemon's env holds the decrypted
+         * provider keys. So the port is obscurity, not a boundary: every RPC
+         * is refused until the caller presents this token over its own
+         * WebSocket, and the daemon fails closed if this is ever unset.
+         *
+         * Readable only by this app's UID (another app cannot read our
+         * /proc/<pid>/environ), which is what makes an env var the right
+         * channel. Handed to the daemon via FORGERIG_AUTH_TOKEN and to the UI
+         * via the NativeHost bridge — deliberately NOT via the URL, so it never
+         * reaches the shared install log or the WebView's history.
+         */
+        val authToken: String = ByteArray(32).also { java.security.SecureRandom().nextBytes(it) }
+            .joinToString("") { "%02x".format(it) }
+
         init {
             try {
                 val serverSocket = ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))
@@ -543,6 +560,24 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        /** The daemon's per-launch auth token. The UI must `auth` with this
+         * before any other RPC; the daemon refuses everything until it does.
+         *
+         * Only ever handed to the daemon's own loopback origin: the bridge is
+         * bound to the whole WebView, and `shouldOverrideUrlLoading` forwards
+         * http/https to it, so a tapped link would otherwise give a remote
+         * page the key to the daemon's `exec` RPC and the provider secrets
+         * behind it. Returns "" to anyone else, which the UI reports as a
+         * clear "needs the app" error rather than a silent retry loop. */
+        @JavascriptInterface
+        fun getAuthToken(): String {
+            val url = try { context.webView.url } catch (_: Exception) { null }
+            return authTokenForPage(url, MainActivity.allocatedPort) ?: run {
+                AssetExtractor.logShared(context, "WARN: getAuthToken refused — page is not the daemon origin")
+                ""
+            }
+        }
+
         /** Mirror the agent's working state into the foreground-service
          * notification so the drawer shows live status/progress. */
         @JavascriptInterface
@@ -974,4 +1009,32 @@ class MainActivity : AppCompatActivity() {
             AssetExtractor.logShared(this@MainActivity, "ERROR: guest gitconfig write failed | $e")
         }
     }
+}
+
+/**
+ * The auth token, but only for the daemon's own page.
+ *
+ * The JS bridge is attached to the WebView, not to a page, and
+ * `shouldOverrideUrlLoading` lets http/https navigations load in it — so a
+ * link tapped out of a transcript, or a redirect, can put a foreign origin
+ * into a context where `NativeHost.getAuthToken()` resolves. That page could
+ * then authenticate to the daemon and reach its `exec` RPC plus the decrypted
+ * provider keys in the daemon's environment. Scheme + host + port must all
+ * match the daemon we started, and no path prefix may sneak past via
+ * `http://127.0.0.1:1234.evil.com/` or a query string carrying a different
+ * origin.
+ */
+internal fun authTokenForPage(url: String?, port: Int): String? {
+    if (url == null || port <= 0) return null
+    val origin = "http://127.0.0.1:$port"
+    if (!url.startsWith(origin)) return null
+    // Query/fragment may trail the path (`/`, `/?x=1`, `/#f`); the path itself
+    // must be empty or "/". Everything else is a different origin wearing ours
+    // as a string prefix, e.g. "http://127.0.0.1:41234.evil.com/".
+    val rest = url.substring(origin.length)
+    val path = rest.substringBefore('?').substringBefore('#')
+    if (path.isEmpty() || path == "/") {
+        return MainActivity.authToken
+    }
+    return null
 }

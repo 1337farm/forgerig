@@ -54,6 +54,8 @@ global.document = {
   createElement: (tag) => makeEl(tag),
 };
 global.window = { addEventListener: (k, f) => { listeners[k] = f; } };
+// The NativeHost bridge is how the app hands the daemon's auth token to the UI.
+global.window.NativeHost = { getAuthToken: () => 'bridge-token' };
 global.location = { protocol: 'http:', host: 'localhost' };
 global.confirm = () => { throw new Error('confirm must never be called'); };
 
@@ -72,6 +74,13 @@ const server = {
     sent.push(obj);
     const reply = (result) => server.sock.onmessage({ data: JSON.stringify({ id: obj.id, result }) });
     switch (obj.method) {
+      case 'auth': {
+        // The daemon refuses everything until this succeeds, and it must be
+        // the first frame on the wire.
+        assert.equal(obj.params.token, 'bridge-token', 'auth sends the bridge token');
+        reply({ authenticated: true });
+        break;
+      }
       case 'status': reply({ provider: 'provider=openai model=x key=set' }); break;
       case 'lean_status': reply({}); break;
       case 'session_list':

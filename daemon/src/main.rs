@@ -68,6 +68,100 @@ async fn push_notification(push: &WsPush, value: Value) {
         .await;
 }
 
+// ── Authentication ───────────────────────────────────────────────────────────
+//
+// The daemon binds 127.0.0.1:$PORT with an ephemeral per-launch port, but a
+// loopback port is trivially discoverable by any other app on the device, and
+// the daemon's env carries the decrypted provider keys (see
+// ContainerService.kt). The `exec` RPC in particular runs `run_trusted` —
+// unsandboxed, 600s, and deliberately NOT behind the command denylist, which
+// guards only the model-facing path. So an unauthenticated socket is remote
+// code execution as the app's UID plus secret exfiltration.
+//
+// The app mints a random token per daemon launch (FORGERIG_AUTH_TOKEN) and
+// hands it to the UI over the JS bridge. Nothing but `auth` runs before it.
+//
+// Fail-closed: with no token configured, EVERY method is refused, `auth`
+// included — there is nothing to compare against, and a daemon that silently
+// ran wide open because someone forgot an env var is the exact failure this
+// guards against. Local dev exports its own token.
+
+/// JSON-RPC error code for "you have not authenticated".
+const AUTH_REQUIRED: i32 = -32001;
+
+/// Compare two secrets without an early exit on the first differing byte.
+/// Length is compared normally: a length mismatch is not secret-dependent, and
+/// padding to equal length first would make a 32-byte guess cost 32 bytes of
+/// work per attempt.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+/// Per-connection auth state: `true` once this connection presented the right
+/// token.
+///
+/// Per CONNECTION, never per process. One authenticated connection must not
+/// vouch for another — a shared flag would mean the first caller to guess or
+/// steal the token authenticates every subsequent connection for the daemon's
+/// lifetime, which is the same hole with extra steps.
+type ConnAuth = Arc<std::sync::atomic::AtomicBool>;
+
+fn conn_auth() -> ConnAuth {
+    Arc::new(std::sync::atomic::AtomicBool::new(false))
+}
+
+/// Result of the pre-dispatch auth gate.
+#[derive(Debug)]
+enum AuthGate {
+    /// Call may proceed.
+    Pass,
+    /// `auth` itself was called with the right token: mark the connection and
+    /// answer `{"authenticated": true}`.
+    Accepted,
+    /// Refuse with this code and message.
+    Denied(i32, String),
+}
+
+/// The auth gate, as a pure function of (configured token, per-connection
+/// state, incoming method, offered token) so every branch is testable without
+/// a socket, an env var, or a task.
+fn auth_gate(configured: Option<&str>, conn: &std::sync::atomic::AtomicBool, method: &str, offered: Option<&str>) -> AuthGate {
+    use std::sync::atomic::Ordering;
+    // Fail closed when no token is configured. Deliberately first, so it wins
+    // even for `auth`. A blank token is not a token: the boot path filters it,
+    // but the gate must be fail-closed on its own — otherwise an empty
+    // `FORGERIG_AUTH_TOKEN` would authenticate any caller offering "".
+    let configured = configured.map(str::trim).filter(|t| !t.is_empty());
+    let Some(expected) = configured else {
+        return AuthGate::Denied(AUTH_REQUIRED, "daemon has no auth token configured (set FORGERIG_AUTH_TOKEN)".into());
+    };
+    if method == "auth" {
+        return match offered {
+            Some(t) if constant_time_eq(t, expected) => {
+                conn.store(true, Ordering::SeqCst);
+                AuthGate::Accepted
+            }
+            _ => {
+                eprintln!("auth: rejected an authentication attempt");
+                AuthGate::Denied(AUTH_REQUIRED, "invalid token".into())
+            }
+        };
+    }
+    if conn.load(Ordering::SeqCst) {
+        AuthGate::Pass
+    } else {
+        AuthGate::Denied(AUTH_REQUIRED, "authentication required: call `auth` first".into())
+    }
+}
+
 /// Per-connection stop flags: the chat future and its chat_stop RPC share
 /// the same connection task, so a thread-local registry (not a global map)
 /// pairs them without cross-connection races.
@@ -105,12 +199,20 @@ async fn system_message_with_memory(memory: &Arc<MemoryEngine>, session: Option<
     sys
 }
 
-async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &Arc<MemoryEngine>, sessions: &Arc<sessions::SessionManager>, push: &WsPush) -> RpcResponse {
+async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &Arc<MemoryEngine>, sessions: &Arc<sessions::SessionManager>, push: &WsPush, auth_token: Option<&str>, conn: &std::sync::atomic::AtomicBool) -> RpcResponse {
     fn ok(result: Value, id: Option<Value>) -> RpcResponse {
         RpcResponse { jsonrpc: "2.0".into(), result: Some(result), error: None, id }
     }
     fn err(code: i32, message: String, id: Option<Value>) -> RpcResponse {
         RpcResponse { jsonrpc: "2.0".into(), result: None, error: Some(RpcError { code, message }), id }
+    }
+
+    // Authentication gate, ahead of every method — see the note by `auth_gate`.
+    let offered = req.params.as_ref().and_then(|p| p.get("token")).and_then(|t| t.as_str());
+    match auth_gate(auth_token, conn, &req.method, offered) {
+        AuthGate::Pass => {}
+        AuthGate::Accepted => return ok(json!({ "authenticated": true }), req.id),
+        AuthGate::Denied(code, message) => return err(code, message, req.id),
     }
 
     match req.method.as_str() {
@@ -560,6 +662,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .map_err(|e| format!("open memory db oss_memory.db: {e}"))?,
     );
+    // Per-launch shared secret; the app mints it and hands it to the UI over
+    // the JS bridge. Absent => fail closed (every RPC refused).
+    let auth_token = std::env::var("FORGERIG_AUTH_TOKEN").ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+    if auth_token.is_none() {
+        eprintln!(
+            "FATAL: FORGERIG_AUTH_TOKEN is not set — refusing every RPC. \
+             The app always sets it; export one to run the daemon by hand."
+        );
+    }
     let backend = Arc::new(provider::Backend::resolve(memory_engine.clone()).await);
     let persist_path = std::env::var("FORGERIG_SESSIONS_FILE")
         .map(PathBuf::from)
@@ -580,6 +691,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let backend = Arc::clone(&backend);
         let memory = Arc::clone(&memory_engine);
         let sessions = Arc::clone(&sessions);
+        let auth_token = auth_token.clone();
 
         tokio::spawn(async move {
             // Peek (without consuming) to decide whether this is a WebSocket
@@ -610,6 +722,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
             let (ws_sender, mut ws_receiver) = ws_stream.split();
             let ws_sender = std::sync::Arc::new(tokio::sync::Mutex::new(ws_sender));
+            // One auth state per connection, shared by that connection's
+            // per-request tasks.
+            let conn = conn_auth();
 
             // Handle each incoming request concurrently so a long chat can't
             // block lean_status/progress polls or another session's chat.
@@ -621,9 +736,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         let memory = Arc::clone(&memory);
                         let sessions = Arc::clone(&sessions);
                         let sender = Arc::clone(&ws_sender);
+                        let conn = Arc::clone(&conn);
+                        let auth_token = auth_token.clone();
                         tokio::spawn(async move {
                             let response = match serde_json::from_str::<RpcRequest>(&text) {
-                                Ok(req) => handle_rpc(req, &backend, &memory, &sessions, &sender).await,
+                                Ok(req) => handle_rpc(req, &backend, &memory, &sessions, &sender, auth_token.as_deref(), &conn).await,
                                 Err(_) => RpcResponse {
                                     jsonrpc: "2.0".into(),
                                     result: None,
@@ -729,6 +846,83 @@ async fn send_json(stream: &mut TcpStream, status: u16, body: Value) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn denied(gate: AuthGate) -> (i32, String) {
+        match gate {
+            AuthGate::Denied(code, message) => (code, message),
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    /// Fail-closed is the whole point: a launch that forgets the token must not
+    /// silently run wide open, and `auth` must not be a way around it.
+    #[test]
+    fn no_configured_token_refuses_everything() {
+        for method in ["status", "exec", "chat", "auth"] {
+            let conn = AtomicBool::new(true); // even a pre-authed connection
+            let (code, msg) = denied(auth_gate(None, &conn, method, Some("anything")));
+            assert_eq!(code, AUTH_REQUIRED, "{method}");
+            assert!(msg.contains("no auth token configured"), "{method}: {msg}");
+        }
+        // A blank/empty token is not a token.
+        let conn = AtomicBool::new(false);
+        assert!(matches!(auth_gate(Some(""), &conn, "auth", Some("")), AuthGate::Denied(..)));
+    }
+
+    /// Nothing but `auth` runs before authentication.
+    #[test]
+    fn every_method_is_refused_before_auth() {
+        let conn = AtomicBool::new(false);
+        for method in ["status", "exec", "chat", "session_list", "ingest", "net_fetch", "lean"] {
+            let (code, msg) = denied(auth_gate(Some("tok"), &conn, method, None));
+            assert_eq!(code, AUTH_REQUIRED, "{method}");
+            assert!(msg.contains("call `auth` first"), "{method}: {msg}");
+        }
+    }
+
+    /// A wrong or missing token must not flip the connection, and the right one
+    /// must.
+    #[test]
+    fn auth_compares_the_token_and_latches_the_connection() {
+        let conn = AtomicBool::new(false);
+        assert!(matches!(auth_gate(Some("s3cret"), &conn, "auth", Some("wrong")), AuthGate::Denied(..)));
+        assert!(!conn.load(Ordering::SeqCst), "a rejected auth must not latch");
+        // Absent token field is a rejection too, not a bypass.
+        assert!(matches!(auth_gate(Some("s3cret"), &conn, "auth", None), AuthGate::Denied(..)));
+        assert!(!conn.load(Ordering::SeqCst));
+        assert!(matches!(auth_gate(Some("s3cret"), &conn, "auth", Some("s3cret")), AuthGate::Accepted));
+        assert!(conn.load(Ordering::SeqCst));
+        // And now ordinary methods pass on THIS connection.
+        assert!(matches!(auth_gate(Some("s3cret"), &conn, "status", None), AuthGate::Pass));
+    }
+
+    /// The regression that makes the whole feature a no-op if written naively:
+    /// authenticating one connection must not vouch for another.
+    #[test]
+    fn auth_does_not_leak_across_connections() {
+        let a = AtomicBool::new(false);
+        let b = AtomicBool::new(false);
+        assert!(matches!(auth_gate(Some("tok"), &a, "auth", Some("tok")), AuthGate::Accepted));
+        assert!(a.load(Ordering::SeqCst));
+        assert!(matches!(auth_gate(Some("tok"), &a, "exec", None), AuthGate::Pass));
+        // Second, independent connection: still refused.
+        assert!(matches!(auth_gate(Some("tok"), &b, "exec", None), AuthGate::Denied(..)));
+        assert!(!b.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn constant_time_eq_matches_equality_semantics() {
+        assert!(constant_time_eq("", ""));
+        assert!(constant_time_eq("abc", "abc"));
+        assert!(!constant_time_eq("abc", "abd"));
+        assert!(!constant_time_eq("abc", "ab"));
+        assert!(!constant_time_eq("ab", "abc"));
+        // A token that is a prefix of the real one must not pass.
+        assert!(!constant_time_eq("tok", "tok-extra"));
+    }
+
     #[test]
     fn served_page_inlines_all_frontend_js() {
         let html = super::page_html();

@@ -48,7 +48,7 @@ jobs:
           (cd sentinel-engine && cargo test --release --lib)
 
       - name: Run Web UI unit tests
-        run: node --test daemon/web/tests/markdown.test.js daemon/web/tests/state.test.js daemon/web/tests/tabflow.test.js
+        run: node --test daemon/web/tests/markdown.test.js daemon/web/tests/state.test.js daemon/web/tests/tabflow.test.js daemon/web/tests/auth.test.js
 
   package-apk:
     name: apk

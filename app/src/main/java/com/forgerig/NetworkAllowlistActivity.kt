@@ -132,7 +132,9 @@ class NetworkAllowlistActivity : AppCompatActivity() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 ws = webSocket
                 Log.d(TAG, "WebSocket connected")
-                handler.post { loadDomains() }
+                // The daemon refuses every RPC until this connection
+                // authenticates, so nothing else may be sent first.
+                authenticate()
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -177,6 +179,20 @@ class NetworkAllowlistActivity : AppCompatActivity() {
             put("id", id)
         }
         socket.send(req.toString())
+    }
+
+    private fun authenticate() {
+        val token = MainActivity.authToken
+        rpc("auth", JSONObject().put("token", token)) { success, result ->
+            handler.post {
+                if (success) loadDomains()
+                else {
+                    Log.e(TAG, "Daemon auth failed: $result")
+                    Toast.makeText(this, "Could not authenticate with the daemon: $result", Toast.LENGTH_LONG).show()
+                    updateList(emptyList())
+                }
+            }
+        }
     }
 
     private fun loadDomains() {

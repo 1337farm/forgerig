@@ -27,6 +27,10 @@ import websockets
 
 DAEMON_PORT = 18080
 DAEMON_URL = f"ws://127.0.0.1:{DAEMON_PORT}"
+# The daemon refuses every RPC until a connection presents this token, and
+# fails closed when it is unset — so the harness must mint one and pass it to
+# the spawned daemon below.
+AUTH_TOKEN = "walled-garden-test-token"
 
 
 class DaemonProcess:
@@ -87,6 +91,7 @@ class DaemonProcess:
             "CONTAINER_RESOLV_CONF": "/etc/resolv.conf",
             "FORGERIG_API_KEY": "test-key",
             "FORGERIG_PROVIDER": "openai",
+            "FORGERIG_AUTH_TOKEN": AUTH_TOKEN,
             "PORT": str(DAEMON_PORT),
             "RUST_LOG": "info",
         })
@@ -124,6 +129,10 @@ class DaemonProcess:
 
     async def _check_ready(self):
         async with websockets.connect(DAEMON_URL) as ws:
+            await ws.send(json.dumps({"jsonrpc": "2.0", "method": "auth", "params": {"token": AUTH_TOKEN}, "id": 0}))
+            resp = await asyncio.wait_for(ws.recv(), timeout=2)
+            if "error" in json.loads(resp):
+                raise RuntimeError("Daemon rejected auth — cannot probe readiness")
             await ws.send(json.dumps({"jsonrpc": "2.0", "method": "status", "id": 1}))
             resp = await asyncio.wait_for(ws.recv(), timeout=2)
             data = json.loads(resp)
@@ -153,6 +162,9 @@ class GateTester:
     async def connect(self):
         self.ws = await websockets.connect(DAEMON_URL)
         print("Connected to daemon")
+        # Authenticate before anything else: the daemon refuses every RPC,
+        # status included, on an unauthenticated connection.
+        await self.rpc("auth", {"token": AUTH_TOKEN})
 
     async def close(self):
         if self.ws:
