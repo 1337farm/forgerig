@@ -317,6 +317,11 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
                     // a title, and survives a mid-flight tab switch.
                     sessions.append_message(&sid, json!({ "role": "user", "content": p }));
                     let mut messages = sessions.thread(&sid).unwrap_or_else(|| vec![provider::system_message()]);
+                    // Bound only what goes to the model: the stored thread stays
+                    // complete, so the UI, undo/redo, and fork are unaffected.
+                    if messages.len() > 1 {
+                        messages = provider::bound_history(&messages);
+                    }
                     // Keep the session's system message synced with the latest
                     // permanent project memory (spans sessions/projects) and
                     // with this session's workspace path.

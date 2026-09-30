@@ -207,6 +207,50 @@ pub fn system_message() -> serde_json::Value {
     json!({ "role": "system", "content": SYSTEM_PREAMBLE })
 }
 
+/// How many recent user→assistant exchanges are sent to the model in full.
+///
+/// This bounds one request, not the session: the stored thread stays complete
+/// and is still what the UI renders, the session list shows, and undo/redo and
+/// fork navigate. Without a bound, every new turn re-sends the entire history,
+/// so cost and latency grow without limit and an old session eventually stops
+/// fitting the model's context at all.
+const MAX_HISTORY_TURNS: usize = 12;
+
+/// Reduce a stored thread to what the model should see.
+///
+/// Keeps the most recent [`MAX_HISTORY_TURNS`] exchanges, measured in user
+/// messages so an exchange is never split. Anything elided is replaced by one
+/// marker message: the model is told earlier context exists rather than being
+/// left to assume the conversation began a moment ago, which is what makes it
+/// re-ask for facts the user already gave.
+///
+/// The caller's system message is dropped along with the elision — the session
+/// re-seeds index 0 with the live memory-backed preamble either way, so keeping
+/// the stale copy would just spend tokens on text that is about to be replaced.
+pub fn bound_history(thread: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let is_user = |m: &serde_json::Value| {
+        m.get("role").and_then(|r| r.as_str()) == Some("user")
+    };
+    // Index of each user message, i.e. where each exchange starts.
+    let starts: Vec<usize> = (0..thread.len()).filter(|&i| is_user(&thread[i])).collect();
+    if starts.len() <= MAX_HISTORY_TURNS {
+        return thread.to_vec();
+    }
+    let keep_from = starts[starts.len() - MAX_HISTORY_TURNS];
+    // Everything before the first kept user message is elided.
+    let elided = keep_from;
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(thread.len() - elided + 1);
+    out.push(json!({
+        "role": "system",
+        "content": format!(
+            "[{elided} earlier messages in this conversation were omitted to fit the context window. \
+             They remain in the app's history if you need to ask the user to repeat something.]"
+        ),
+    }));
+    out.extend_from_slice(&thread[keep_from..]);
+    out
+}
+
 /// Hard cap on the number of tool→reply rounds before we stop rather than loop.
 const MAX_TOOL_TURNS: usize = 8;
 
@@ -1202,5 +1246,114 @@ mod tests {
         let headers = openrouter_headers();
         assert!(headers.iter().any(|(k, v)| k == "HTTP-Referer" && v.contains("forgerig")));
         assert!(headers.iter().any(|(k, v)| k == "X-Title" && !v.is_empty()));
+    }
+
+    /// Build a thread of `turns` exchanges: system, then user/assistant pairs.
+    fn long_thread(turns: usize) -> Vec<serde_json::Value> {
+        let mut thread = vec![system_message()];
+        for t in 0..turns {
+            thread.push(json!({ "role": "user", "content": format!("q{t}") }));
+            thread.push(json!({ "role": "assistant", "content": format!("a{t}") }));
+        }
+        thread
+    }
+
+    fn contents(messages: &[serde_json::Value]) -> Vec<String> {
+        messages
+            .iter()
+            .filter_map(|m| m.get("content").and_then(|c| c.as_str()).map(String::from))
+            .collect()
+    }
+
+    /// A short thread must reach the model untouched. Bounding that trims a
+    /// conversation that already fits is indistinguishable from losing history.
+    #[test]
+    fn a_short_thread_is_sent_whole() {
+        let thread = long_thread(MAX_HISTORY_TURNS);
+        assert_eq!(bound_history(&thread), thread, "a thread within the bound was modified");
+    }
+
+    /// The point of the bound: a long session stops re-sending its whole past.
+    #[test]
+    fn a_long_thread_is_cut_to_the_most_recent_turns() {
+        let turns = MAX_HISTORY_TURNS + 25;
+        let thread = long_thread(turns);
+        let sent = bound_history(&thread);
+
+        // One marker plus two messages per kept exchange.
+        assert_eq!(sent.len(), 2 * MAX_HISTORY_TURNS + 1, "unexpected bound output size");
+        let text = contents(&sent);
+        assert!(
+            text.contains(&format!("a{}", turns - 1)),
+            "the newest exchange must survive: {text:?}"
+        );
+        assert!(
+            text.contains(&format!("q{}", turns - MAX_HISTORY_TURNS)),
+            "the oldest kept exchange must survive"
+        );
+        assert!(
+            !text.contains(&String::from("q0")),
+            "an elided exchange leaked into the request: {text:?}"
+        );
+    }
+
+    /// An exchange is a user message plus the assistant messages that follow it;
+    /// a cut landing mid-exchange would show the model an assistant reply with no
+    /// question before it, which reads as it answering something unasked.
+    ///
+    /// The thread ends in a stray assistant message (what a partial reply looks
+    /// like when a stream is cut) so that cutting by message *count* would land
+    /// one message off a turn boundary. On a strictly alternating thread the two
+    /// strategies coincide and this test would pass either way.
+    #[test]
+    fn the_cut_never_splits_an_exchange() {
+        let mut thread = long_thread(MAX_HISTORY_TURNS + 3);
+        thread.push(json!({ "role": "assistant", "content": "partial" }));
+        let sent = bound_history(&thread);
+        // Drop the marker: the kept history must start on a user message.
+        let tail = &sent[1..];
+        assert_eq!(
+            tail[0].get("role").and_then(|r| r.as_str()),
+            Some("user"),
+            "the kept history starts mid-exchange: {:?}",
+            tail[0]
+        );
+        let users = tail
+            .iter()
+            .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+            .count();
+        assert_eq!(users, MAX_HISTORY_TURNS, "an elided exchange leaked into the request");
+    }
+
+    /// The model must be told the history was cut. Silently dropping messages
+    /// reads like a conversation that just started, which invites it to re-ask
+    /// for facts the user already provided.
+    #[test]
+    fn elided_history_is_announced() {
+        let turns = MAX_HISTORY_TURNS + 4;
+        let thread = long_thread(turns);
+        let sent = bound_history(&thread);
+        let marker = sent[0].get("content").and_then(|c| c.as_str()).unwrap_or("");
+        // The stale system message plus every whole exchange that was dropped.
+        let dropped = 1 + 2 * (turns - MAX_HISTORY_TURNS);
+        assert!(
+            marker.contains(&format!("{dropped} earlier messages")),
+            "the marker must say how much was dropped, expected {dropped}, got: {marker:?}"
+        );
+        assert!(
+            marker.contains("omitted"),
+            "the marker must not imply the history is empty: {marker:?}"
+        );
+    }
+
+    /// The bound applies to the request only. The stored thread is what the UI
+    /// renders and what undo/redo and fork navigate, so trimming it here would
+    /// destroy user-visible history.
+    #[test]
+    fn the_stored_thread_is_untouched_by_bounding() {
+        let thread = long_thread(MAX_HISTORY_TURNS + 10);
+        let snapshot = thread.clone();
+        let _sent = bound_history(&thread);
+        assert_eq!(thread, snapshot, "bound_history mutated the thread it was given");
     }
 }
