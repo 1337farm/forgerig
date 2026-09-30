@@ -33,7 +33,15 @@ function makeEl(id) {
   let html = '';
   Object.defineProperty(el, 'innerHTML', {
     get() { return html; },
-    set(v) { html = v; el.children = []; },
+    // Detached children must lose their parentNode, exactly as the real DOM
+    // does: app.js uses `node.parentNode` as its only "is this still in the
+    // document?" test, so leaving the link in place makes the fake DOM agree
+    // with code that would never be reached in a browser.
+    set(v) {
+      el.children.forEach((c) => { c.parentNode = null; });
+      html = v;
+      el.children = [];
+    },
   });
   return el;
 }
@@ -53,7 +61,19 @@ global.document = {
   getElementById: (id) => els[id] || makeEl(id),
   createElement: (tag) => makeEl(tag),
 };
-global.window = { addEventListener: (k, f) => { listeners[k] = f; } };
+// Chunks are coalesced into one paint per animation frame. Model that here so
+// the tests exercise the same scheduling the WebView does: queue frames, and
+// run them only when a test explicitly flushes.
+const rafQueue = [];
+global.window = {
+  addEventListener: (k, f) => { listeners[k] = f; },
+  requestAnimationFrame(cb) { rafQueue.push(cb); return rafQueue.length; },
+};
+function flushFrames() {
+  const due = rafQueue.splice(0, rafQueue.length);
+  due.forEach((cb) => cb());
+  return due.length;
+}
 // The NativeHost bridge is how the app hands the daemon's auth token to the UI.
 global.window.NativeHost = { getAuthToken: () => 'bridge-token' };
 global.location = { protocol: 'http:', host: 'localhost' };
@@ -378,10 +398,41 @@ function msgTexts() {
   for (let i = 0; i < 40 && !sc; i++) { await tick(); sc = server.pendingChat.pop(); }
   assert.ok(sc, 'stream chat accepted after reconnect');
   const scSid = sc.params.session_id;
+
+  // Streaming into the *background*, then coming back to it.
+  //
+  // A frame queued while the tab was hidden is dropped, not painted into a
+  // bubble the user is not looking at. So the text only reappears when the tab
+  // is reopened, and that reopen must paint synchronously: the user just
+  // clicked, so deferring it a frame reads as a broken tab.
+  server.pushChunk(scSid, 'mid-stream ');
+  await tick();
+  const streamTab = tabLabels().findIndex((l) => l.includes('first'));
+  const otherTab = tabLabels().findIndex((l) => l.includes('fork'));
+  assert.ok(streamTab >= 0 && otherTab >= 0 && otherTab !== streamTab,
+    'the forked session tab exists to switch to');
+  // Switch away with a paint still queued, then let the frame run. The reply
+  // belongs to the tab the user just left, so it must not paint into the tab
+  // now in front of them.
+  els['tab-list'].children[otherTab].children[0].click();
+  await tick();
+  flushFrames();
+  assert.ok(!msgTexts().join(' ').includes('mid-stream'),
+    'a frame pending when the tab was left does not paint into the new tab');
+  const queuedWhileAway = rafQueue.length;
+  els['tab-list'].children[streamTab].children[0].click();
+  await tick();
+  assert.ok(msgTexts().join(' ').includes('mid-stream'),
+    'opening a streaming tab shows its accumulated text');
+  assert.equal(rafQueue.length, queuedWhileAway,
+    'opening a streaming tab must paint synchronously, not defer to a frame');
+
   server.pushChunk(scSid, 'hel');
   await tick();
   server.pushChunk(scSid, 'lo world');
   await tick();
+  assert.equal(rafQueue.length, 1, 'a burst of chunks queues one frame, not one per chunk');
+  flushFrames();
   assert.ok(msgTexts().join(' ').includes('hello world'), 'streamed chunks paint live');
   server.pushTool(scSid, 'start', { name: 'bash_executor' });
   await tick();
@@ -392,6 +443,47 @@ function msgTexts() {
   server.pushDone(scSid, 'hello world');
   await tick(); await tick();
   assert.ok(msgTexts().join(' ').includes('hello world'), 'done reload shows reply');
+
+  // ---- coalescing: the property this change is about ------------------
+  //
+  // Before, every chunk re-rendered the whole accumulated reply, so an
+  // N-token reply cost N renders of growing text. Chunks now queue at most
+  // one paint, and the paint shows the complete buffer — coalescing must be
+  // invisible to the user, not lossy.
+
+  let sc2 = null;
+  els.composer.value = 'long reply please';
+  els['send-btn'].onclick();
+  for (let i = 0; i < 40 && !sc2; i++) { await tick(); sc2 = server.pendingChat.pop(); }
+  assert.ok(sc2, 'second stream accepted');
+  const sid2 = sc2.params.session_id;
+
+  let maxQueued = 0;
+  for (let i = 0; i < 50; i++) {
+    server.pushChunk(sid2, `tok${i} `);
+    maxQueued = Math.max(maxQueued, rafQueue.length);
+    await tick();
+  }
+  // The whole burst fits in a single frame; without coalescing this would be 50.
+  assert.equal(maxQueued, 1, `expected at most one queued frame, saw ${maxQueued}`);
+  assert.equal(rafQueue.length, 1, 'still exactly one pending frame');
+  flushFrames();
+  {
+    const text = msgTexts().join(' ');
+    assert.ok(text.includes('tok0'), 'first token painted');
+    assert.ok(text.includes('tok49'), 'last token painted');
+    assert.ok(text.includes('tok0') && text.includes('tok25') && text.includes('tok49'),
+      'a coalesced paint must show every accumulated token, not just the first');
+  }
+
+  // A queued paint must not resurrect a bubble after the reply is torn down.
+  server.pushChunk(sid2, 'late');
+  server.sessions[sid2].push({ role: 'user', content: 'long reply please' }, { role: 'assistant', content: 'tok0 tok1' });
+  server.pushDone(sid2, 'tok0 tok1');
+  await tick(); await tick();
+  const before = msgTexts().join(' ');
+  flushFrames();
+  assert.equal(msgTexts().join(' '), before, 'a frame queued before teardown repainted a removed bubble');
 
   console.log('TABFLOW ALL PASS');
 
