@@ -274,6 +274,74 @@ var leanOverlayEl = $('lean-overlay');
     scrollToBottom();
   }
 
+  // Per-token repaint is quadratic: every chunk re-ran the markdown renderer
+  // over the *whole* accumulated reply and threw away the DOM that render
+  // produced. For an N-token reply that is N renders of growing text plus N
+  // innerHTML assignments, so the last token — the one the user is waiting on —
+  // is the most expensive and the whole thing degrades as replies get longer.
+  //
+  // Chunks only ever append to the buffer, so the render can be coalesced: mark
+  // the bubble dirty on each chunk and paint once per frame. Frames are already
+  // the right granularity for a WebView (they align with vsync), so nothing
+  // visible is lost — the buffer is still complete, just painted in one pass
+  // per frame instead of one per token.
+  var streamDirty = {};
+  var streamFrame = null;
+
+  function scheduleStreamPaint(sid) {
+    streamDirty[sid] = true;
+    if (streamFrame !== null) return;
+    var raf = window.requestAnimationFrame;
+    if (typeof raf !== 'function') {
+      // No rAF (non-browser host, or an old WebView): fall back to a macrotask
+      // so the coalescing still happens instead of rendering per chunk.
+      streamFrame = setTimeout(function () {
+        streamFrame = null;
+        flushStreamPaints();
+      }, 16);
+      return;
+    }
+    // Non-null while a paint is pending, so later chunks coalesce into it.
+    streamFrame = raf.call(window, function () {
+      streamFrame = null;
+      flushStreamPaints();
+    });
+  }
+
+  function flushStreamPaints() {
+    var ids = Object.keys(streamDirty);
+    for (var i = 0; i < ids.length; i++) {
+      var sid = ids[i];
+      delete streamDirty[sid];
+      // The user may have switched tabs or stopped this reply since the chunk
+      // arrived; painting then would fight the newer state.
+      if (activeId !== sid || stoppedSid[sid]) continue;
+      var refs = streamBubble(sid);
+      if (refs && refs.body) {
+        refs.body.innerHTML = phaseHeaderHtml(sid) +
+          '<div class="stream-text">' + Markdown.render(streamBuf[sid]) + '</div>';
+      }
+    }
+    if (activeId) scrollToBottom();
+  }
+
+  // Paint any pending text immediately: used when the user does something that
+  // must not be visually overtaken by a deferred frame (opening the tab,
+  // switching away, stopping the reply).
+  function paintStreamNow(sid) {
+    if (sid) {
+      delete streamDirty[sid];
+      if (activeId !== sid || stoppedSid[sid]) return;
+      var refs = streamBubble(sid);
+      if (refs && refs.body) {
+        refs.body.innerHTML = phaseHeaderHtml(sid) +
+          '<div class="stream-text">' + Markdown.render(streamBuf[sid]) + '</div>';
+      }
+    } else {
+      flushStreamPaints();
+    }
+  }
+
   function onStreamChunk(sid, delta) {
     if (stoppedSid[sid]) return;
     streamBuf[sid] = (streamBuf[sid] || '') + delta;
@@ -282,13 +350,7 @@ var leanOverlayEl = $('lean-overlay');
       renderTabs();
       return;
     }
-    var refs = streamBubble(sid);
-    // Preserve the pinned phase header while tokens stream underneath it.
-    if (refs.body) {
-      refs.body.innerHTML = phaseHeaderHtml(sid) +
-        '<div class="stream-text">' + Markdown.render(streamBuf[sid]) + '</div>';
-    }
-    scrollToBottom();
+    scheduleStreamPaint(sid);
   }
 
   function onStreamTool(sid, p) {
@@ -322,6 +384,9 @@ var leanOverlayEl = $('lean-overlay');
   function teardownLive(sid) {
     if (flightTimer[sid]) { clearTimeout(flightTimer[sid]); delete flightTimer[sid]; }
     delete streamBuf[sid];
+    // Drop any queued paint for this reply. Without this a frame already
+    // scheduled would repaint a bubble that has just been removed from the DOM.
+    delete streamDirty[sid];
     delete phaseLabel[sid];
     var refs = streamEls[sid];
     if (refs && refs.wrap) removeNode(refs.wrap);
@@ -349,6 +414,7 @@ var leanOverlayEl = $('lean-overlay');
     if (flightTimer[sid]) { clearTimeout(flightTimer[sid]); delete flightTimer[sid]; }
     delete inflight[sid];
     delete streamBuf[sid];
+    delete streamDirty[sid];
     delete phaseLabel[sid];
     delete streamEls[sid];
     delete pendEl[sid];
@@ -649,8 +715,9 @@ var leanOverlayEl = $('lean-overlay');
       renderTabs();
       render();
       if (streamBuf[id]) {
-        var rb = streamBubble(id);
-        if (rb.body) rb.body.innerHTML = Markdown.render(streamBuf[id]);
+        // Paint synchronously: the user just asked for this tab, so a frame's
+        // delay here would be visible as text appearing after the history.
+        paintStreamNow(id);
       } else if (id && inflight[id]) {
         appendElement(makePendingEl());
       }
