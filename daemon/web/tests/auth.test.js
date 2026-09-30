@@ -39,7 +39,9 @@ function harness(opts) {
     createElement: (tag) => makeEl(tag),
     createTextNode: (t) => ({ textContent: t }),
   };
-  global.window = { addEventListener: () => {} };
+  const listeners = {};
+  global.window = { addEventListener: (k, f) => { (listeners[k] = listeners[k] || []).push(f); } };
+  global.window.__listeners = listeners;
   if (opts.token !== undefined) {
     global.window.NativeHost = { getAuthToken: () => opts.token };
   }
@@ -135,6 +137,45 @@ test('a missing bridge token fails loudly instead of firing doomed calls', async
   await tick();
   assert.deepEqual(h.methods(), [], 'no RPC is sent when there is no token to send');
   assert.match(h.els['status'].textContent, /ForgeRig app/i);
+});
+
+test('unhandled UI errors are reported to the daemon', async () => {
+  const h = harness({ token: 'tok' });
+  await tick();
+  // The client_error RPC exists so an on-device JS failure reaches the shared
+  // log. If nothing calls it, the page silently stops working instead.
+  const before = h.methods().length;
+  global.window.onerror('boom', 'app.js', 42, 7, { stack: 'at foo' });
+  global.window.__listeners.unhandledrejection.forEach((f) => f({ reason: new Error('rejected!') }));
+  await tick();
+  const reports = h.frames.slice(before).filter((f) => f.method === 'client_error');
+  assert.equal(reports.length, 2, 'both a JS error and a rejection are reported');
+  assert.equal(reports[0].params.kind, 'js');
+  assert.equal(reports[0].params.message, 'boom');
+  assert.equal(reports[0].params.line, 42);
+  assert.equal(reports[0].params.stack, 'at foo');
+  assert.equal(reports[1].params.kind, 'promise');
+  assert.match(reports[1].params.message, /rejected!/);
+});
+
+test('error reporting is bounded and never throws', async () => {
+  const h = harness({ token: 'tok' });
+  await tick();
+  // A pathological message must be truncated rather than shipped whole: this
+  // string ends up in a log file the user is expected to paste somewhere.
+  global.window.onerror('x'.repeat(100000), 'app.js', 1, 1, null);
+  global.window.onerror(undefined, 'app.js', 1, 1, { stack: 'y'.repeat(50000) });
+  await tick();
+  const reports = h.frames.filter((f) => f.method === 'client_error');
+  assert.ok(reports.every((r) => r.params.message.length <= 2000), 'message truncated');
+  assert.ok(reports.every((r) => r.params.stack.length <= 4000), 'stack truncated');
+  // A missing message still sends the field the daemon reads, rather than
+  // omitting it — the daemon's `(no message)` default then applies on-device.
+  assert.equal(typeof reports[1].params.message, 'string');
+  assert.equal(reports[1].params.message, 'undefined');
+  // And reporting while disconnected is a no-op, not a throw.
+  global.window.onerror('while down', 'app.js', 1, 1, null);
+  assert.ok(true, 'no throw');
 });
 
 test('after auth the normal probes follow', async () => {
