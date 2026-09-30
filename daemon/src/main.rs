@@ -199,6 +199,68 @@ async fn system_message_with_memory(memory: &Arc<MemoryEngine>, session: Option<
     sys
 }
 
+/// `params` as an object, or an empty object when absent. Missing params are a
+/// normal case (the UI sends `{}`), so every field read goes through here.
+fn params_of(req: &RpcRequest) -> Value {
+    match &req.params {
+        Some(v) if v.is_object() => v.clone(),
+        _ => Value::Object(serde_json::Map::new()),
+    }
+}
+
+/// String field lookup that tolerates a non-string (the UI hands us whatever
+/// JSON it had, so `123` or `null` must not panic a match arm).
+fn param_str(params: &Value, key: &str) -> String {
+    params.get(key).and_then(|v| v.as_str()).unwrap_or_default().trim().to_string()
+}
+
+/// Err variant is (JSON-RPC code, message) so the arms read as one line.
+type RpcFail = (i32, String);
+
+/// Closed tabs for the 🕘 history panel: the trash, newest first.
+fn closed_tabs(sessions: &Arc<sessions::SessionManager>) -> Result<Value, RpcFail> {
+    Ok(json!(sessions.trash_list()))
+}
+
+/// Restore a soft-deleted session. Returns the full thread (same shape as
+/// `session_history`) so the UI can open it without a second round-trip.
+fn restore_session(sessions: &Arc<sessions::SessionManager>, params: &Value) -> Result<Value, RpcFail> {
+    let id = param_str(params, "session_id");
+    if id.is_empty() {
+        return Err((-32602, "Missing 'session_id' in params".into()));
+    }
+    match sessions.restore(&id) {
+        Some(s) => Ok(json!({
+            "id": s.id,
+            "title": s.title,
+            "messages": s.thread(),
+            "workspace": s.workspace(),
+        })),
+        None => Err((-32603, format!("session '{id}' is not in the trash"))),
+    }
+}
+
+/// Rename a tab. An empty/whitespace title is rejected rather than silently
+/// clearing it — `set_title` refuses blank titles on purpose, so that a stray
+/// Enter in the rename box cannot wipe a name.
+fn rename_session(sessions: &Arc<sessions::SessionManager>, params: &Value) -> Result<Value, RpcFail> {
+    let id = param_str(params, "session_id");
+    if id.is_empty() {
+        return Err((-32602, "Missing 'session_id' in params".into()));
+    }
+    let title = params.get("title").and_then(|v| v.as_str()).unwrap_or_default();
+    match sessions.set_title(&id, title) {
+        Some(s) => Ok(json!({ "id": s.id, "title": s.title })),
+        None => {
+            if !sessions.exists(&id) {
+                Err((-32603, format!("session '{id}' not found")))
+            } else {
+                Err((-32602, "title must not be empty".into()))
+            }
+        }
+    }
+}
+
 async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &Arc<MemoryEngine>, sessions: &Arc<sessions::SessionManager>, push: &WsPush, auth_token: Option<&str>, conn: &std::sync::atomic::AtomicBool) -> RpcResponse {
     fn ok(result: Value, id: Option<Value>) -> RpcResponse {
         RpcResponse { jsonrpc: "2.0".into(), result: Some(result), error: None, id }
@@ -448,6 +510,28 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
             let id = req.params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
             let archived = req.params.as_ref().and_then(|p| p.get("archived")).and_then(|a| a.as_bool()).unwrap_or(true);
             ok(json!({ "archived": sessions.set_archived(&id, archived) }), req.id)
+        }
+        // Closed tabs: the trash behind the 🕘 history panel, plus the two
+        // actions on it. All three were called by the UI and handled nowhere,
+        // so every call fell through to "Method not found": the panel stayed
+        // permanently empty, rename silently reverted, Restore did nothing.
+        "session_closed" => {
+            match closed_tabs(sessions) {
+                Ok(v) => ok(v, req.id),
+                Err((code, message)) => err(code, message, req.id),
+            }
+        }
+        "session_restore" => {
+            match restore_session(sessions, &params_of(&req)) {
+                Ok(v) => ok(v, req.id),
+                Err((code, message)) => err(code, message, req.id),
+            }
+        }
+        "session_rename" => {
+            match rename_session(sessions, &params_of(&req)) {
+                Ok(v) => ok(v, req.id),
+                Err((code, message)) => err(code, message, req.id),
+            }
         }
         "chat_stop" => {
             let id = req.params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
@@ -847,12 +931,168 @@ async fn send_json(stream: &mut TcpStream, status: u16, body: Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sessions::SessionManager;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn denied(gate: AuthGate) -> (i32, String) {
         match gate {
             AuthGate::Denied(code, message) => (code, message),
             other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    // ---- closed tabs / rename / restore ---------------------------------
+    //
+    // The 🕘 history panel, the inline tab rename, and its Restore button all
+    // called methods the daemon never handled. Every request fell through to
+    // "Method not found", which the UI swallows: the panel stayed empty,
+    // rename reverted on the next render, Restore did nothing.
+
+    fn mgr() -> Arc<SessionManager> {
+        Arc::new(SessionManager::new())
+    }
+
+    fn thread(id: &str, content: &str) -> Value {
+        json!({ "role": "user", "content": content })
+    }
+
+    /// The closed-tab list must be a JSON array (the UI does `list.length`),
+    /// empty — not null — when nothing is closed.
+    #[test]
+    fn closed_tabs_is_an_array_even_when_empty() {
+        let m = mgr();
+        assert_eq!(closed_tabs(&m).unwrap(), json!([]));
+        let s = m.create(json!({ "role": "system", "content": "S" }));
+        m.append_message(&s.id, thread(&s.id, "hi"));
+        assert_eq!(closed_tabs(&m).unwrap(), json!([]), "a live tab is not closed");
+        m.delete(&s.id);
+        let listed = closed_tabs(&m).unwrap();
+        let arr = listed.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "a deleted tab is closed");
+        // The UI reads id/title/message_count/archived off these rows.
+        assert_eq!(arr[0]["id"], json!(s.id));
+        assert_eq!(arr[0]["message_count"], json!(2));
+        assert_eq!(arr[0]["archived"], json!(false));
+    }
+
+    /// Restore hands back the whole thread so the UI can open it without a
+    /// second round-trip, and the session is live again afterwards.
+    #[test]
+    fn restore_returns_the_thread_and_revives_the_session() {
+        let m = mgr();
+        let s = m.create(json!({ "role": "system", "content": "S" }));
+        m.append_message(&s.id, thread(&s.id, "important work"));
+        m.set_title(&s.id, "budget chat");
+        m.delete(&s.id);
+        assert!(!m.exists(&s.id), "deleted from the live list");
+
+        let out = restore_session(&m, &json!({ "session_id": s.id })).unwrap();
+        assert_eq!(out["id"], json!(s.id));
+        assert_eq!(out["title"], json!("budget chat"));
+        let msgs = out["messages"].as_array().unwrap();
+        assert!(msgs.iter().any(|x| x["content"] == json!("important work")), "history survived the round-trip");
+        assert!(m.exists(&s.id), "restored to the live list");
+        assert_eq!(m.get(&s.id).unwrap().thread().len(), msgs.len(), "restored state matches the reply");
+        // ...and it left the trash, so the badge count drops.
+        assert_eq!(closed_tabs(&m).unwrap(), json!([]));
+        // Restoring twice is an error, not a silent duplicate.
+        assert_eq!(restore_session(&m, &json!({ "session_id": s.id })).unwrap_err().0, -32603);
+    }
+
+    /// Newest closed tab first: the panel lists most-recently-closed at the top.
+    #[test]
+    fn closed_tabs_are_newest_first() {
+        let m = mgr();
+        let a = m.create(json!({ "role": "system", "content": "S" }));
+        let b = m.create(json!({ "role": "system", "content": "S" }));
+        m.delete(&a.id);
+        m.delete(&b.id);
+        let arr = closed_tabs(&m).unwrap();
+        let ids: Vec<&Value> = arr.as_array().unwrap().iter().map(|x| &x["id"]).collect();
+        assert_eq!(ids, vec![&json!(b.id), &json!(a.id)], "b was closed last, so it leads");
+    }
+
+    #[test]
+    fn rename_sticks_and_is_capped() {
+        let m = mgr();
+        let s = m.create(json!({ "role": "system", "content": "S" }));
+        let out = rename_session(&m, &json!({ "session_id": s.id, "title": "  my chat  " })).unwrap();
+        assert_eq!(out["title"], json!("my chat"), "trimmed");
+        assert_eq!(m.get(&s.id).unwrap().title, "my chat", "persisted");
+        // TITLE_MAX: a runaway paste is truncated, not rejected.
+        let long = "x".repeat(500);
+        let out = rename_session(&m, &json!({ "session_id": s.id, "title": long })).unwrap();
+        assert_eq!(out["title"].as_str().unwrap().chars().count(), 60);
+    }
+
+    /// A blank rename is a client mistake, not "clear the title" — and it must
+    /// not clobber an existing name.
+    #[test]
+    fn blank_rename_is_rejected_and_keeps_the_title() {
+        let m = mgr();
+        let s = m.create(json!({ "role": "system", "content": "S" }));
+        rename_session(&m, &json!({ "session_id": s.id, "title": "keep me" })).unwrap();
+        for bad in ["", "   "] {
+            let e = rename_session(&m, &json!({ "session_id": s.id, "title": bad })).unwrap_err();
+            assert_eq!(e.0, -32602, "blank title is invalid params");
+        }
+        assert_eq!(m.get(&s.id).unwrap().title, "keep me", "title untouched");
+    }
+
+    /// Missing vs unknown are distinguished so the UI can tell "you forgot a
+    /// field" from "that tab is gone".
+    #[test]
+    fn session_rpcs_report_missing_and_unknown_separately() {
+        let m = mgr();
+        assert_eq!(restore_session(&m, &json!({})).unwrap_err().0, -32602);
+        assert_eq!(restore_session(&m, &json!({ "session_id": "" })).unwrap_err().0, -32602);
+        assert_eq!(restore_session(&m, &json!({ "session_id": "nope" })).unwrap_err().0, -32603);
+        assert_eq!(rename_session(&m, &json!({ "title": "x" })).unwrap_err().0, -32602);
+        assert_eq!(rename_session(&m, &json!({ "session_id": "nope", "title": "x" })).unwrap_err().0, -32603);
+    }
+
+    /// The UI's JSON is not trusted to be the right type: a numeric session_id
+    /// or a non-string title must produce an error, never a panic that takes
+    /// down the connection task.
+    #[test]
+    fn session_rpcs_tolerate_wrong_param_types() {
+        let m = mgr();
+        let s = m.create(json!({ "role": "system", "content": "S" }));
+        assert_eq!(rename_session(&m, &json!({ "session_id": 7, "title": "x" })).unwrap_err().0, -32602);
+        assert_eq!(rename_session(&m, &json!({ "session_id": s.id, "title": 99 })).unwrap_err().0, -32602);
+        assert_eq!(restore_session(&m, &json!({ "session_id": null })).unwrap_err().0, -32602);
+        assert_eq!(restore_session(&m, &json!(["not", "an", "object"])).unwrap_err().0, -32602);
+        assert_eq!(restore_session(&m, &Value::Null).unwrap_err().0, -32602);
+    }
+
+    /// Every method a client can actually call must be handled. This is the
+    /// check that would have caught the three missing session RPCs: they were
+    /// called by the UI and dispatched nowhere, and the UI swallows the
+    /// resulting "Method not found" error, so the breakage was silent.
+    #[test]
+    fn every_method_the_clients_call_is_handled() {
+        // Kept in sync with daemon/web/app.js (call('…')) and the Kotlin
+        // NetworkAllowlistActivity (rpc("…")). `auth` is handled by the gate
+        // itself, ahead of this match, so it has no arm.
+        const CLIENT_METHODS: &[&str] = &[
+            "auth", "status", "exec", "chat", "chat_stop",
+            "session_list", "session_create", "session_history", "session_fork",
+            "session_undo", "session_redo", "session_goto", "session_nav",
+            "session_archive", "session_delete", "session_closed",
+            "session_rename", "session_restore",
+            "lean_status", "lean_progress", "lean_provision",
+            "network_policy_list", "network_policy_add", "network_policy_remove",
+        ];
+        let src = include_str!("main.rs");
+        for method in CLIENT_METHODS {
+            if *method == "auth" {
+                continue;
+            }
+            assert!(
+                src.contains(&format!("\"{method}\" =>")),
+                "clients call `{method}` but handle_rpc has no arm for it — \
+                 the UI would get a silent \"Method not found\""
+            );
         }
     }
 

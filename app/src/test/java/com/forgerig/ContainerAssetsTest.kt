@@ -93,4 +93,54 @@ class ContainerAssetsTest {
         assertTrue(ranges.none { it.startsWith("bytes=0-") })
         assertFalse(File(out.path + ".resume").exists())
     }
+
+    @Test
+    fun parseManifestReadsVersion2RootfsAndLeanEntries() {
+        val text = """
+            {
+              "version": 2,
+              "assets": {
+                "ubuntu-rootfs.bin": { "sha256": "abc123", "size": 102579690 },
+                "lean-4.35.0-rc3-linux_aarch64.tar.zst": {
+                  "sha256": "def456", "size": 596161714,
+                  "url": "https://github.com/leanprover/lean4/releases/download/v4.35.0-rc3/lean-4.35.0-rc3-linux_aarch64.tar.zst"
+                }
+              }
+            }
+        """.trimIndent()
+        val m = ContainerAssets.parseManifest(text)
+        assertEquals(2, m.size)
+        assertEquals(102579690L, m["ubuntu-rootfs.bin"]!!.size)
+        assertEquals("abc123", m["ubuntu-rootfs.bin"]!!.sha256)
+        // The Lean entry is carried for the daemon, which reads this same file
+        // out of the cache instead of fetching it itself.
+        assertEquals(596161714L, m["lean-4.35.0-rc3-linux_aarch64.tar.zst"]!!.size)
+    }
+
+    /// isVerified is what lets a reinstall skip the network: the payload on
+    /// disk must match the manifest byte-for-byte, and anything less (short
+    /// file, wrong bytes, missing manifest entry) has to re-download.
+    @Test
+    fun isVerifiedAcceptsOnlyExactManifestBytes() {
+        val bytes = ByteArray(2048) { (it % 97).toByte() }
+        val sha = MessageDigest.getInstance("SHA-256").digest(bytes)
+            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        val info = ContainerAssets.Asset("rootfs.bin", sha, bytes.size.toLong())
+        val good = tmp.newFile("rootfs.bin").apply { writeBytes(bytes) }
+
+        assertTrue(ContainerAssets.isVerified(good, info))
+        // Right bytes, wrong manifest: a new release invalidated the cache.
+        assertFalse(
+            ContainerAssets.isVerified(
+                good,
+                ContainerAssets.Asset("rootfs.bin", "0".repeat(64), bytes.size.toLong())
+            )
+        )
+        // Truncated by a killed download.
+        val partial = tmp.newFile("partial.bin").apply { writeBytes(bytes.copyOf(bytes.size - 1)) }
+        assertFalse(ContainerAssets.isVerified(partial, info))
+        // Nothing cached, and no manifest entry at all.
+        assertFalse(ContainerAssets.isVerified(File(tmp.root, "absent.bin"), info))
+        assertFalse(ContainerAssets.isVerified(good, null))
+    }
 }
