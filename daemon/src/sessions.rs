@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -193,15 +193,66 @@ struct SessionState {
     trash_seq: Mutex<u64>,
 }
 
+/// Persistence bookkeeping, shared between the manager and its writer thread.
+///
+/// A generation counter rather than a boolean, because a boolean cannot
+/// distinguish "clean" from "a mutation arrived while I was writing". With a
+/// flag, a mutation landing during serialization set it, and the writer in
+/// flight then cleared it — publishing a file that predates the mutation while
+/// nothing was left pending to notice. Here `mutations` only ever counts up and
+/// `written` records how many of them a *completed* write captured, so anything
+/// that mutated since keeps `pending()` true and the writer comes back.
+struct Persist {
+    mutations: AtomicU64,
+    written: AtomicU64,
+    /// Serializes writers.
+    ///
+    /// Every write lands through the same `<path>.tmp` before being renamed
+    /// into place, so two concurrent writers interleave on one temp file: the
+    /// second truncates what the first is part-way through writing, and
+    /// whichever renames first wins with the other's bytes.
+    write_lock: Mutex<()>,
+    /// Test-only: fires inside `write_state` after the snapshot is taken and
+    /// before the bytes hit the temp file. That is the one window where a
+    /// mutation is invisible to the write in progress, and therefore the only
+    /// place a test can reliably land one.
+    ///
+    /// Per-`Persist` rather than a global because `cargo test` runs tests on
+    /// parallel threads: a global hook would let one test's writer fire another
+    /// test's closure.
+    #[cfg(test)]
+    gap: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl Persist {
+    fn pending(&self) -> bool {
+        self.written.load(Ordering::SeqCst) < self.mutations.load(Ordering::SeqCst)
+    }
+
+    /// Count a mutation. Called by every state change that must reach disk.
+    fn note_mutation(&self) {
+        self.mutations.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A completed write covered mutations up to `target`.
+    ///
+    /// `target` is the generation read immediately before that write's
+    /// snapshot, so a mutation arriving while it was serializing or hitting the
+    /// disk counts past `written` and forces another pass. Only a failed write
+    /// leaves `written` behind `mutations`, which is what stops a debounced
+    /// writer from going silently stale.
+    fn mark_written(&self, target: u64) {
+        self.written.store(target, Ordering::SeqCst);
+    }
+}
+
 pub struct SessionManager {
     state: Arc<SessionState>,
     persist_path: Option<PathBuf>,
-    /// Set by a mutation, cleared only once a write lands. A mutation that
-    /// races an in-flight write re-sets it, forcing another pass.
-    dirty: Arc<AtomicBool>,
-    /// Wake channel for the writer. Checked under `wake_lock` together with
-    /// `dirty` so a mutation cannot land between the writer's dirty check and
-    /// its wait, which would sleep through the notification entirely.
+    persist: Arc<Persist>,
+    /// Wake channel for the writer. Pending-ness is checked under `wake_lock`
+    /// so a mutation cannot land between the writer's check and its wait, which
+    /// would sleep through the notification entirely.
     wake_lock: Arc<Mutex<()>>,
     wake: Arc<Condvar>,
     /// Set on drop so the writer exits after its final flush.
@@ -224,7 +275,15 @@ const WRITE_POLL: Duration = Duration::from_millis(500);
 ///
 /// A free function rather than a method: the writer thread holds an `Arc` to
 /// the state, not to the manager that owns it.
-fn write_state(state: &SessionState, path: &Path, dirty: &AtomicBool) {
+fn write_state(state: &SessionState, path: &Path, persist: &Persist) {
+    // The generation is read under the write lock, immediately before the
+    // snapshot, and published only after the rename lands. Keeping those two
+    // operations adjacent is what closes the window: a mutation can arrive
+    // either before this read (so the snapshot below covers it) or after it
+    // (so it counts past `written` and forces another pass). There is no point
+    // at which a mutation is both absent from the file and marked written.
+    let _writing = persist.write_lock.lock().unwrap();
+    let target = persist.mutations.load(Ordering::SeqCst);
     let sessions = state.sessions.lock().unwrap();
     let trash = state.trash.lock().unwrap();
     let snapshot = PersistedState {
@@ -236,6 +295,13 @@ fn write_state(state: &SessionState, path: &Path, dirty: &AtomicBool) {
     };
     drop(sessions);
     drop(trash);
+    #[cfg(test)]
+    {
+        let gap = persist.gap.lock().unwrap().take();
+        if let Some(hook) = gap {
+            hook();
+        }
+    }
     let text = match serde_json::to_string(&snapshot) {
         Ok(text) => text,
         Err(_) => return,
@@ -247,11 +313,7 @@ fn write_state(state: &SessionState, path: &Path, dirty: &AtomicBool) {
     if fs::rename(&tmp, path).is_err() {
         return;
     }
-    // Clear only after the rename landed. Clearing earlier — before the write,
-    // or on failure — discards a pending mutation and leaves the file
-    // permanently stale with nothing to indicate it, which is worse than
-    // having been slow.
-    dirty.store(false, Ordering::SeqCst);
+    persist.mark_written(target);
 }
 /// Max stored title length (UI + RPC trim longer input).
 const TITLE_MAX: usize = 60;
@@ -307,7 +369,13 @@ impl SessionManager {
                 trash_seq: Mutex::new(trash_seq),
             }),
             persist_path: path,
-            dirty: Arc::new(AtomicBool::new(false)),
+            persist: Arc::new(Persist {
+                mutations: AtomicU64::new(0),
+                written: AtomicU64::new(0),
+                write_lock: Mutex::new(()),
+                #[cfg(test)]
+                gap: Mutex::new(None),
+            }),
             wake_lock: Arc::new(Mutex::new(())),
             wake: Arc::new(Condvar::new()),
             stopping: Arc::new(AtomicBool::new(false)),
@@ -323,27 +391,27 @@ impl SessionManager {
             return;
         };
         let state = Arc::clone(&self.state);
-        let dirty = Arc::clone(&self.dirty);
+        let persist = Arc::clone(&self.persist);
         let wake_lock = Arc::clone(&self.wake_lock);
         let wake = Arc::clone(&self.wake);
         let stopping = Arc::clone(&self.stopping);
         self.writer = Some(thread::spawn(move || loop {
             {
                 let guard = wake_lock.lock().unwrap();
-                if !dirty.load(Ordering::SeqCst) {
+                if !persist.pending() {
                     // Wake on a mutation, on shutdown, or on a timer so a lost
                     // notification can never wedge the file forever.
                     let _unused = wake.wait_timeout(guard, WRITE_POLL).unwrap();
                 }
             }
-            if !dirty.load(Ordering::SeqCst) && stopping.load(Ordering::SeqCst) {
+            if !persist.pending() && stopping.load(Ordering::SeqCst) {
                 break;
             }
             if !stopping.load(Ordering::SeqCst) {
                 thread::sleep(WRITE_DEBOUNCE);
             }
-            write_state(&state, &path, &dirty);
-            if stopping.load(Ordering::SeqCst) && !dirty.load(Ordering::SeqCst) {
+            write_state(&state, &path, &persist);
+            if stopping.load(Ordering::SeqCst) && !persist.pending() {
                 break;
             }
         }));
@@ -419,7 +487,7 @@ impl SessionManager {
         if self.persist_path.is_none() {
             return;
         }
-        self.dirty.store(true, Ordering::SeqCst);
+        self.persist.note_mutation();
         self.wake.notify_all();
     }
 
@@ -430,7 +498,7 @@ impl SessionManager {
         let Some(path) = &self.persist_path else {
             return;
         };
-        write_state(&self.state, path, &self.dirty);
+        write_state(&self.state, path, &self.persist);
     }
 
     fn summary_of(s: &Session) -> SessionSummary {
@@ -1186,15 +1254,15 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
-    /// A failed write must leave the dirty flag set.
+    /// A failed write must leave the state pending.
     ///
     /// This is the invariant that stops a debounced writer from going silently
-    /// stale. A timing-based "mutation during a write" test cannot pin it — a
-    /// later write re-captures the state either way, so the mutation passes
-    /// even when the bug is present. Tested directly through the failure path
-    /// instead: the flag may only be cleared once the rename has landed.
+    /// stale. Tested through the failure path, which is reachable
+    /// deterministically: a timing-based "mutation during a write" test cannot
+    /// pin it, because a later write re-captures the state either way and the
+    /// mutation passes even when the bug is present.
     #[test]
-    fn a_failed_write_keeps_the_state_dirty() {
+    fn a_failed_write_leaves_the_state_pending() {
         let path = tmp_state_file("failwrite");
         // write_state writes to `<path>.tmp` first, so making that a directory
         // forces every write to fail.
@@ -1205,10 +1273,180 @@ mod tests {
         m.append_message(&s.id, json!({ "role": "user", "content": "hi" }));
         m.flush();
         assert!(
-            m.dirty.load(Ordering::SeqCst),
-            "a failed write cleared the dirty flag, so the state is now silently stale"
+            m.persist.pending(),
+            "a failed write marked the state written, so it is now silently stale"
         );
         let _ = fs::remove_dir_all(&tmp);
+        let _ = fs::remove_file(path);
+    }
+
+    /// The regression the generation counter exists for: a mutation landing
+    /// mid-write must not be swallowed by that write's own bookkeeping.
+    ///
+    /// With a boolean, the writer snapshotted the state, a mutation arriving
+    /// during serialization re-set the flag, and the writer then cleared it —
+    /// publishing a file that predates the mutation with nothing left pending.
+    ///
+    /// Driven through `write_state`'s test hook rather than by racing threads.
+    /// The hook fires in the one window that matters: after the snapshot, before
+    /// the bytes are written. Blocking on the write lock instead does not work
+    /// — it parks the writer *before* the snapshot, so it would legitimately
+    /// cover the mutation and marking it written would be correct.
+    #[test]
+    fn a_mutation_during_a_write_is_not_swallowed() {
+        let path = tmp_state_file("midwrite");
+        let m = SessionManager::with_persist_path(Some(path.clone()));
+        let s = m.create(sys());
+        m.append_message(&s.id, json!({ "role": "user", "content": "before" }));
+        // Quiesce the background writer so it cannot settle state under us.
+        drop(m);
+
+        let id = s.id.clone();
+        let state = Arc::new(SessionState {
+            sessions: Mutex::new(HashMap::new()),
+            trash: Mutex::new(HashMap::new()),
+            seq: Mutex::new(0),
+            trash_seq: Mutex::new(0),
+        });
+        let persist = Arc::new(Persist {
+            mutations: AtomicU64::new(1),
+            written: AtomicU64::new(0),
+            write_lock: Mutex::new(()),
+            gap: Mutex::new(None),
+        });
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            0,
+            MsgNode { id: 0, parent: None, message: sys(), children: Vec::new() },
+        );
+        let make_session = || Session {
+            id: id.clone(),
+            title: String::new(),
+            tree: SessionTree { nodes: nodes.clone(), root: 0, head: 0, next: 1, redo: Vec::new() },
+            archived: false,
+            created_ms: 1,
+            parent_id: None,
+            role: String::new(),
+            goal: String::new(),
+        };
+        let mut session = make_session();
+        SessionManager::push_node(&mut session, json!({ "role": "user", "content": "before" }));
+        state.sessions.lock().unwrap().insert(id.clone(), session);
+
+        // Land a mutation inside that blind spot.
+        *persist.gap.lock().unwrap() = Some(Box::new({
+            let state = Arc::clone(&state);
+            let persist = Arc::clone(&persist);
+            let id = id.clone();
+            move || {
+                let mut sessions = state.sessions.lock().unwrap();
+                let mut session = sessions.get(&id).unwrap().clone();
+                SessionManager::push_node(
+                    &mut session,
+                    json!({ "role": "user", "content": "during" }),
+                );
+                sessions.insert(id, session);
+                persist.note_mutation();
+            }
+        }));
+        write_state(&state, &path, &persist);
+        assert!(
+            persist.gap.lock().unwrap().is_none(),
+            "the write never reached its mid-flight hook"
+        );
+
+        assert!(
+            persist.pending(),
+            "a mutation that arrived mid-write was marked written, so it is lost"
+        );
+
+        // The next write must carry it to disk and settle the state.
+        write_state(&state, &path, &persist);
+        assert!(!persist.pending(), "a write covering every mutation must settle");
+        let persisted: PersistedState =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let contents: Vec<String> = persisted.sessions[0]
+            .thread()
+            .iter()
+            .filter_map(|msg| msg.get("content").and_then(|c| c.as_str()).map(String::from))
+            .collect();
+        assert!(
+            contents.iter().any(|c| c == "before") && contents.iter().any(|c| c == "during"),
+            "the mid-write mutation never reached disk: {contents:?}"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    /// Only one writer may be inside the critical section at a time.
+    ///
+    /// Every write lands through `<path>.tmp` before being renamed into place,
+    /// so two writers overlapping means one truncates the other's half-written
+    /// bytes and the file ends up a mix of both — corrupt JSON that fails to
+    /// load at startup. `flush()` and the background writer can genuinely
+    /// overlap, since a shutdown or an explicit flush can run mid-debounce.
+    ///
+    /// Asserted by parking a writer behind the lock rather than by racing two
+    /// of them: a scheduler-dependent race passes whether or not the lock
+    /// exists, which is the same reason the mid-write test needs a hook.
+    #[test]
+    fn a_writer_waits_for_the_one_in_flight() {
+        let path = tmp_state_file("serial");
+        let m = SessionManager::with_persist_path(Some(path.clone()));
+        let s = m.create(sys());
+        m.append_message(&s.id, json!({ "role": "user", "content": "hi" }));
+        // Quiesce the background writer so it cannot settle state under us.
+        drop(m);
+
+        let state = Arc::new(SessionState {
+            sessions: Mutex::new(HashMap::new()),
+            trash: Mutex::new(HashMap::new()),
+            seq: Mutex::new(0),
+            trash_seq: Mutex::new(0),
+        });
+        let persist = Arc::new(Persist {
+            mutations: AtomicU64::new(1),
+            written: AtomicU64::new(0),
+            write_lock: Mutex::new(()),
+            gap: Mutex::new(None),
+        });
+
+        // Fires once a writer is inside the critical section.
+        let inside = Arc::new(AtomicBool::new(false));
+        *persist.gap.lock().unwrap() = Some(Box::new({
+            let inside = Arc::clone(&inside);
+            move || {
+                inside.store(true, Ordering::SeqCst);
+            }
+        }));
+
+        // Take the lock: any writer must now block before its snapshot.
+        let guard = persist.write_lock.lock().unwrap();
+        let writer = {
+            let state = Arc::clone(&state);
+            let persist = Arc::clone(&persist);
+            let path = path.clone();
+            thread::spawn(move || write_state(&state, &path, &persist))
+        };
+        // Give it a generous window to (wrongly) sail past the lock.
+        let deadline = SystemTime::now() + Duration::from_millis(250);
+        while SystemTime::now() < deadline {
+            if inside.load(Ordering::SeqCst) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !inside.load(Ordering::SeqCst),
+            "a writer entered the write critical section while it was already held"
+        );
+
+        // Releasing the lock lets it through.
+        drop(guard);
+        writer.join().unwrap();
+        assert!(
+            inside.load(Ordering::SeqCst),
+            "the writer never ran after the lock was released"
+        );
         let _ = fs::remove_file(path);
     }
 
