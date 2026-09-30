@@ -90,7 +90,53 @@ pub async fn guest_shell_ready() -> Result<(), String> {
     } else {
         format!("exit {:?}: {}", r.exit_code, first.join(" | "))
     };
-    Err(detail)
+    Err(format!("{detail} [{}]", diagnose_guest()))
+}
+
+/// Explain a guest exec failure from the host side, where the rootfs is just a
+/// directory this process can stat.
+///
+/// proot reports `execve("/usr/bin/sh"): No such file or directory` for several
+/// unrelated causes — a missing shell, a missing ELF interpreter, or a binary
+/// whose execute bit never got set — and its own hint ("the program is a script
+/// but its interpreter was not found") covers only one of them. Every message it
+/// emits therefore reads as "reinstall the environment", even when the
+/// environment is complete and the real fault is elsewhere. The rootfs is a
+/// plain path to us, so name the missing piece instead of guessing.
+fn diagnose_guest() -> String {
+    let Some(rootfs) = std::env::var("CONTAINER_ROOTFS").ok().filter(|v| !v.is_empty()) else {
+        return "no CONTAINER_ROOTFS configured".to_string();
+    };
+    let root = std::path::Path::new(&rootfs);
+    if !root.is_dir() {
+        return format!("rootfs {rootfs} is not a directory");
+    }
+    // What the shell and the loader actually resolve to inside the guest.
+    let sh = root.join("usr/bin/sh");
+    let loader = root.join("usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1");
+    let mut notes: Vec<String> = Vec::new();
+    match std::fs::metadata(&sh) {
+        Ok(_) => {}
+        Err(_) => notes.push(format!("{} missing", sh.display())),
+    }
+    match std::fs::metadata(&loader) {
+        Ok(_) => {}
+        Err(_) => notes.push(format!("{} missing", loader.display())),
+    }
+    // A shell that exists but lost its execute bit fails the same way as a
+    // missing one, and only the mode tells them apart.
+    if let Ok(meta) = std::fs::metadata(&sh) {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 == 0 {
+            notes.push(format!("{} has mode {:o}", sh.display(), meta.permissions().mode() & 0o7777));
+        }
+    }
+    if notes.is_empty() {
+        // Both present and executable: the fault is not the payload.
+        format!("shell and loader look complete under {rootfs}; exec failure is not a missing-file problem")
+    } else {
+        notes.join("; ")
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -604,5 +650,67 @@ mod tests {
         let r = run_sandboxed("curl https://evil.example").await;
         assert!(r.stdout.is_empty());
         assert!(r.stderr.contains("blocked by gatekeeper"), "{}", r.stderr);
+    }
+
+    /// A guest exec failure is reported to the user as an instruction ("reinstall
+    /// the environment"), so the diagnosis has to distinguish a payload that is
+    /// actually incomplete from one that is fine. proot's message cannot: it
+    /// reports the same ENOENT for a missing shell, a missing ELF loader, and a
+    /// shell that is present but not executable.
+    ///
+    /// Driven through a real temp rootfs, because the whole point is inspecting
+    /// the filesystem the daemon would hand proot.
+    #[test]
+    fn a_missing_guest_shell_is_named_rather_than_guessed() {
+        let dir = std::env::temp_dir().join(format!("guest-diag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("usr/bin")).unwrap();
+        // Shell present, loader missing: the message must name the loader rather
+        // than implying the whole environment is broken.
+        std::fs::write(dir.join("usr/bin/sh"), b"x").unwrap();
+        std::env::set_var("CONTAINER_ROOTFS", &dir);
+        let note = diagnose_guest();
+        assert!(note.contains("ld-linux-aarch64.so.1 missing"), "{note}");
+        assert!(!note.contains("usr/bin/sh missing"), "{note}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_non_executable_guest_shell_is_reported_by_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("guest-diag-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("usr/bin")).unwrap();
+        std::fs::create_dir_all(dir.join("usr/lib/aarch64-linux-gnu")).unwrap();
+        let sh = dir.join("usr/bin/sh");
+        std::fs::write(&sh, b"x").unwrap();
+        // The execute bit is exactly what extraction can lose, and it fails
+        // identically to a missing file.
+        std::fs::set_permissions(&sh, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(dir.join("usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"), b"x").unwrap();
+        std::env::set_var("CONTAINER_ROOTFS", &dir);
+        let note = diagnose_guest();
+        assert!(note.contains("mode 644"), "{note}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_complete_guest_does_not_blame_the_environment() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("guest-diag-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("usr/bin")).unwrap();
+        std::fs::create_dir_all(dir.join("usr/lib/aarch64-linux-gnu")).unwrap();
+        for p in ["usr/bin/sh", "usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"] {
+            let f = dir.join(p);
+            std::fs::write(&f, b"x").unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var("CONTAINER_ROOTFS", &dir);
+        let note = diagnose_guest();
+        // This is the case that produced "reinstall the environment" for a
+        // perfectly good rootfs, so it must not repeat that advice.
+        assert!(note.contains("not a missing-file problem"), "{note}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
