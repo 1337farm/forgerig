@@ -364,6 +364,19 @@ class AssetExtractor(private val context: Context) {
         // Online-first: fetch the swappable container payload (slim, upgradable
         // APK). Fall back to the bundled asset so full/offline APKs still work.
         try {
+            // A cached copy of the manifest is enough to decide whether the
+            // cached rootfs is already the right bytes. Re-fetching first would
+            // make every reinstall need the network just to hash a file that is
+            // already on disk — and would report "download failed" on a device
+            // that is fully installed but offline.
+            ContainerAssets.cachedManifest(context)?.let { manifest ->
+                val cached = ContainerAssets.assetFile(context, ROOTFS_ASSET)
+                if (ContainerAssets.isVerified(cached, manifest[ROOTFS_ASSET])) {
+                    log("Rootfs already verified from cache: ${cached.absolutePath} (${cached.length()} bytes)")
+                    val (stream, comp) = compressionOf(FileInputStream(cached))
+                    return RootfsStream(stream, comp, cached.absolutePath, cached.length())
+                }
+            }
             // The manifest fetch is network-bound with nothing on screen yet;
             // say so immediately or a DNS stall looks like a hung install.
             progress.onProgress(2, "Downloading container payload…", "Contacting release server…")

@@ -55,6 +55,28 @@ fun fetchManifest(context: Context): Map<String, Asset> {
         }
     }
 
+    /**
+     * The manifest as it was last fetched, read back from the cache the daemon
+     * also reads. Used to validate an already-downloaded payload without
+     * touching the network. Returns null when nothing usable is cached.
+     */
+    fun cachedManifest(context: Context): Map<String, Asset>? {
+        val file = File(cacheDir(context), "container-manifest.json")
+        if (!file.isFile) return null
+        return try {
+            parseManifest(file.readText())
+        } catch (e: Exception) {
+            Log.w(TAG, "cached manifest unusable: ${e.message}")
+            null
+        }
+    }
+
+    /** True when [file] exists and hashes to exactly the manifest's bytes. */
+    fun isVerified(file: File, info: Asset?): Boolean {
+        if (info == null || !file.exists() || file.length() != info.size) return false
+        return file.sha256() == info.sha256
+    }
+
     fun parseManifest(text: String): Map<String, Asset> {
         val assets = JSONObject(text).getJSONObject("assets")
         val map = mutableMapOf<String, Asset>()

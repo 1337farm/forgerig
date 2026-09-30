@@ -131,6 +131,11 @@ dependencies {
     // useLegacyPackaging the app loads it via System.loadLibrary("zstd-jni-...")).
     implementation("com.github.luben:zstd-jni:1.5.6-7@aar")
     testImplementation("junit:junit:4.13.2")
+    // Real org.json for JVM unit tests: android.jar ships stubs whose getters
+    // return null, so any test touching JSONObject (e.g. ContainerAssets
+    // manifest parsing) would NPE against the SDK. Test-only — the APK keeps
+    // using the platform implementation.
+    testImplementation("org.json:json:20240303")
 }
 
 // Reject APKs built with placeholder container binaries (see scripts/prepare-assets.sh).
