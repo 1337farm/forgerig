@@ -493,6 +493,11 @@ class ContainerService : Service() {
                 // config. It binds 127.0.0.1:$PORT for the WebView.
                 val pb = ProcessBuilder(daemonBin.absolutePath)
                 pb.environment()["PORT"] = MainActivity.allocatedPort.toString()
+                // Auth token for the loopback socket: the daemon refuses every
+                // RPC (including `status`) until a caller presents this over
+                // its own WebSocket, and fails closed if it is missing. Same
+                // UID-only channel as the provider keys below.
+                pb.environment()["FORGERIG_AUTH_TOKEN"] = MainActivity.authToken
                 pb.environment()["CONTAINER_PROOT"] = prootBin.absolutePath
                 pb.environment()["CONTAINER_ROOTFS"] = rootFsDir.absolutePath
                 pb.environment()["PROOT_LOADER"] = loaderBin.absolutePath

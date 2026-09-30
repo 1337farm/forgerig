@@ -85,15 +85,16 @@ var leanOverlayEl = $('lean-overlay');
   }
 
   function paintHeader(state) {
-    // state: connecting | live | working | error | offline
+    // state: connecting | live | working | error | offline | auth-failed
     var pill = $('status-pill');
     var dot = $('conn-dot');
     var label = state === 'working' ? 'Agent working…' :
       state === 'live' ? 'Ready' :
       state === 'error' ? 'Error' :
+      state === 'auth-failed' ? 'Auth failed' :
       state === 'offline' ? 'Offline' : 'Connecting…';
     if (pill) pill.textContent = label;
-    if (dot) dot.className = 'dot' + (state === 'working' ? ' busy' : state === 'error' || state === 'offline' ? ' error' : '');
+    if (dot) dot.className = 'dot' + (state === 'working' ? ' busy' : state === 'error' || state === 'offline' || state === 'auth-failed' ? ' error' : '');
     statusEl.textContent = state === 'live' || state === 'working' ? 'Connected' : label;
   }
 
@@ -118,24 +119,45 @@ var leanOverlayEl = $('lean-overlay');
 
   function connect() {
     paintHeader('connecting');
-    ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/');
+    ws = new WebSocket((location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/');
     ws.onopen = function () {
       reconnectCount = 0;
-      paintHeader('live');
-      call('status', {}, function (err, r) {
-        if (err || !r || !r.provider) return;
-        paintProvider(r.provider);
-        if (/key=missing/.test(r.provider)) {
-          var notice = $('setup-notice');
-          var text = $('setup-notice-text');
-          if (notice && text) {
-            text.textContent = 'No API key configured — open Settings to choose a provider, model, and token budget before sending.';
-            notice.style.display = 'block';
-          }
+      // The daemon refuses every RPC until this connection authenticates, so
+      // the handshake has to complete before anything else is sent. The token
+      // comes from the app over the NativeHost bridge — not the URL, so it
+      // never reaches the install log or the WebView's history.
+      var host = window.NativeHost && window.NativeHost.getAuthToken;
+      var token = host ? String(host.call(window.NativeHost) || '') : '';
+      if (!token) {
+        // Browser-hosted (no bridge): the daemon has no matching token, so
+        // there is nothing to authenticate with. Say so instead of firing
+        // doomed calls.
+        paintHeader('auth-failed');
+        statusEl.textContent = 'This daemon requires the ForgeRig app (no auth token available here).';
+        return;
+      }
+      call('auth', { token: token }, function (err) {
+        if (err) {
+          paintHeader('auth-failed');
+          statusEl.textContent = 'Could not authenticate with the daemon: ' + (err.message || err);
+          return;
         }
+        paintHeader('live');
+        call('status', {}, function (err2, r) {
+          if (err2 || !r || !r.provider) return;
+          paintProvider(r.provider);
+          if (/key=missing/.test(r.provider)) {
+            var notice = $('setup-notice');
+            var text = $('setup-notice-text');
+            if (notice && text) {
+              text.textContent = 'No API key configured — open Settings to choose a provider, model, and token budget before sending.';
+              notice.style.display = 'block';
+            }
+          }
+        });
+        refreshLean();
+        loadSessions();
       });
-      refreshLean();
-      loadSessions();
     };
     ws.onclose = function () {
       paintHeader('offline');
