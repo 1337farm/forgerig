@@ -221,32 +221,41 @@ impl MemoryEngine {
     /// Log a gatekeeper verdict to the persistent audit trail.
     pub async fn log_gatekeeper_verdict(&self, tool: &str, allowed: bool, reason: &str, detail: &str) -> Result<(), Box<dyn std::error::Error>> {
         let tool = tool.to_string();
-        let allowed = allowed.to_string();
+        // `allowed` is declared INTEGER; bind an integer rather than "true".
+        // SQLite's dynamic typing would store the string anyway, so this only
+        // ever worked by accident, and `row.get::<String>` below then had to
+        // agree with it.
+        let allowed: i64 = if allowed { 1 } else { 0 };
         let reason = reason.to_string();
         let detail = detail.to_string();
         self.db.call(move |conn| {
             conn.execute(
                 "INSERT INTO gatekeeper_audit (tool, allowed, reason, detail) VALUES (?1, ?2, ?3, ?4)",
-                [&tool, &allowed, &reason, &detail],
+                rusqlite::params![tool, allowed, reason, detail],
             )?;
             Ok(())
         }).await.map_err(|e| e.into())
     }
 
-    /// Get recent gatekeeper audit entries.
+    /// Get recent gatekeeper audit entries, oldest-first (chronological).
+    ///
+    /// Ordered by `id`, not `timestamp`: `CURRENT_TIMESTAMP` only has
+    /// one-second resolution, so every verdict inside the same second ties and
+    /// the ordering of a burst becomes whatever SQLite happens to return —
+    /// which, with the reverse below, silently shuffled them.
     pub async fn get_gatekeeper_audit(&self, limit: usize) -> Result<Vec<(String, bool, String, String)>, Box<dyn std::error::Error>> {
         self.db.call(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT tool, allowed, reason, detail FROM gatekeeper_audit ORDER BY timestamp DESC LIMIT ?"
+                "SELECT tool, allowed, reason, detail FROM gatekeeper_audit ORDER BY id DESC LIMIT ?"
             )?;
             let mut rows = stmt.query([limit as i64])?;
             let mut entries = Vec::new();
             while let Some(row) = rows.next()? {
                 let tool: String = row.get(0)?;
-                let allowed: String = row.get(1)?;
+                let allowed: i64 = row.get(1)?;
                 let reason: String = row.get(2)?;
                 let detail: String = row.get(3)?;
-                entries.push((tool, allowed == "true", reason, detail));
+                entries.push((tool, allowed != 0, reason, detail));
             }
             entries.reverse();
             Ok(entries)
@@ -383,5 +392,69 @@ mod tests {
 
         // Different scope not affected
         assert!(!engine.is_domain_allowed("session:123", "example.com").await.unwrap());
+    }
+
+    /// `allowed` is declared INTEGER, so bind and read an integer. It only
+    /// round-tripped before because SQLite's dynamic typing stored the string
+    /// "true" anyway and the reader then string-compared it.
+    #[tokio::test]
+    async fn audit_verdicts_round_trip_both_polarities() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = MemoryEngine::new(dir.path().join("audit.db").to_str().unwrap()).await.unwrap();
+
+        engine.log_gatekeeper_verdict("bash_executor", true, "allowed", "ls -la").await.unwrap();
+        engine.log_gatekeeper_verdict("net_fetch", false, "domain-not-allowed", "evil.example").await.unwrap();
+        engine.log_gatekeeper_verdict("lean_executor", false, "workspace-jail", "/etc/passwd").await.unwrap();
+
+        let rows = engine.get_gatekeeper_audit(10).await.unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].0, "bash_executor");
+        assert_eq!(rows[0].1, true, "allow must not read back as a deny");
+        assert_eq!(rows[1].0, "net_fetch");
+        assert_eq!(rows[1].1, false, "deny must not read back as an allow");
+        assert_eq!(rows[2].1, false);
+        assert_eq!(rows[2].2, "workspace-jail");
+        assert_eq!(rows[2].3, "/etc/passwd");
+    }
+
+    /// Oldest-first, and stable inside a burst. `CURRENT_TIMESTAMP` only has
+    /// one-second resolution, so ordering by it left every same-second verdict
+    /// tied and the resulting order arbitrary.
+    #[tokio::test]
+    async fn audit_is_chronological_and_stable_within_a_second() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = MemoryEngine::new(dir.path().join("audit.db").to_str().unwrap()).await.unwrap();
+
+        // Written as fast as possible: same CURRENT_TIMESTAMP second.
+        let expected: Vec<String> = (0..25).map(|i| format!("tool-{i:02}")).collect();
+        for t in &expected {
+            engine.log_gatekeeper_verdict(t, true, "ok", "").await.unwrap();
+        }
+        let rows = engine.get_gatekeeper_audit(50).await.unwrap();
+        let got: Vec<String> = rows.iter().map(|r| r.0.clone()).collect();
+        assert_eq!(got, expected, "a same-second burst kept insertion order");
+    }
+
+    /// `limit` keeps the NEWEST N but still returns them oldest-first, so a
+    /// reader showing the tail of the log sees the same order as a full read.
+    #[tokio::test]
+    async fn audit_limit_keeps_the_newest_and_stays_chronological() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = MemoryEngine::new(dir.path().join("audit.db").to_str().unwrap()).await.unwrap();
+        for i in 0..5 {
+            engine.log_gatekeeper_verdict(&format!("tool-{i}"), true, "ok", "").await.unwrap();
+        }
+        let rows = engine.get_gatekeeper_audit(2).await.unwrap();
+        let got: Vec<&String> = rows.iter().map(|r| &r.0).collect();
+        assert_eq!(got, vec!["tool-3", "tool-4"]);
+    }
+
+    /// An empty ledger reads back as an empty list, not an error — the audit
+    /// panel shows this on a fresh install.
+    #[tokio::test]
+    async fn audit_is_empty_on_a_fresh_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = MemoryEngine::new(dir.path().join("audit.db").to_str().unwrap()).await.unwrap();
+        assert!(engine.get_gatekeeper_audit(10).await.unwrap().is_empty());
     }
 }

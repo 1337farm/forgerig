@@ -1209,5 +1209,32 @@ var leanOverlayEl = $('lean-overlay');
   function onVisibility() { if (activeId) openSession(activeId); }
   window.addEventListener('online', onVisibility);
 
+  // Surface UI failures to the daemon, which writes them to stderr where the
+  // app pipes them into the shared Downloads error log. Without this the
+  // `client_error` RPC has no caller and an on-device JS failure is invisible:
+  // the page just stops working with nothing in any log.
+  function reportClientError(kind, message, extra) {
+    try {
+      call('client_error', {
+        kind: String(kind),
+        message: String(message).slice(0, 2000),
+        url: String((location && location.href) || '').slice(0, 500),
+        stack: String((extra && extra.stack) || '').slice(0, 4000),
+        line: (extra && extra.lineno) || 0,
+      }, function () {});
+    } catch (_) {
+      // Reporting an error must never throw.
+    }
+  }
+
+  window.onerror = function (message, src, lineno, colno, err) {
+    reportClientError('js', message, { stack: err && err.stack, lineno: lineno });
+    return false; // keep the default console logging too
+  };
+  window.addEventListener('unhandledrejection', function (e) {
+    var r = e && e.reason;
+    reportClientError('promise', r && r.message ? r.message : r, { stack: r && r.stack });
+  });
+
   connect();
 })();

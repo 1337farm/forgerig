@@ -733,6 +733,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             gatekeeper::register_gitconfig_secrets(std::path::Path::new(&rootfs));
         }
     }
+    gatekeeper::register_env_secrets();
 
     dns_probe("github.com");
     // Termux-style fallback: if the daemon cannot resolve, at least surface

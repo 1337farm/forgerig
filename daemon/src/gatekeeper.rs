@@ -369,6 +369,38 @@ pub fn register_gitconfig_secrets(rootfs: &std::path::Path) {
     }
 }
 
+/// Register the credentials the app passes to the daemon through the
+/// environment.
+///
+/// These are the highest-value secrets in the process — the provider API key
+/// plus the GitHub and HuggingFace tokens — and they are in `environ` for the
+/// daemon's whole life. `register_gitconfig_secrets` only covers the copies
+/// the app persisted into the guest, and only at boot: a token the user
+/// rotates in Settings afterwards, or one that arrives with no `.gitconfig`
+/// write at all, was never registered and so could be echoed straight back
+/// into model context. Reading the same env vars the provider already reads
+/// keeps the two paths in step with no new app<->daemon plumbing.
+pub fn register_env_secrets() {
+    // Split out so the name list is testable without mutating the test
+    // process's own environment (which is shared with parallel tests).
+    collect_env_secrets(&|name| std::env::var(name).ok());
+}
+
+fn collect_env_secrets(lookup: &dyn Fn(&str) -> Option<String>) {
+    // The daemon's own socket token. Not a provider credential, but it is a
+    // bearer secret for a socket that runs `exec` — see `auth_gate`.
+    for name in [
+        "FORGERIG_API_KEY",
+        "GITHUB_TOKEN",
+        "HF_TOKEN",
+        "FORGERIG_AUTH_TOKEN",
+    ] {
+        if let Some(value) = lookup(name) {
+            register_secret(&value);
+        }
+    }
+}
+
 /// Extract the userinfo (password/token) part of every
 /// `https://<credential>@host` URL in a gitconfig body.
 fn gitconfig_credentials(gitconfig: &str) -> Vec<String> {
@@ -518,6 +550,7 @@ fn scrub_blobs(s: &str, count: &mut usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn workspace_jail_blocks_escapes() {
@@ -673,5 +706,46 @@ mod tests {
         // A 3-char literal would be redacted out of unrelated text everywhere.
         register_secret("abc");
         assert_eq!(redact_known("abcdef abc ghi"), "abcdef abc ghi");
+    }
+
+    /// The env credentials were the gap the boot-only harvest left: the
+    /// provider key and the GitHub/HF tokens live in `environ` for the daemon's
+    /// whole life, so any tool that echoed env (or a rotated token with no
+    /// `.gitconfig` write behind it) would hand them to a cloud model.
+    #[test]
+    fn env_credentials_are_registered_and_redacted() {
+        let key = "sk-envtest-provider-key-value-0001";
+        let gh = "ghp_envtesttokenvalue0000000000000000000001";
+        let hf = "hf_envtesttokenvalue0000000000000000000001";
+        let socket = "envtest-socket-token-0000000000000001";
+        let mut env: HashMap<&str, String> = HashMap::new();
+        env.insert("FORGERIG_API_KEY", key.to_string());
+        env.insert("GITHUB_TOKEN", gh.to_string());
+        env.insert("HF_TOKEN", hf.to_string());
+        env.insert("FORGERIG_AUTH_TOKEN", socket.to_string());
+        collect_env_secrets(&|name| env.get(name).cloned());
+
+        for secret in [key, gh, hf, socket] {
+            let leaked = format!("env dump: {secret} trailing");
+            let out = redact_known(&leaked);
+            assert!(!out.contains(secret), "leaked {secret}: {out}");
+            assert!(out.contains("[TOKEN_REDACTED]"), "{out}");
+        }
+        // And the useful text around them survives.
+        let kept = redact_known("building /root/workspace/src/lib.rs sha256 a3f5c9e1");
+        assert!(kept.contains("/root/workspace/src/lib.rs"), "{kept}");
+    }
+
+    /// An unset or blank variable must not register anything — otherwise a
+    /// placeholder like "dummy-key" (what resolve_key returns when nothing is
+    /// configured) would redact that literal out of unrelated output.
+    #[test]
+    fn unset_env_credentials_register_nothing() {
+        let before = redact_known("dummy-key and ollama and hf_dummy");
+        let empty: HashMap<&str, String> = HashMap::new();
+        collect_env_secrets(&|name| empty.get(name).cloned());
+        // ...and a blank value is treated as absent by register_secret's length
+        // check, so nothing changed.
+        assert_eq!(redact_known("dummy-key and ollama and hf_dummy"), before);
     }
 }
