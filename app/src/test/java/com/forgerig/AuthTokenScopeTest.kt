@@ -88,4 +88,53 @@ class AuthTokenScopeTest {
         // free pass for everything.
         assertFalse(isDaemonOrigin(daemon, 3000))
     }
+
+    /**
+     * The bridge must not read the URL off the WebView.
+     *
+     * `getAuthToken()` used to do exactly that. `@JavascriptInterface` methods
+     * are dispatched on the WebView's JavaBridge thread, and `WebView.getUrl()`
+     * throws `WebViewMethodCalledOnWrongThreadViolation` from anywhere but the
+     * thread that built the WebView. The throw was caught and turned into
+     * `null`, which the origin check correctly rejected — so the app refused
+     * its own page and reported "no auth token available here" on every launch,
+     * on every device, while every test in this file passed, because the
+     * predicate was never the broken part.
+     *
+     * The URL is now captured on the main thread and read from a snapshot, so
+     * this pins the two halves meeting: the page really is the daemon origin,
+     * and the token is reachable from the bridge.
+     */
+    @Test
+    fun theBridgeReachesTheTokenThroughTheMainThreadSnapshot() {
+        val realPort = MainActivity.allocatedPort
+        val daemonPage = "http://127.0.0.1:$realPort"
+        try {
+            // The snapshot is process-global, so start from a known-empty state
+            // rather than assuming no earlier test left a URL behind. Empty
+            // fails closed, so it cannot be mistaken for a way in.
+            MainActivity.notePageUrl(null)
+            assertNull(authTokenForPage(MainActivity.pageUrlSnapshot(), realPort))
+
+            // What onPageStarted records once the daemon page commits.
+            MainActivity.notePageUrl(daemonPage)
+            // Compared against a non-null String so this binds JUnit's
+            // assertEquals(expected, actual, message) rather than the
+            // assertEquals(Any?, Any?, Any?) overload, which would silently
+            // treat the message as the expected value.
+            val token: String = authTokenForPage(MainActivity.pageUrlSnapshot(), realPort) ?: ""
+            // JUnit4 keeps a legacy `assertEquals(message, expected, actual)`
+            // overload that Kotlin binds for a 3-arg String call, silently
+            // reordering the arguments. Bind the expected value to an explicit
+            // non-null type and keep the comparison to one unambiguous form.
+            val expected: String = MainActivity.authToken
+            assertEquals(expected, token)
+            // A navigation away from the daemon origin must revoke it: the
+            // snapshot is what scopes the token, so it has to follow the page.
+            MainActivity.notePageUrl("https://example.com/")
+            assertNull(authTokenForPage(MainActivity.pageUrlSnapshot(), realPort))
+        } finally {
+            MainActivity.notePageUrl(null)
+        }
+    }
 }

@@ -36,6 +36,38 @@ class MainActivity : AppCompatActivity() {
         var allocatedPort: Int = 3000
 
         /**
+         * The WebView's current URL, as observed on the **main** thread.
+         *
+         * `@JavascriptInterface` methods are dispatched on the WebView's
+         * JavaBridge thread, and every WebView method throws
+         * `WebViewMethodCalledOnWrongThreadViolation` when touched from there.
+         * `getAuthToken()` used to read `webView.url` directly, so it always
+         * threw, always yielded null, and therefore always reported "page is
+         * not the daemon origin" — the app could never authenticate, on any
+         * device. Swallowing the throw as `null` hid the cause behind a
+         * plausible-looking security refusal.
+         *
+         * So the URL is captured here, on the thread that owns the WebView, and
+         * the bridge reads this snapshot instead. `null` means "nothing loaded
+         * yet", which the origin check rejects, so an unpopulated cache fails
+         * closed exactly as a foreign page does.
+         *
+         * Written from the main thread only, so no synchronization is needed
+         * beyond the reference write itself being atomic; it is `@Volatile` to
+         * make that ordering explicit for the bridge thread's reader.
+         */
+        @Volatile
+        private var currentPageUrl: String? = null
+
+        /** Record the loaded page. Main thread only. */
+        fun notePageUrl(url: String?) {
+            currentPageUrl = url
+        }
+
+        /** The page URL last seen on the main thread; safe from any thread. */
+        fun pageUrlSnapshot(): String? = currentPageUrl
+
+        /**
          * Per-process shared secret for the daemon socket. The daemon binds an
          * ephemeral loopback port, but any app on the device can find a
          * listening loopback port, and the daemon's env holds the decrypted
@@ -536,6 +568,18 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+            super.onPageStarted(view, url, favicon)
+            // Main thread, so this is the only place allowed to touch the
+            // WebView's URL. The JS bridge reads the snapshot, never the view.
+            //
+            // `onPageStarted` is the only history hook that fires here: the
+            // daemon page never calls pushState/replaceState and never navigates
+            // (a foreign origin is redirected to the browser instead), so every
+            // document it loads comes through this callback.
+            notePageUrl(url)
+        }
+
         override fun onPageFinished(view: WebView?, url: String?) {
             super.onPageFinished(view, url)
             // Daemon UI (or a reload) is ready: deliver any pending
@@ -614,9 +658,15 @@ class MainActivity : AppCompatActivity() {
          * clear "needs the app" error rather than a silent retry loop. */
         @JavascriptInterface
         fun getAuthToken(): String {
-            val url = try { context.webView.url } catch (_: Exception) { null }
-            return authTokenForPage(url, MainActivity.allocatedPort) ?: run {
-                AssetExtractor.logShared(context, "WARN: getAuthToken refused — page is not the daemon origin")
+            // Read the main-thread snapshot, never `webView.url`: this method
+            // runs on the JavaBridge thread, where every WebView method throws.
+            // See [pageUrlSnapshot] for how that broke authentication.
+            return authTokenForPage(pageUrlSnapshot(), MainActivity.allocatedPort) ?: run {
+                AssetExtractor.logShared(
+                    context,
+                    "WARN: getAuthToken refused — page=${pageUrlSnapshot()} " +
+                        "port=${MainActivity.allocatedPort} expected=http://127.0.0.1:${MainActivity.allocatedPort}"
+                )
                 ""
             }
         }
