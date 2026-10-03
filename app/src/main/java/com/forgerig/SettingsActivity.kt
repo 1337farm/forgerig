@@ -30,15 +30,7 @@ class SettingsActivity : AppCompatActivity() {
     }
 
     private val providerOptions = listOf(
-        "openai - OpenAI (gpt-4o-mini)" to "openai",
-        "openrouter - OpenRouter (free + auto)" to "openrouter",
         "nvidia - NVIDIA NIM (free credits)" to "nvidia",
-        "groq - Groq (free tier)" to "groq",
-        "deepseek - DeepSeek (cheap)" to "deepseek",
-        "mistral - Mistral" to "mistral",
-        "gemini - Google Gemini (free tier)" to "gemini",
-        "ollama - Local LLM" to "ollama",
-        "custom - any OpenAI-compatible endpoint" to "custom",
     )
 
     private data class ModelOption(val name: String, val free: Boolean)
@@ -47,62 +39,15 @@ class SettingsActivity : AppCompatActivity() {
     // free tier). "Refresh from provider" below merges the live /v1/models
     // list so drift self-heals; curated entries are the offline fallback.
     private val modelCatalog: Map<String, List<ModelOption>> = mapOf(
-        "openai" to listOf(
-            ModelOption("gpt-4o-mini", false),
-            ModelOption("gpt-4o", false),
-        ),
-        "openrouter" to listOf(
-            ModelOption(PROVIDER_AUTO, true),
-            ModelOption("nvidia/nemotron-3.5-lightning:free", true),
-            ModelOption("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", true),
-            ModelOption("nvidia/nemotron-3-super-120b-a12b:free", true),
-            ModelOption("nvidia/nemotron-3-ultra-550b-a55b:free", true),
-        ),
         "nvidia" to listOf(
+            ModelOption("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning", true),
             ModelOption("nvidia/llama-3.1-nemotron-70b-instruct", true),
+            ModelOption("nvidia/llama-3.1-nemotron-51b-instruct", true),
         ),
-        "groq" to listOf(
-            ModelOption("llama-3.3-70b-versatile", true),
-            ModelOption("llama-3.1-8b-instant", true),
-            ModelOption("mixtral-8x7b-32768", true),
-            ModelOption("gemma2-9b-it", true),
-        ),
-        "deepseek" to listOf(
-            ModelOption("deepseek-chat", false),
-            ModelOption("deepseek-reasoner", false),
-        ),
-        "mistral" to listOf(
-            ModelOption("mistral-small-latest", false),
-            ModelOption("mistral-medium-latest", false),
-            ModelOption("mistral-large-latest", false),
-            ModelOption("open-mistral-7b", false),
-            ModelOption("open-mixtral-8x7b", false),
-        ),
-        "gemini" to listOf(
-            ModelOption("gemini-2.5-flash", true),
-            ModelOption("gemini-2.5-pro", true),
-            ModelOption("gemini-2.0-flash", true),
-        ),
-        "ollama" to listOf(
-            ModelOption("llama3.1:8b", true),
-            ModelOption("llama3.1:70b", true),
-            ModelOption("mistral", true),
-            ModelOption("gemma2", true),
-            ModelOption("qwen2.5", true),
-            ModelOption("deepseek-r1", true),
-        ),
-        "custom" to emptyList(),
     )
 
     private val defaultBaseUrls = mapOf(
-        "openai" to "https://api.openai.com",
-        "openrouter" to "https://openrouter.ai/api",
         "nvidia" to "https://integrate.api.nvidia.com",
-        "groq" to "https://api.groq.com/openai",
-        "deepseek" to "https://api.deepseek.com",
-        "mistral" to "https://api.mistral.ai",
-        "gemini" to "https://generativelanguage.googleapis.com",
-        "ollama" to "http://localhost:11434",
     )
 
     // Live-fetched model IDs merged over the curated catalog (per provider)
@@ -339,7 +284,7 @@ class SettingsActivity : AppCompatActivity() {
         val keyEdit = editText(current.apiKey, "stored encrypted on this device")
         root.addView(keyEdit)
         root.addView(TextView(this).apply {
-            text = "The key is saved per provider — refresh-all queries each provider with its own saved key."
+            text = "The key is saved for NVIDIA; model list refreshes automatically on app start and when this screen opens."
             setTextColor(0xFF999999.toInt())
             textSize = 12f
             setPadding(0, dp(2), 0, 0)
@@ -404,7 +349,8 @@ class SettingsActivity : AppCompatActivity() {
         }
 
         fun fetchModels() {
-            Toast.makeText(this, "Refreshing all providers…", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Refreshing NVIDIA model list…", Toast.LENGTH_SHORT).show()
+            runOnUiThread { providerCountView.text = "Updating models…" }
             Thread {
                 try {
                     val typedKey = keyEdit.text.toString().trim()
@@ -450,17 +396,31 @@ class SettingsActivity : AppCompatActivity() {
                         refreshModels()
                         val notes = (failures + skipped).joinToString("; ")
                         val tail = if (notes.isEmpty()) "" else " Notes: $notes"
-                        Toast.makeText(this, "Added $totalAdded model(s), $totalSeen seen across providers.$tail", Toast.LENGTH_LONG).show()
+                        Toast.makeText(this, "Added $totalAdded model(s), $totalSeen seen.$tail", Toast.LENGTH_LONG).show()
+                        // Auto-fetch runs on open, so validate the saved choice
+                        // against what the live list just returned.
+                        val current = try { SettingsStore.load(this@SettingsActivity) } catch (_: Exception) { Settings() }
+                        val available = allOptions("nvidia").map { it.name }.toSet()
+                        val problem = when {
+                            current.model.isNotBlank() && !available.contains(current.model) -> "Model '${current.model}' is not in the NVIDIA list"
+                            current.evalModel.isNotBlank() && !available.contains(current.evalModel) -> "Eval model '${current.evalModel}' is not in the NVIDIA list"
+                            else -> null
+                        }
+                        if (problem != null) {
+                            Toast.makeText(this@SettingsActivity, "$problem — update it in Settings.", Toast.LENGTH_LONG).show()
+                            providerCountView.text = "$problem — update it in Settings."
+                        }
                     }
                 } catch (e: Exception) {
                     runOnUiThread {
+                        providerCountView.text = "Refresh failed"
                         Toast.makeText(this, "Refresh failed: ${e.message}", Toast.LENGTH_LONG).show()
                     }
                 }
             }.start()
         }
         root.addView(Button(this).apply {
-            text = "Refresh models (all providers)"
+            text = "Refresh models"
             setBackgroundColor(0xFF3a3348.toInt())
             setTextColor(0xFFe6e6e6.toInt())
             setOnClickListener { fetchModels() }
@@ -477,6 +437,12 @@ class SettingsActivity : AppCompatActivity() {
             override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
         }
         refreshModels()
+
+        // Fetch the live NVIDIA list as soon as the model selection screen
+        // opens (also runs on app start from MainActivity) so the dropdown
+        // reflects what the saved key actually has access to, and the saved
+        // model/eval model can be validated against it instead of going stale.
+        fetchModels()
 
         // Network Allowlist section
         root.addView(label("Network Allowlist (for net_fetch)"))

@@ -159,6 +159,43 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
+    private fun refreshModelsOnStart() {
+        kotlin.concurrent.thread(isDaemon = true) {
+            try {
+                val s = try { SettingsStore.load(this@MainActivity) } catch (_: Exception) { Settings() }
+                val base = s.baseUrl.ifBlank { "https://integrate.api.nvidia.com" }
+                if (base.isBlank()) return@thread
+                // Per-provider key wins; legacy single-key field is the fallback.
+                val key = try { SettingsStore.getKey(this@MainActivity, SettingsStore.llmScope("nvidia")) } catch (_: Exception) { "" }
+                    .ifBlank { s.apiKey }
+                val discovered = try {
+                    val q = ModelDiscovery.buildQuery("nvidia", base, key) ?: return@thread
+                    val conn = java.net.URL(q.url).openConnection() as java.net.HttpURLConnection
+                    try {
+                        conn.connectTimeout = 15000; conn.readTimeout = 15000
+                        if (q.auth != null) conn.setRequestProperty("Authorization", "Bearer ${q.auth}")
+                        if (conn.responseCode !in 200..299) return@thread
+                        ModelDiscovery.discoverModels("nvidia", conn.inputStream.bufferedReader().readText())
+                    } finally { conn.disconnect() }
+                } catch (_: Exception) { return@thread }
+                // Persist the discovered IDs so SettingsActivity shows them on open.
+                try {
+                    val flattened = discovered.map { m -> "nvidia\u0001${if (m.free) "1" else "0"}\u0001${m.id}" }.toSet()
+                    getSharedPreferences("forgerig_extra_models", MODE_PRIVATE).edit().putStringSet("extra_models", flattened).apply()
+                } catch (_: Exception) {}
+                // Validate the saved choice: if it is gone from the live list,
+                // say so after the page is ready so the user knows to re-pick.
+                val gone = listOfNotNull(s.model.takeIf { it.isNotBlank() }, s.evalModel.takeIf { it.isNotBlank() })
+                    .filter { id -> discovered.none { it.id == id } }
+                if (gone.isNotEmpty()) {
+                    runOnUiThread {
+                        android.widget.Toast.makeText(this@MainActivity, "Saved model ${gone.joinToString(", ")} not in NVIDIA's live list — re-pick in Settings.", android.widget.Toast.LENGTH_LONG).show()
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         AssetExtractor.installCrashHandler(this)
         AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_YES)
@@ -177,6 +214,13 @@ class MainActivity : AppCompatActivity() {
             } catch (_: Exception) {
             }
         }
+
+        // Fetch the live NVIDIA model list at app start so the dropdown
+        // reflects what the saved key actually has access to, and so the
+        // saved model/eval model can be validated against it instead of going
+        // stale against the curated fallback. The same refresh runs when the
+        // model selection screen opens (SettingsActivity.onCreate).
+        refreshModelsOnStart()
 
         // Initialize WebView
         webView = findViewById(R.id.webView)

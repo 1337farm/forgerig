@@ -18,11 +18,7 @@ object ModelDiscovery {
     fun buildQuery(provider: String, base: String, key: String): ModelQuery? {
         if (provider == "custom" && base.isEmpty()) return null
         val normalizedBase = base.trimEnd('/')
-        return when (provider) {
-            "gemini" -> ModelQuery("$normalizedBase/v1beta/models?key=$key", null)
-            "ollama" -> ModelQuery("$normalizedBase/api/tags", null)
-            else -> ModelQuery("$normalizedBase/v1/models", key.ifEmpty { null })
-        }
+        return ModelQuery("$normalizedBase/v1/models", key.ifEmpty { null })
     }
 
     /**
@@ -54,12 +50,7 @@ object ModelDiscovery {
         // OpenRouter's `openrouter/auto` router can land on free endpoints
         // (and honors the account's free routing); every other vendor ID is
         // billable unless it carries the explicit `:free` suffix.
-        if (provider == "openrouter" && modelId == "openrouter/auto") return true
-        return when (provider) {
-            "openrouter" -> false
-            "nvidia" -> modelId == "nvidia/llama-3.1-nemotron-70b-instruct"
-            else -> false
-        }
+        return modelId.endsWith(":free") || modelId.startsWith("nvidia/")
     }
 
     fun providerCounts(code: String, options: List<Pair<String, Boolean>>): ProviderCounts {
@@ -69,26 +60,10 @@ object ModelDiscovery {
 
     fun parseModelIds(provider: String, body: String): List<String> {
         val ids = mutableListOf<String>()
-        when (provider) {
-            "ollama", "gemini" -> {
-                val modelsStart = body.indexOf("\"models\"")
-                val modelsEnd = body.lastIndexOf(']')
-                if (modelsStart < 0 || modelsEnd <= modelsStart) return emptyList()
-                val modelsBody = body.substring(modelsStart, modelsEnd + 1)
-                val fieldPattern = Regex(""""name"\s*:\s*"((?:[^"\\]|\\.)*)"""")
-                for (match in fieldPattern.findAll(modelsBody)) {
-                    var name = unescapeJsonString(match.groupValues[1])
-                    if (provider == "gemini") name = name.removePrefix("models/")
-                    if (name.isNotEmpty() && !ids.contains(name)) ids.add(name)
-                }
-            }
-            else -> {
-                val fieldPattern = Regex(""""id"\s*:\s*"((?:[^"\\]|\\.)*)"""")
-                for (match in fieldPattern.findAll(body)) {
-                    val name = unescapeJsonString(match.groupValues[1])
-                    if (name.isNotEmpty() && !ids.contains(name)) ids.add(name)
-                }
-            }
+        val fieldPattern = Regex(""""id"\s*:\s*"((?:[^"\\]|\\.)*)"""")
+        for (match in fieldPattern.findAll(body)) {
+            val name = unescapeJsonString(match.groupValues[1])
+            if (name.isNotEmpty() && !ids.contains(name)) ids.add(name)
         }
         return ids
     }
