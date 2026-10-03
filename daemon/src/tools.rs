@@ -255,6 +255,12 @@ fn build_cmd_binds(command: &str, sandbox: bool, binds: &[String], workdir: &str
             // Re-apply LD_LIBRARY_PATH after env_clear() so proot can find
             // its DT_NEEDED libs (libtalloc.so.2, libandroid-shmem.so).
             .env("LD_LIBRARY_PATH", std::env::var("LD_LIBRARY_PATH").unwrap_or_default())
+            // proot's ELF loader (libproot_loader.so) has a compiled-in default
+            // path inside /data/data/com.termux that the app UID cannot see,
+            // so the app hands us the real one via PROOT_LOADER. env_clear()
+            // drops it, so re-apply it explicitly — without it proot cannot
+            // exec any guest binary and reports ENOENT on the guest path.
+            .env("PROOT_LOADER", std::env::var("PROOT_LOADER").unwrap_or_default())
             .arg("-r")
             .arg(&rootfs)
             .arg("-0")
