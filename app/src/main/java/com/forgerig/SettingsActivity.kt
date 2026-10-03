@@ -35,17 +35,10 @@ class SettingsActivity : AppCompatActivity() {
 
     private data class ModelOption(val name: String, val free: Boolean)
 
-    // Curated real model IDs per provider (free flags follow each provider's
-    // free tier). "Refresh from provider" below merges the live /v1/models
-    // list so drift self-heals; curated entries are the offline fallback.
-    private val modelCatalog: Map<String, List<ModelOption>> = mapOf(
-        "nvidia" to listOf(
-            ModelOption("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning", true),
-            ModelOption("nvidia/llama-3.1-nemotron-70b-instruct", true),
-            ModelOption("nvidia/llama-3.1-nemotron-51b-instruct", true),
-        ),
-    )
-
+    // Starts blank: the only model names ever shown come from the NVIDIA
+    // /v1/models fetch (app start + settings open), never a hard-coded
+    // catalog that could drift from what the saved key can call.
+    private val modelCatalog: Map<String, List<ModelOption>> = mapOf("nvidia" to emptyList())
     private val defaultBaseUrls = mapOf(
         "nvidia" to "https://integrate.api.nvidia.com",
     )
@@ -65,7 +58,10 @@ class SettingsActivity : AppCompatActivity() {
                 val provider = parts[0]
                 val free = parts[1] == "1"
                 val model = parts[2]
-                if (provider.isNotEmpty() && model.isNotEmpty()) {
+                // Only NVIDIA remains a supported provider; any leftover
+                // entries from prior multi-provider installs are stale and
+                // would show non-NVIDIA models in the dropdown.
+                if (provider == "nvidia" && model.isNotEmpty()) {
                     extraModels.getOrPut(provider) { mutableListOf() }.addIfAbsent(ModelOption(model, free))
                 }
             } else if (parts.size == 2) {
@@ -73,7 +69,7 @@ class SettingsActivity : AppCompatActivity() {
                 // free flag instead of dropping previously discovered models.
                 val provider = parts[0]
                 val model = parts[1]
-                if (provider.isNotEmpty() && model.isNotEmpty()) {
+                if (provider == "nvidia" && model.isNotEmpty()) {
                     extraModels.getOrPut(provider) { mutableListOf() }
                         .addIfAbsent(ModelOption(model, ModelDiscovery.inferFree(provider, model)))
                 }
