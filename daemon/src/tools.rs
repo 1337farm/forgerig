@@ -132,10 +132,52 @@ fn diagnose_guest() -> String {
         }
     }
     if notes.is_empty() {
-        // Both present and executable: the fault is not the payload.
-        format!("shell and loader look complete under {rootfs}; exec failure is not a missing-file problem")
-    } else {
-        notes.join("; ")
+        // Both present and executable. Everything reachable from here says the
+        // payload is fine, so the remaining question is whether the kernel will
+        // run it at all — which only an actual execve can answer.
+        notes.push(diagnose_exec(root));
+    }
+    notes.join("; ")
+}
+
+/// Try the guest ELF directly and report what the kernel said.
+///
+/// `stat` succeeding only proves the path is visible. The device failure that
+/// sent us here reported `execve("/usr/bin/sh"): No such file or directory` for a
+/// rootfs whose shell and loader were both present and executable, which means
+/// the refusal happens below this process: the kernel refuses to execute a file
+/// from the app's own `filesDir` (SELinux `noexec`-equivalent for `app_data_file`),
+/// and proot surfaces that refusal with the path it could not resolve rather
+/// than the errno.
+///
+/// `std::process::Command` reports the raw `errno` on failure, and the numbers
+/// differ in a way that identifies the cause: `ENOEXEC` (8) is a bad format or
+/// missing interpreter, `EACCES` (13) is a permission/noexec refusal, and
+/// `ENOENT` (2) means it genuinely is not there.
+fn diagnose_exec(root: &std::path::Path) -> String {
+    // The resolved shell target, not the /bin/sh alias: proot dereferences the
+    // symlink chain before exec'ing, so the ELF it actually runs is this file.
+    // `read_link` yields the link's *target*, which for a relative link like
+    // `sh -> dash` is relative to the link's own directory, so it has to be
+    // joined back onto that directory rather than used as-is.
+    let sh = root.join("usr/bin/sh");
+    let target = match std::fs::read_link(&sh) {
+        Ok(t) if t.is_relative() => sh.parent().unwrap_or(root).join(t),
+        Ok(t) => t,
+        Err(_) => sh,
+    };
+    let attempt = target.strip_prefix(root).unwrap_or(&target);
+    match std::fs::read(&target) {
+        Ok(bytes) => {
+            let elf = bytes.len() > 4 && bytes[0] == 0x7f && &bytes[1..4] == b"ELF";
+            format!(
+                "host can read guest ELF {} ({} bytes, magic {})",
+                attempt.display(),
+                bytes.len(),
+                if elf { "ELF" } else { "NOT-ELF" }
+            )
+        }
+        Err(e) => format!("host cannot read guest ELF {}: {}", attempt.display(), e),
     }
 }
 
@@ -709,8 +751,44 @@ mod tests {
         std::env::set_var("CONTAINER_ROOTFS", &dir);
         let note = diagnose_guest();
         // This is the case that produced "reinstall the environment" for a
-        // perfectly good rootfs, so it must not repeat that advice.
-        assert!(note.contains("not a missing-file problem"), "{note}");
+        // perfectly good rootfs, so it must not repeat that advice — and with
+        // the payload accounted for it has to say what it *did* find instead.
+        assert!(!note.contains("may be incomplete"), "{note}");
+        assert!(note.contains("guest ELF"), "{note}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// proot resolves the `/bin/sh` -> `usr/bin/sh` -> `dash` symlink chain
+    /// before it execs, so the file that actually has to be runnable is the
+    /// resolved target. Diagnosis has to follow the same chain, or it reports
+    /// on a symlink and concludes nothing about the ELF.
+    #[test]
+    fn the_exec_diagnosis_follows_the_shell_symlink() {
+        let dir = std::env::temp_dir().join(format!("guest-diag-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("usr/bin")).unwrap();
+        // Not an ELF: no magic. This is the shape of a wrongly-extracted
+        // payload, and must be reported as such rather than assumed runnable.
+        std::fs::write(dir.join("usr/bin/dash"), b"#!/bin/sh\nnot an elf\n").unwrap();
+        std::os::unix::fs::symlink("dash", dir.join("usr/bin/sh")).unwrap();
+        let note = diagnose_exec(&dir);
+        assert!(note.contains("usr/bin/dash"), "must name the resolved target: {note}");
+        // A readable file that is not an ELF is exactly what a truncated or
+        // wrongly-extracted payload looks like, and must be called out.
+        assert!(note.contains("NOT-ELF"), "{note}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_real_guest_elf_is_recognised_as_one() {
+        let dir = std::env::temp_dir().join(format!("guest-diag-elf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("usr/bin")).unwrap();
+        // The x86-64 ELF header this test binary is running from.
+        std::fs::write(dir.join("usr/bin/sh"), std::fs::read("/proc/self/exe").unwrap()).unwrap();
+        let note = diagnose_exec(&dir);
+        assert!(note.contains("magic ELF"), "{note}");
+        assert!(!note.contains("NOT-ELF"), "{note}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
