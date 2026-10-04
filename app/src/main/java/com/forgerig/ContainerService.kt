@@ -18,6 +18,18 @@ import java.io.File
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
+/**
+ * True when a [SecurityException] is Android refusing a background foreground-service
+ * start. The concrete type only exists on newer SDKs, so match by class name
+ * instead of referencing it directly (minSdk 26 must not load it).
+ */
+internal fun isBackgroundStartDenial(e: SecurityException): Boolean {
+    if (e.javaClass.name.endsWith("ForegroundServiceStartNotAllowedException")) return true
+    val message = e.message ?: return false
+    return message.contains("mAllowStartForeground") ||
+        (message.contains("not allowed") && message.contains("foreground", ignoreCase = true))
+}
+
 class ContainerService : Service() {
 
     private var wakeLock: PowerManager.WakeLock? = null
@@ -28,6 +40,12 @@ class ContainerService : Service() {
     /** Bumped on every (re)launch; stale launch threads are ignored on exit. */
     @Volatile
     private var daemonGeneration = 0
+    /** Set once startForeground() has succeeded; avoids re-clobbering status text. */
+    @Volatile
+    private var inForeground = false
+    /** Set when Android refused a background foreground-service start. */
+    @Volatile
+    private var foregroundDenied = false
 
     companion object {
         const val ACTION_INSTALL = "com.forgerig.action.INSTALL"
@@ -57,10 +75,35 @@ class ContainerService : Service() {
         // Must go through startForegroundService(): it creates the notification
         // channel first — startForeground() on an unregistered channel throws
         // Bad notification for startForeground and kills the process.
-        startForegroundService()
+        // If Android restarts us while backgrounded it forbids startForeground();
+        // that denial must stop the service quietly, not crash the process.
+        if (!tryEnsureForeground()) {
+            writeStatus("stopped:foreground-denied-background")
+            try {
+                stopSelf()
+            } catch (e: Exception) {
+                AssetExtractor.logShared(this, "ERROR: stop after foreground denial failed | $e")
+            }
+            return
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // A previous background start may have left this instance alive but
+        // never foregrounded; retry once here so an explicit user start issued
+        // after returning to the app can still proceed.
+        foregroundDenied = false
+        if (!inForeground && !tryEnsureForeground()) {
+            writeStatus("stopped:foreground-denied-background")
+            try {
+                stopSelf()
+            } catch (e: Exception) {
+                AssetExtractor.logShared(this, "ERROR: stop after foreground denial failed | $e")
+            }
+            // Do not ask for an automatic restart: the system would recreate
+            // us in the background and hit the same denial in a crash-free loop.
+            return START_NOT_STICKY
+        }
         when (intent?.action) {
             ACTION_STOP -> shutdown("stop requested")
             ACTION_INSTALL -> startInstall()
@@ -340,6 +383,25 @@ class ContainerService : Service() {
         if (InstallState.detail.isNotEmpty()) sb.append('\n').append(InstallState.detail.take(200))
         if (failed && InstallState.error.isNotEmpty()) sb.append('\n').append(InstallState.error)
         return sb.toString().trim()
+    }
+
+    /**
+     * Best-effort foreground entry that never turns a background-start denial
+     * into a process crash. Returns false when Android refused (caller must
+     * stop quietly); rethrows any other SecurityException fail-fast.
+     */
+    private fun tryEnsureForeground(): Boolean {
+        try {
+            startForegroundService()
+            inForeground = true
+            foregroundDenied = false
+            return true
+        } catch (se: SecurityException) {
+            if (!isBackgroundStartDenial(se)) throw se
+            foregroundDenied = true
+            AssetExtractor.logShared(this, "ERROR: foreground start denied while backgrounded; stopping service without crashing | $se")
+            return false
+        }
     }
 
     private fun startForegroundService() {

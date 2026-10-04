@@ -107,6 +107,11 @@ const server = {
         reply(Object.keys(this.sessions).map((id) => ({ id, title: this.titles[id] || '', message_count: 0, created_ms: 1 })));
         break;
       case 'session_history':
+        if (server.failNextHistory) {
+          server.failNextHistory = false;
+          server.sock.onmessage({ data: JSON.stringify({ id: obj.id, error: { message: 'history gone' } }) });
+          break;
+        }
         reply({ id: obj.params.session_id, title: '', messages: this.sessions[obj.params.session_id] || [] });
         break;
       case 'chat': {
@@ -116,7 +121,11 @@ const server = {
           server.sock.onmessage({ data: JSON.stringify({ id: obj.id, error: { message: 'boom' } }) });
           break;
         }
-        reply({ accepted: true, session_id: sid });
+        // acceptSidOverride lets a test model the daemon answering with a
+        // session id the client did not send (unknown/stale tab server-side).
+        const acceptedSid = server.acceptSidOverride || sid;
+        server.acceptSidOverride = null;
+        reply({ accepted: true, session_id: acceptedSid });
         this.pendingChat.push(obj);
         break;
       }
@@ -384,6 +393,11 @@ function msgTexts() {
   // Finish the disconnect-block flight so later sends are not queued behind it.
   server.resolveChat(server.pendingChat.pop(), 'disc-ok');
   await tick(); await tick();
+  // Drain the reconnect the disconnect scheduled (500 ms backoff): it must
+  // run while no flight is in progress. Otherwise it would fire mid-stream
+  // later and correctly fail that flight as connection-dropped, which is the
+  // behavior under test elsewhere — here it would only be timing noise.
+  for (let i = 0; i < 30; i++) { await tick(); }
 
   // Live streaming on the active tab: chunks paint, tool lines show, done reloads.
   // NOTE: the disconnect block above reconnects (new server.sock), so drain
@@ -484,6 +498,127 @@ function msgTexts() {
   const before = msgTexts().join(' ');
   flushFrames();
   assert.equal(msgTexts().join(' '), before, 'a frame queued before teardown repainted a removed bubble');
+
+  // ---- accept-session reconcile -------------------------------------------
+  //
+  // The daemon answers `chat` with the session the turn actually landed in.
+  // When that differs from the tab we sent to, the flight must move onto the
+  // real tab. Before, the reply streamed into a tab the strip did not know
+  // while the sent tab kept its Thinking bubble and its Stop button forever.
+  els['new-session'].onclick();
+  await tick();
+  server.acceptSidOverride = 'GHOST1';
+  server.sessions['GHOST1'] = [{ role: 'system', content: 'S' }];
+  els.composer.value = 'migrate me';
+  els['send-btn'].onclick();
+  let migChat = null;
+  for (let i = 0; i < 40 && !migChat; i++) { await tick(); migChat = server.pendingChat.pop(); }
+  assert.ok(migChat, 'migration chat accepted');
+  const sentSid = migChat.params.session_id;
+  assert.notEqual(sentSid, 'GHOST1', 'the mismatch comes from the server side, not the test');
+  const migTab = tabLabels().findIndex((l) => l.startsWith('\u2026'));
+  assert.ok(migTab >= 0, 'the authoritative session appears as a live tab');
+  server.pushChunk('GHOST1', 'ghost chunk here');
+  await tick();
+  flushFrames();
+  assert.ok(msgTexts().join(' ').includes('ghost chunk here'), 'chunks paint on the migrated tab');
+  assert.ok(msgTexts().join(' ').includes('migrate me'), 'the sent turn stays visible after migration');
+  server.sessions['GHOST1'].push({ role: 'user', content: 'migrate me' }, { role: 'assistant', content: 'ghost reply' });
+  server.pushDone('GHOST1', 'ghost reply');
+  await tick(); await tick();
+  assert.ok(msgTexts().join(' ').includes('ghost reply'), 'the migrated reply resolves');
+  assert.equal(els['send-btn'].textContent, 'Send', 'the send button is not stuck on Stop after migration');
+
+  // ---- done with failing history -------------------------------------------
+  //
+  // chat_done is followed by a session_history reload. If that reload fails,
+  // the Thinking bubble used to stay up forever with the flight already
+  // cleared. Now the client paints what it has locally instead.
+  els['new-session'].onclick();
+  await tick();
+  els.composer.value = 'history will fail';
+  els['send-btn'].onclick();
+  let histChat = null;
+  for (let i = 0; i < 40 && !histChat; i++) { await tick(); histChat = server.pendingChat.pop(); }
+  assert.ok(histChat, 'history-fail chat accepted');
+  const histSid = histChat.params.session_id;
+  server.failNextHistory = true;
+  server.pushDone(histSid, 'the reply text');
+  await tick(); await tick();
+  {
+    const text = msgTexts().join(' ');
+    assert.ok(text.includes('the reply text'), 'the reply paints even when history fails');
+    assert.ok(text.includes('history will fail'), 'the sent turn stays visible');
+  }
+  assert.equal(els['send-btn'].textContent, 'Send', 'no stuck Stop after a failed history reload');
+
+  // ---- drop mid-flight, then reconnect --------------------------------------
+  //
+  // Notifications for the old socket can never arrive on the new one, so a
+  // reconnect must fail tracked flights with a Retry instead of leaving
+  // eternal Thinking dots.
+  els['new-session'].onclick();
+  await tick();
+  els.composer.value = 'will drop';
+  els['send-btn'].onclick();
+  let dropChat = null;
+  for (let i = 0; i < 40 && !dropChat; i++) { await tick(); dropChat = server.pendingChat.pop(); }
+  assert.ok(dropChat, 'drop chat accepted');
+  const dropSid = dropChat.params.session_id;
+  server.sock.onclose();
+  for (let i = 0; i < 35; i++) { await tick(); }
+  {
+    const text = msgTexts().join(' ');
+    assert.ok(text.includes('Connection dropped'), 'a dropped flight becomes a visible error');
+  }
+  assert.equal(els['send-btn'].textContent, 'Send', 'no stuck Stop after a dropped connection');
+  // Retry resends through the new socket and completes normally.
+  const dropRetryBtn = (function findRetry(nodes) {
+    for (const n of nodes) {
+      if (n.textContent === '↻ Retry') return n;
+      const found = findRetry(n.children || []);
+      if (found) return found;
+    }
+    return null;
+  })(els.messages.children);
+  assert.ok(dropRetryBtn, 'the dropped flight offers Retry');
+  dropRetryBtn.onclick({ stopPropagation() {} });
+  let redriveChat = null;
+  for (let i = 0; i < 40 && !redriveChat; i++) { await tick(); redriveChat = server.pendingChat.pop(); }
+  assert.ok(redriveChat, 'retry re-sends');
+  assert.equal(redriveChat.params.session_id, dropSid, 'retry stays on the same session');
+  server.sessions[dropSid].push({ role: 'user', content: 'will drop' }, { role: 'assistant', content: 'recovered' });
+  server.pushDone(dropSid, 'recovered');
+  await tick(); await tick();
+  assert.ok(msgTexts().join(' ').includes('recovered'), 'the retried reply resolves');
+
+  // ---- closing a tab mid-flight ----------------------------------------------
+  //
+  // Deleting a tab with a reply in flight must stop the provider loop and drop
+  // late traffic: otherwise a late chat_done reopens the deleted session and
+  // leaves a bubble nothing can resolve.
+  els['new-session'].onclick();
+  await tick();
+  els.composer.value = 'doomed flight';
+  els['send-btn'].onclick();
+  let doomedChat = null;
+  for (let i = 0; i < 40 && !doomedChat; i++) { await tick(); doomedChat = server.pendingChat.pop(); }
+  assert.ok(doomedChat, 'doomed chat accepted');
+  const doomedSid = doomedChat.params.session_id;
+  const doomedTab = tabLabels().findIndex((l) => l.startsWith('\u2026'));
+  assert.ok(doomedTab >= 0, 'the doomed tab is live');
+  const sentBefore = sent.length;
+  els['tab-list'].children[doomedTab].children[2].click();
+  await tick();
+  els['tab-list'].children[doomedTab].children[2].click();
+  await tick();
+  const stopCalls = sent.slice(sentBefore).filter((s) => s.method === 'chat_stop');
+  assert.equal(stopCalls.length, 1, 'closing a live tab stops the provider loop');
+  assert.equal(stopCalls[0].params.session_id, doomedSid, 'the stop names the doomed session');
+  server.pushDone(doomedSid, 'late ghost reply');
+  await tick(); await tick();
+  assert.ok(!msgTexts().join(' ').includes('late ghost reply'), 'a late done does not resurrect the deleted tab');
+  assert.equal(els['send-btn'].textContent, 'Send', 'no stuck Stop after closing a live tab');
 
   console.log('TABFLOW ALL PASS');
 

@@ -121,6 +121,11 @@ var leanOverlayEl = $('lean-overlay');
     paintHeader('connecting');
     ws = new WebSocket((location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/');
     ws.onopen = function () {
+      // A reconnect means the previous socket is dead, and with it every
+      // in-flight reply: the daemon's notifications were addressed to the old
+      // sink and can never arrive here. Fail those flights now with a Retry
+      // rather than leaving their Thinking bubbles up until the watchdog.
+      var resumed = (reconnectCount || 0) > 0;
       reconnectCount = 0;
       // The daemon refuses every RPC until this connection authenticates, so
       // the handshake has to complete before anything else is sent. The token
@@ -143,6 +148,7 @@ var leanOverlayEl = $('lean-overlay');
           return;
         }
         paintHeader('live');
+        if (resumed) reconcileFlightsAfterReconnect();
         call('status', {}, function (err2, r) {
           if (err2 || !r || !r.provider) return;
           paintProvider(r.provider);
@@ -180,6 +186,16 @@ var leanOverlayEl = $('lean-overlay');
         cb(d.error, d.result);
       }
     };
+  }
+
+  // After a reconnect, every tracked flight is unrecoverable: its
+  // notifications went to the dead socket. Surface that as a normal error
+  // bubble with Retry instead of eternal Thinking dots.
+  function reconcileFlightsAfterReconnect() {
+    var ids = Object.keys(inflight);
+    for (var i = 0; i < ids.length; i++) {
+      failFlight(ids[i], 'Connection dropped mid-reply — tap Retry to resend.');
+    }
   }
 
   // Server-initiated streaming notifications (no request id).
@@ -429,7 +445,15 @@ var leanOverlayEl = $('lean-overlay');
         window.NativeHost.notifyAgentDone(String(reply || '').slice(0, 240));
       }
     } catch (_) {}
-    if (!activeId || activeId === sid) openSession(sid);
+    if (!activeId || activeId === sid) openSession(sid, null, function () {
+      // The reply arrived but the transcript could not be reloaded (the
+      // history RPC failed). Without this the Thinking bubble stays up
+      // forever with the flight already cleared: paint what we have locally.
+      teardownLive(sid);
+      render();
+      if (reply) appendMessage({ kind: 'assistant', content: reply });
+      else failFlight(sid, 'Reply received but the transcript failed to reload.');
+    });
     else { tabFlag[sid] = 'unread'; refreshSessionsAfterChat(); }
     drainQueue();
   }
@@ -703,12 +727,15 @@ var leanOverlayEl = $('lean-overlay');
     return '';
   }
 
-  function openSession(id, after) {
+  function openSession(id, after, onFail) {
     activeId = id;
     delete tabFlag[id];
     renderTabs();
     call('session_history', { session_id: id }, function (err, s) {
-      if (err || !s) return;
+      if (err || !s) {
+        if (onFail) onFail();
+        return;
+      }
       if (activeId !== id) return; // stale: user already moved on
       activeThread = s.messages || [];
       navState = s.nav || null;
@@ -740,6 +767,17 @@ var leanOverlayEl = $('lean-overlay');
   }
 
   function removeSession(id) {
+    if (currentFlight === id) {
+      // A reply in flight must not resurrect the tab it was headed for: stop
+      // the provider loop first, then drop late traffic and clear the flight
+      // locally. Without this a late chat_done reopens the deleted session and
+      // leaves its bubble up with nothing to resolve it.
+      call('chat_stop', { session_id: id, partial: streamBuf[id] || '' }, function () {});
+      stoppedSid[id] = true;
+      currentFlight = null;
+      teardownLive(id);
+      updateSendButton();
+    }
     delete inflight[id];
     delete tabFlag[id];
     call('session_delete', { session_id: id }, function () {
@@ -802,17 +840,18 @@ var leanOverlayEl = $('lean-overlay');
     updateSendButton();
     paintHeader('working');
     reportAgentStatus('Agent working…');
-    // Client-side bound matching the server's 300s cap: a hung reply
-    // becomes a recoverable error instead of a stuck pending bubble.
-    flightTimer[sid] = setTimeout(function () {
-      failFlight(sid, 'timed out after 310s — message restored to the composer; edit and resend.');
-    }, 310000);
+    armFlightTimer(sid);
     call('chat', { session_id: activeId, prompt: text }, function (err, r) {
       if (err || !(r && r.accepted)) {
         // Transport-level failure (the streamed outcome arrives as
         // chat_done/chat_error notifications instead).
         failFlight(sid, (err && (err.message || err)) || 'send failed');
+        return;
       }
+      // The daemon answers with the session the turn actually landed in. When
+      // that is not the tab we sent to, the reply would otherwise stream into
+      // a tab that does not exist while this tab's bubble never resolves.
+      if (r.session_id && r.session_id !== sid) migrateFlight(sid, r.session_id);
       // Accepted: chunks arrive as notifications; the watchdog bounds them.
     });
   }
@@ -849,6 +888,49 @@ var leanOverlayEl = $('lean-overlay');
     }
   }
 
+  // Client-side bound matching the server's 300s cap: a hung reply
+  // becomes a recoverable error instead of a stuck pending bubble.
+  var FLIGHT_TIMEOUT_MS = 310000;
+
+  function armFlightTimer(sid) {
+    if (flightTimer[sid]) { clearTimeout(flightTimer[sid]); }
+    flightTimer[sid] = setTimeout(function () {
+      failFlight(sid, 'timed out after 310s — message restored to the composer; edit and resend.');
+    }, FLIGHT_TIMEOUT_MS);
+  }
+
+  // A reply in flight can outlive the tab it was sent to: the daemon answers
+  // `chat` with the authoritative session id, and when that differs from the
+  // id we sent — the tab was deleted, archived, or never existed server-side —
+  // every later notification arrives for a session the strip does not know.
+  // Move the whole flight onto the real id so the reply paints somewhere that
+  // exists; otherwise the Thinking bubble and the Stop button stick forever.
+  function migrateFlight(fromSid, toSid) {
+    if (!fromSid || !toSid || fromSid === toSid) return;
+    var maps = [inflight, streamBuf, streamEls, pendEl, phaseLabel, stoppedSid];
+    for (var i = 0; i < maps.length; i++) {
+      if (maps[i][fromSid] !== undefined) {
+        maps[i][toSid] = maps[i][fromSid];
+        delete maps[i][fromSid];
+      }
+    }
+    if (flightTimer[fromSid]) {
+      clearTimeout(flightTimer[fromSid]);
+      delete flightTimer[fromSid];
+      armFlightTimer(toSid);
+    }
+    if (!sessions.some(function (s) { return s.id === toSid; })) {
+      sessions.unshift({ id: toSid, title: '(new)', message_count: 1 });
+    }
+    // A stopped flight stays where the user left it: adopting the tab would
+    // show one tab's messages under another tab's highlight.
+    if (!stoppedSid[toSid]) {
+      activeId = toSid;
+      if (currentFlight === fromSid) currentFlight = toSid;
+    }
+    renderTabs();
+  }
+
   // Shared failure path: the thinking bubble is torn down, the sent
   // user bubble stays (committed at send time — never clobbers the
   // composer or queued text), and an agent error bubble carries a Retry.
@@ -863,14 +945,16 @@ var leanOverlayEl = $('lean-overlay');
     reportAgentStatus('Container running');
     var replySid = (sid === '__fresh__') ? null : sid;
     if (replySid) tabFlag[replySid] = 'error';
-    refreshSessionsAfterChat();
     if (!activeId || activeId === replySid) {
       // Re-sync (server never persisted the failed turn) WITHOUT wiping the
       // local send-time commit: openSession's reload would drop the sent
       // bubble the user must see, so only refresh titles/flags here.
-      refreshSessionsAfterChat();
       appendErrorBubble(message, sid === '__fresh__' ? null : sid);
     }
+    // Exactly one list refresh: it repaints the '!' glyph on background tabs
+    // and picks up any title changes. Two overlapping refreshes race the
+    // sessions array against tab switches.
+    refreshSessionsAfterChat();
     drainQueue();
   }
 
