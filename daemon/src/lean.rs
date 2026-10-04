@@ -685,6 +685,13 @@ pub async fn provision() -> String {
 /// button forever (a previous failed unpack left PROVISIONING=true across
 /// restarts of the flow, so every later tap hit "already running").
 pub async fn kick_off_provision() -> String {
+    // Readiness gate first: the daemon calls this on every boot, and logging
+    // "starting download" for an install that is already complete is what made
+    // restarts look like re-downloads. Only claim a download when one starts.
+    if status().await.ready {
+        let ver = cached_lean_version().unwrap_or_else(|| "unknown version".to_string());
+        return format!("Lean already installed ({ver})");
+    }
     if LEAN_PROVISIONING.swap(true, Ordering::SeqCst) {
         // Stale guard: if no download/progress has moved recently the flag
         // is orphaned — reclaim it instead of dead-buttoning forever.

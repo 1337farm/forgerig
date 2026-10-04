@@ -162,12 +162,37 @@ fn auth_gate(configured: Option<&str>, conn: &std::sync::atomic::AtomicBool, met
     }
 }
 
-/// Per-connection stop flags: the chat future and its chat_stop RPC share
-/// the same connection task, so a thread-local registry (not a global map)
-/// pairs them without cross-connection races.
-thread_local! {
-    static STOP: std::cell::RefCell<std::collections::HashMap<String, provider::StopFlag>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+/// Stop flags shared by every connection task: `chat` registers the flag for a
+/// session and `chat_stop` sets it, and the two RPCs routinely run on different
+/// Tokio worker threads (every request is its own spawned task), so a
+/// thread-local registry silently drops the stop most of the time — the user
+/// taps Stop, the socket closes locally, and the provider loop keeps burning
+/// tokens server-side. A process-wide map pairs them regardless of thread.
+static STOP: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, provider::StopFlag>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Register a session's stop flag, replacing any previous one for the id.
+fn stop_register(id: &str, flag: provider::StopFlag) {
+    STOP.lock().unwrap().insert(id.to_string(), flag);
+}
+
+/// Set a session's stop flag. Returns whether a live flight was actually
+/// stopped, so callers can tell "no such flight" apart from "stopped".
+fn stop_set(id: &str) -> bool {
+    if let Some(flag) = STOP.lock().unwrap().get(id) {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        return true;
+    }
+    false
+}
+
+/// Forget a session's stop flag, but only if it is the same flag that was
+/// registered: a newer flight on the same session must keep its own.
+fn stop_forget(id: &str, flag: &provider::StopFlag) {
+    let mut map = STOP.lock().unwrap();
+    if map.get(id).map(|f| std::sync::Arc::ptr_eq(f, flag)).unwrap_or(false) {
+        map.remove(id);
+    }
 }
 
 /// Build the session's system message, with permanent project memory appended.
@@ -343,7 +368,7 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
                         }
                     });
                     let stop: provider::StopFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    STOP.with(|cell| { cell.borrow_mut().insert(sid.clone(), std::sync::Arc::clone(&stop)); });
+                    stop_register(&sid, std::sync::Arc::clone(&stop));
                     let backend2 = Arc::clone(backend);
                     let memory2 = Arc::clone(memory);
                     let sessions2 = Arc::clone(sessions);
@@ -404,6 +429,10 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
                                 .await;
                             }
                         }
+                        // Flight over: forget our flag so a later chat on the
+                        // same session is never stopped by a stale entry — but
+                        // only if it is still ours (a newer flight replaces it).
+                        stop_forget(&sid2, &stop);
                     });
                     ok(json!({ "accepted": true, "session_id": sid }), req.id)
                 }
@@ -541,11 +570,10 @@ async fn handle_rpc(req: RpcRequest, backend: &Arc<provider::Backend>, memory: &
         "chat_stop" => {
             let id = req.params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
             let partial = req.params.as_ref().and_then(|p| p.get("partial")).and_then(|x| x.as_str()).unwrap_or_default().to_string();
-            STOP.with(|cell| {
-                if let Some(flag) = cell.borrow().get(&id) {
-                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                }
-            });
+            // The registry is process-wide: chat and chat_stop run on
+            // different worker threads, and a thread-local lookup would miss
+            // the flag almost every time.
+            stop_set(&id);
             // Bank the client's partial text as the transcript position so a
             // later Resume continues from near the cutoff, not from scratch.
             if !partial.trim().is_empty() {
@@ -1184,5 +1212,44 @@ mod tests {
         assert!(html.contains("function visibleTurns"));
         assert!(html.contains("function forkRawIndex"));
         assert!(html.contains("function sendMessage"));
+    }
+
+    /// chat and chat_stop run on different worker threads (every request is
+    /// its own spawned task), so the stop registry must be visible across
+    /// threads. A thread-local map silently drops the stop almost every time,
+    /// which is exactly the "had to tap Stop repeatedly" report.
+    #[test]
+    fn stop_flag_set_on_another_thread_stops_the_flight() {
+        let id = format!("stop-xthread-{}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let flag: provider::StopFlag = std::sync::Arc::new(AtomicBool::new(false));
+        stop_register(&id, std::sync::Arc::clone(&flag));
+        // chat_stop runs elsewhere: set the flag from a spawned thread, the
+        // way the real RPC does.
+        let probe = id.clone();
+        std::thread::spawn(move || {
+            assert!(stop_set(&probe), "stop on another thread must find the flight");
+        })
+        .join()
+        .unwrap();
+        assert!(flag.load(Ordering::SeqCst), "the flight must observe the stop");
+        stop_forget(&id, &flag);
+        assert!(!stop_set(&id), "a forgotten flight must not be stoppable");
+    }
+
+    /// A finished flight must not take a newer flight on the same session
+    /// down with it when it unregisters.
+    #[test]
+    fn stop_forget_keeps_a_newer_flight_on_the_same_session() {
+        let id = format!("stop-replace-{}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let old: provider::StopFlag = std::sync::Arc::new(AtomicBool::new(false));
+        let new: provider::StopFlag = std::sync::Arc::new(AtomicBool::new(false));
+        stop_register(&id, std::sync::Arc::clone(&old));
+        stop_register(&id, std::sync::Arc::clone(&new));
+        stop_forget(&id, &old);
+        assert!(stop_set(&id), "the newer flight must survive the older one's cleanup");
+        stop_forget(&id, &new);
+        assert!(!stop_set(&id), "nothing left to stop afterwards");
     }
 }

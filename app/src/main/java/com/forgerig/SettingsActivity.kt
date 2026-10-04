@@ -25,7 +25,6 @@ class SettingsActivity : AppCompatActivity() {
 
     private companion object {
         const val EXTRA_MODELS_PREFS = "forgerig_extra_models"
-        const val PROVIDER_AUTO = "openrouter/auto"
         const val FREE_SUFFIX = "  (free)"
     }
 
@@ -350,24 +349,13 @@ class SettingsActivity : AppCompatActivity() {
             Thread {
                 try {
                     val typedKey = keyEdit.text.toString().trim()
-                    val customBase = urlEdit.text.toString().trim()
                     var totalAdded = 0
                     var totalSeen = 0
                     val failures = mutableListOf<String>()
                     val skipped = mutableListOf<String>()
                     for ((_, code) in providerOptions) {
-                        // Each provider is queried against its own default base
-                        // (custom keeps the typed URL); one provider's outage
-                        // must not abort the rest.
-                        val base = if (code == "custom") customBase else defaultBaseUrls[code] ?: ""
+                        val base = defaultBaseUrls[code] ?: ""
                         if (base.isEmpty()) continue
-                        if (code == "ollama" && base == defaultBaseUrls["ollama"]) {
-                            // Local Ollama is optional and often not installed:
-                            // keep the curated local fallback visible instead of
-                            // reporting a connection failure every refresh.
-                            skipped.add("ollama: local server not configured")
-                            continue
-                        }
                         // Per-provider keys: the single typed field belongs to
                         // the selected provider only. Other providers use their
                         // own saved key so one provider's key never causes
@@ -376,12 +364,21 @@ class SettingsActivity : AppCompatActivity() {
                         try {
                             val discovered = fetchModelsFor(code, base, key)
                             totalSeen += discovered.size
+                            // Reconcile, don't just append: the free flags and
+                            // the membership both come from the live list, so a
+                            // model that vanished upstream or whose flag
+                            // changed must not linger with stale metadata.
+                            // append-only merging is what left dead models
+                            // selectable (and 404ing) after they were removed.
+                            val curated = modelCatalog[code] ?: emptyList()
+                            val fresh = discovered.sortedBy { it.id }
+                                .filter { d -> curated.none { it.name == d.id } }
+                                .map { ModelOption(it.id, it.free) }
                             val known = extraModels.getOrPut(code) { mutableListOf() }
-                            for (model in discovered.sortedBy { it.id }) {
-                                if ((modelCatalog[code] ?: emptyList()).none { it.name == model.id }) {
-                                    if (known.addIfAbsent(ModelOption(model.id, model.free))) totalAdded++
-                                }
-                            }
+                            val had = known.map { it.name }.toSet()
+                            totalAdded += fresh.count { it.name !in had }
+                            known.clear()
+                            known.addAll(fresh)
                             persistExtraModels()
                         } catch (e: Exception) {
                             failures.add("$code: ${e.message}")
