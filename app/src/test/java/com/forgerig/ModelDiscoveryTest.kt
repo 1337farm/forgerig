@@ -79,9 +79,43 @@ class ModelDiscoveryTest {
     }
 
     @Test
+    fun missingModelsReportsOnlyGoneIds() {
+        val discovered = listOf(
+            ModelDiscovery.DiscoveredModel("nvidia/kept-model", true),
+        )
+        assertEquals(
+            listOf("nvidia/gone-model"),
+            ModelDiscovery.missingModels(
+                listOf("nvidia/kept-model", "nvidia/gone-model"),
+                discovered,
+            ),
+        )
+        assertEquals(
+            emptyList<String>(),
+            ModelDiscovery.missingModels(
+                listOf("nvidia/kept-model"),
+                discovered,
+            ),
+        )
+    }
+
+    @Test
+    fun missingModelsStaysSilentOnEmptyDiscovery() {
+        // An empty catalog response must not false-alarm on every saved model:
+        // per reconcileModels it says nothing reliable about what serves.
+        assertEquals(
+            emptyList<String>(),
+            ModelDiscovery.missingModels(
+                listOf("nvidia/anything", "nvidia/else"),
+                emptyList(),
+            ),
+        )
+    }
+
+    @Test
     fun reconcileWithEmptyDiscoveryKeepsKnown() {
-        // An empty fetch response says nothing reliable about what still
-        // serves: wiping here would strand the user with no selectable model.
+        // Same keep-on-empty rule at the reconcile level: an empty fetch must
+        // not wipe the persisted list and strand the user with no models.
         val known = listOf(ModelDiscovery.DiscoveredModel("nvidia/old", true))
         val (fresh, added) = ModelDiscovery.reconcileModels(
             curated = emptyList(),
