@@ -630,6 +630,26 @@ class MainActivity : AppCompatActivity() {
             // notification reply into the composer.
             injectAgentReply()
         }
+
+        // A dead renderer leaves the WebView permanently black: the URL is
+        // unchanged so onResume sees nothing to fix, and no error callback
+        // fires. Returning true keeps the process alive and reloading here
+        // restores the page instead of showing black until the next restart.
+        override fun onRenderProcessGone(
+            view: WebView?,
+            detail: android.webkit.RenderProcessGoneDetail?
+        ): Boolean {
+            AssetExtractor.logShared(
+                this@MainActivity,
+                "WARN: WebView renderer gone (crashed=${detail?.didCrash()}); reloading daemon page"
+            )
+            try {
+                view?.loadUrl("http://127.0.0.1:${MainActivity.allocatedPort}")
+            } catch (e: Exception) {
+                AssetExtractor.logShared(this@MainActivity, "ERROR: renderer-gone reload failed | $e")
+            }
+            return true
+        }
     }
 
     inner class WebAppInterface(private val context: MainActivity) {
