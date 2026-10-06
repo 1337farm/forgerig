@@ -152,4 +152,19 @@ object ModelDiscovery {
         val had = known.map { it.id }.toSet()
         return fresh to fresh.count { it.id !in had }
     }
+
+    /**
+     * Saved ids missing from a fresh discovery — pure function of its inputs.
+     *
+     * An empty discovery reports nothing missing: per [reconcileModels] it
+     * says nothing reliable about what still serves, so validating against it
+     * would false-alarm on every saved model.
+     */
+    fun missingModels(
+        savedIds: List<String>,
+        discovered: List<DiscoveredModel>,
+    ): List<String> {
+        if (discovered.isEmpty()) return emptyList()
+        return savedIds.filter { id -> discovered.none { it.id == id } }
+    }
 }

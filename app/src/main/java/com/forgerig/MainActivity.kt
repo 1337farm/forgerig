@@ -181,23 +181,37 @@ class MainActivity : AppCompatActivity() {
                 // Persist through the same reconcile rule as SettingsActivity:
                 // fresh membership and flags from the live list, curated
                 // entries excluded, empty discovery keeps what is there.
+                // Legacy 2-part entries are honored the same way
+                // SettingsActivity.loadExtraModels honors them: re-infer the
+                // flag instead of dropping previously discovered models.
                 try {
                     val prefs = getSharedPreferences("forgerig_extra_models", MODE_PRIVATE)
                     val known = (prefs.getStringSet("extra_models", emptySet()) ?: emptySet())
                         .mapNotNull { entry ->
                             val parts = entry.split("\u0001")
-                            if (parts.size == 3 && parts[0] == "nvidia") {
-                                ModelDiscovery.DiscoveredModel(parts[2], parts[1] == "1")
-                            } else null
+                            when {
+                                parts.size == 3 && parts[0] == "nvidia" ->
+                                    ModelDiscovery.DiscoveredModel(parts[2], parts[1] == "1")
+                                parts.size == 2 && parts[0] == "nvidia" && parts[1].isNotEmpty() ->
+                                    ModelDiscovery.DiscoveredModel(
+                                        parts[1],
+                                        ModelDiscovery.inferFree("nvidia", parts[1]),
+                                    )
+                                else -> null
+                            }
                         }
                     val (fresh, _) = ModelDiscovery.reconcileModels(emptyList(), known, discovered)
                     val flattened = fresh.map { m -> "nvidia\u0001${if (m.free) "1" else "0"}\u0001${m.id}" }.toSet()
                     prefs.edit().putStringSet("extra_models", flattened).apply()
                 } catch (_: Exception) {}
-                // Validate the saved choice: if it is gone from the live list,
-                // say so after the page is ready so the user knows to re-pick.
-                val gone = listOfNotNull(s.model.takeIf { it.isNotBlank() }, s.evalModel.takeIf { it.isNotBlank() })
-                    .filter { id -> discovered.none { it.id == id } }
+                // Validate the saved choice through the same empty-safe rule:
+                // an empty discovery reports nothing missing, so a shape
+                // mismatch in the catalog response can never false-alarm on
+                // every saved model at once.
+                val gone = ModelDiscovery.missingModels(
+                    listOfNotNull(s.model.takeIf { it.isNotBlank() }, s.evalModel.takeIf { it.isNotBlank() }),
+                    discovered,
+                )
                 if (gone.isNotEmpty()) {
                     runOnUiThread {
                         android.widget.Toast.makeText(this@MainActivity, "Saved model ${gone.joinToString(", ")} not in NVIDIA's live list — re-pick in Settings.", android.widget.Toast.LENGTH_LONG).show()
