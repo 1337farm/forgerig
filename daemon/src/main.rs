@@ -1252,4 +1252,284 @@ mod tests {
         stop_forget(&id, &new);
         assert!(!stop_set(&id), "nothing left to stop afterwards");
     }
+
+    /// Full UI workflow over a real socket: real TCP, real WebSocket frames,
+    /// real JSON-RPC dispatch, real sessions, and a real provider HTTP call
+    /// against a stub OpenAI-compat server. The unit tests fake the socket and
+    /// the provider; this test runs the steps the app actually runs (auth gate
+    /// → status → create → list → chat with streamed notifications → rename →
+    /// delete) so a wiring regression anywhere in that chain fails here.
+    ///
+    /// Env vars are saved and restored: the backend resolves its provider from
+    /// the environment, and no other test reads these keys.
+    struct SavedEnv(Vec<(&'static str, Option<String>)>);
+    impl SavedEnv {
+        fn set(key: &'static str, val: String, saved: &mut Vec<(&'static str, Option<String>)>) {
+            saved.push((key, std::env::var(key).ok()));
+            std::env::set_var(key, val);
+        }
+    }
+    impl Drop for SavedEnv {
+        fn drop(&mut self) {
+            for (key, val) in self.0.drain(..) {
+                match val {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    /// Read one HTTP request (headers + declared body) from a stub-server
+    /// connection. Plain blocking I/O: the stub lives on its own thread.
+    fn read_http_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
+        use std::io::Read as _;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 8192];
+        loop {
+            let n = stream.read(&mut tmp).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&buf[..end]);
+                let len: usize = headers
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Content-Length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                if buf.len() >= end + 4 + len {
+                    break;
+                }
+            }
+            if buf.len() > 1_000_000 {
+                break;
+            }
+        }
+        buf
+    }
+
+    type E2eSink = futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        tokio_tungstenite::tungstenite::Message,
+    >;
+    type E2eStream = futures_util::stream::SplitStream<
+        tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    >;
+
+    /// Send one JSON-RPC request over the real socket and return the matching
+    /// reply, stashing any interleaved push notifications for later.
+    async fn e2e_call(
+        tx: &mut E2eSink,
+        rx: &mut E2eStream,
+        stash: &mut Vec<Value>,
+        method: &str,
+        params: Value,
+        id: i64,
+    ) -> Value {
+        let req = json!({"jsonrpc": "2.0", "method": method, "params": params, "id": id});
+        tx.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&req).unwrap(),
+        ))
+        .await
+        .unwrap();
+        loop {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(30), rx.next())
+                .await
+                .expect("timed out waiting for an RPC reply")
+                .unwrap()
+                .unwrap();
+            if !msg.is_text() {
+                continue;
+            }
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            if v.get("id") == Some(&json!(id)) {
+                return v;
+            }
+            stash.push(v);
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_chat_workflow_over_real_socket() {
+        // Stub provider first: the backend resolves its base URL from the
+        // environment, so point it at a loopback stub serving canned SSE.
+        let stub = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stub_port = stub.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            for stream in stub.incoming().take(8) {
+                let mut stream = match stream {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let raw = read_http_request(&mut stream);
+                let text = String::from_utf8_lossy(&raw);
+                let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
+                // The agent loop streams (`"stream":true`); the background
+                // evaluator posts a one-shot completion. Serve both shapes so
+                // either path the workflow takes gets a valid answer.
+                let payload = if body.contains("\"stream\":true") {
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \"},\"finish_reason\":null}]}\n\n\
+                     data: {\"choices\":[{\"delta\":{\"content\":\"e2e\"},\"finish_reason\":null}]}\n\n\
+                     data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                     data: [DONE]\n\n"
+                        .to_string()
+                } else {
+                    "{\"choices\":[{\"message\":{\"content\":\"stub-eval-ok\"},\"finish_reason\":\"stop\"}]}"
+                        .to_string()
+                };
+                let content_type = if body.contains("\"stream\":true") {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(payload.as_bytes());
+            }
+        });
+
+        let mut saved = Vec::new();
+        let _env = {
+            SavedEnv::set("FORGERIG_PROVIDER", "openai".to_string(), &mut saved);
+            SavedEnv::set(
+                "FORGERIG_BASE_URL",
+                format!("http://127.0.0.1:{stub_port}"),
+                &mut saved,
+            );
+            SavedEnv::set("FORGERIG_MODEL", "e2e-chat-model".to_string(), &mut saved);
+            SavedEnv::set("FORGERIG_EVAL_MODEL", "e2e-eval-model".to_string(), &mut saved);
+            SavedEnv::set("FORGERIG_API_KEY", "e2e-key".to_string(), &mut saved);
+            // The guard owns the saved values; dropping it restores them.
+            SavedEnv(saved)
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("e2e.db");
+        let memory = Arc::new(
+            MemoryEngine::new(db_path.to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let sessions = Arc::new(SessionManager::new());
+        let backend = Arc::new(provider::Backend::resolve(memory.clone()).await);
+        let token = Some("e2e-token".to_string());
+        let conn = conn_auth();
+
+        // Real TCP + real WebSocket handshake, then the production accept
+        // loop: parse each frame, dispatch handle_rpc, send the reply.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (sink, mut rx) = ws.split();
+            let push: WsPush = Arc::new(tokio::sync::Mutex::new(sink));
+            while let Some(msg) = rx.next().await {
+                let Ok(msg) = msg else { break };
+                if !msg.is_text() {
+                    continue;
+                }
+                let req: RpcRequest = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+                let resp = handle_rpc(req, &backend, &memory, &sessions, &push, token.as_deref(), &conn).await;
+                let body = serde_json::to_string(&resp).unwrap();
+                push_notification(&push, serde_json::from_str(&body).unwrap()).await;
+            }
+        });
+
+        let client = tokio::net::TcpStream::connect(format!("127.0.0.1:{ws_port}"))
+            .await
+            .unwrap();
+        let url = url::Url::parse(&format!("ws://127.0.0.1:{ws_port}/")).unwrap();
+        let (ws, _) = tokio_tungstenite::client_async(url, client).await.unwrap();
+        let (mut tx, mut rx) = ws.split();
+        let mut stash = Vec::new();
+
+        // 1. The gate refuses everything before auth, over the real wire.
+        let r = e2e_call(&mut tx, &mut rx, &mut stash, "status", json!({}), 1).await;
+        assert!(r.get("error").is_some(), "status before auth must be refused: {r}");
+        // 2. Wrong token stays refused.
+        let r = e2e_call(&mut tx, &mut rx, &mut stash, "auth", json!({"token": "nope"}), 2).await;
+        assert!(r.get("error").is_some(), "wrong token must be refused: {r}");
+        // 3. Right token authenticates this connection.
+        let r = e2e_call(&mut tx, &mut rx, &mut stash, "auth", json!({"token": "e2e-token"}), 3).await;
+        assert_eq!(r["result"]["authenticated"], json!(true), "auth must succeed: {r}");
+        // 4. Status now answers.
+        let r = e2e_call(&mut tx, &mut rx, &mut stash, "status", json!({}), 4).await;
+        assert!(r["result"]["provider"].as_str().unwrap_or("").contains("openai"), "status must describe the backend: {r}");
+        // 5. Create a tab.
+        let r = e2e_call(&mut tx, &mut rx, &mut stash, "session_create", json!({}), 5).await;
+        let sid = r["result"]["id"].as_str().unwrap_or("").to_string();
+        assert!(!sid.is_empty(), "create must return a session id: {r}");
+        // 6. The tab is listed.
+        let r = e2e_call(&mut tx, &mut rx, &mut stash, "session_list", json!({}), 6).await;
+        let ids: Vec<&str> = r["result"].as_array().unwrap().iter()
+            .filter_map(|s| s.get("id").and_then(|v| v.as_str())).collect();
+        assert!(ids.contains(&sid.as_str()), "list must contain the new tab: {r}");
+        // 7. Chat is accepted for that tab, then streams to chat_done.
+        let r = e2e_call(
+            &mut tx, &mut rx, &mut stash,
+            "chat", json!({"session_id": sid, "prompt": "say hello"}), 7,
+        )
+        .await;
+        assert_eq!(r["result"]["accepted"], json!(true), "chat must be accepted: {r}");
+        assert_eq!(r["result"]["session_id"], json!(sid), "chat must land in the sent tab: {r}");
+        // Drain the stream: chunks accumulate, chat_done ends it. A single
+        // read loop (not one wait per method) so done arriving before the
+        // next chunk can never wedge the test.
+        let mut chunks = 0;
+        let done = loop {
+            let v = if let Some(i) = stash
+                .iter()
+                .position(|v| matches!(v.get("method").and_then(|m| m.as_str()), Some("chat_chunk") | Some("chat_done")))
+            {
+                stash.remove(i)
+            } else {
+                let msg = tokio::time::timeout(std::time::Duration::from_secs(60), rx.next())
+                    .await
+                    .expect("timed out waiting for provider notifications")
+                    .unwrap()
+                    .unwrap();
+                if !msg.is_text() {
+                    continue;
+                }
+                serde_json::from_str(msg.to_text().unwrap()).unwrap()
+            };
+            match v.get("method").and_then(|m| m.as_str()) {
+                Some("chat_chunk") => chunks += 1,
+                Some("chat_done") => break v,
+                // Phase markers bracket the stream; anything else here
+                // would mean traffic from a flight this test never started.
+                Some("chat_phase") | Some("chat_tool") => {}
+                Some(other) => panic!("unexpected push while streaming: {other}"),
+                None => {}
+            }
+        };
+        assert!(chunks >= 1, "the stubbed provider must stream at least one chunk");
+        let reply = done["params"]["reply"].as_str().unwrap_or("");
+        assert!(reply.contains("Hello") && reply.contains("e2e"), "done must carry the stubbed reply, got: {reply:?}");
+        // 8. Rename sticks.
+        let r = e2e_call(
+            &mut tx, &mut rx, &mut stash,
+            "session_rename", json!({"session_id": sid, "title": "e2e chat"}), 8,
+        )
+        .await;
+        assert_eq!(r["result"]["title"], json!("e2e chat"), "rename must stick: {r}");
+        // 9. Delete removes it from the list.
+        let r = e2e_call(&mut tx, &mut rx, &mut stash, "session_delete", json!({"session_id": sid}), 9).await;
+        assert_eq!(r["result"]["deleted"], json!(true), "delete must succeed: {r}");
+        let r = e2e_call(&mut tx, &mut rx, &mut stash, "session_list", json!({}), 10).await;
+        let ids: Vec<&str> = r["result"].as_array().unwrap().iter()
+            .filter_map(|s| s.get("id").and_then(|v| v.as_str())).collect();
+        assert!(!ids.contains(&sid.as_str()), "deleted tab must leave the list: {r}");
+
+        drop(server);
+    }
 }
