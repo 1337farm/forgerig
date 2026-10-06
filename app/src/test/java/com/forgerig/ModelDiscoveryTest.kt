@@ -34,19 +34,62 @@ class ModelDiscoveryTest {
     }
 
     @Test
-    fun mergesCuratedAndDiscoveredWithoutReplacingFallback() {
-        val merged = ModelDiscovery.mergeDiscovered(
-            listOf("nvidia/llama-3.1-nemotron-70b-instruct"),
-            listOf("nvidia/llama-3.1-nemotron-70b-instruct", "nvidia/new-model"),
+    fun reconcileDropsVanishedModelsAndRefreshesFlags() {
+        // known[] carries stale metadata the way the persisted extras did: a
+        // model that vanished upstream, and one whose free flag flipped.
+        val known = listOf(
+            ModelDiscovery.DiscoveredModel("nvidia/gone-model", true),
+            ModelDiscovery.DiscoveredModel("nvidia/flipped-model", false),
+            ModelDiscovery.DiscoveredModel("nvidia/still-here", true),
+        )
+        val discovered = listOf(
+            ModelDiscovery.DiscoveredModel("nvidia/flipped-model", true),
+            ModelDiscovery.DiscoveredModel("nvidia/still-here", true),
+            ModelDiscovery.DiscoveredModel("nvidia/brand-new", false),
+        )
+        val (fresh, added) = ModelDiscovery.reconcileModels(
+            curated = emptyList(), known = known, discovered = discovered,
         )
         assertEquals(
             listOf(
-                "nvidia/llama-3.1-nemotron-70b-instruct",
-                "nvidia/new-model",
+                ModelDiscovery.DiscoveredModel("nvidia/brand-new", false),
+                ModelDiscovery.DiscoveredModel("nvidia/flipped-model", true),
+                ModelDiscovery.DiscoveredModel("nvidia/still-here", true),
             ),
-            merged,
+            fresh,
         )
-        assertTrue(merged.contains("nvidia/llama-3.1-nemotron-70b-instruct"))
+        assertEquals(1, added)
+        assertTrue(fresh.none { it.id == "nvidia/gone-model" })
+    }
+
+    @Test
+    fun reconcileExcludesCuratedEntriesAndCountsOnlyNewIds() {
+        val (fresh, added) = ModelDiscovery.reconcileModels(
+            curated = listOf("nvidia/llama-3.1-nemotron-70b-instruct"),
+            known = listOf(
+                ModelDiscovery.DiscoveredModel("nvidia/llama-3.1-nemotron-70b-instruct", true),
+            ),
+            discovered = listOf(
+                ModelDiscovery.DiscoveredModel("nvidia/llama-3.1-nemotron-70b-instruct", true),
+                ModelDiscovery.DiscoveredModel("nvidia/new-model", false),
+            ),
+        )
+        assertEquals(listOf(ModelDiscovery.DiscoveredModel("nvidia/new-model", false)), fresh)
+        assertEquals(1, added)
+    }
+
+    @Test
+    fun reconcileWithEmptyDiscoveryKeepsKnown() {
+        // An empty fetch response says nothing reliable about what still
+        // serves: wiping here would strand the user with no selectable model.
+        val known = listOf(ModelDiscovery.DiscoveredModel("nvidia/old", true))
+        val (fresh, added) = ModelDiscovery.reconcileModels(
+            curated = emptyList(),
+            known = known,
+            discovered = emptyList(),
+        )
+        assertEquals(known, fresh)
+        assertEquals(0, added)
     }
 
     @Test

@@ -178,10 +178,21 @@ class MainActivity : AppCompatActivity() {
                         ModelDiscovery.discoverModels("nvidia", conn.inputStream.bufferedReader().readText())
                     } finally { conn.disconnect() }
                 } catch (_: Exception) { return@thread }
-                // Persist the discovered IDs so SettingsActivity shows them on open.
+                // Persist through the same reconcile rule as SettingsActivity:
+                // fresh membership and flags from the live list, curated
+                // entries excluded, empty discovery keeps what is there.
                 try {
-                    val flattened = discovered.map { m -> "nvidia\u0001${if (m.free) "1" else "0"}\u0001${m.id}" }.toSet()
-                    getSharedPreferences("forgerig_extra_models", MODE_PRIVATE).edit().putStringSet("extra_models", flattened).apply()
+                    val prefs = getSharedPreferences("forgerig_extra_models", MODE_PRIVATE)
+                    val known = (prefs.getStringSet("extra_models", emptySet()) ?: emptySet())
+                        .mapNotNull { entry ->
+                            val parts = entry.split("\u0001")
+                            if (parts.size == 3 && parts[0] == "nvidia") {
+                                ModelDiscovery.DiscoveredModel(parts[2], parts[1] == "1")
+                            } else null
+                        }
+                    val (fresh, _) = ModelDiscovery.reconcileModels(emptyList(), known, discovered)
+                    val flattened = fresh.map { m -> "nvidia\u0001${if (m.free) "1" else "0"}\u0001${m.id}" }.toSet()
+                    prefs.edit().putStringSet("extra_models", flattened).apply()
                 } catch (_: Exception) {}
                 // Validate the saved choice: if it is gone from the live list,
                 // say so after the page is ready so the user knows to re-pick.

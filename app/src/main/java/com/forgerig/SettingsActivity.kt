@@ -377,21 +377,20 @@ class SettingsActivity : AppCompatActivity() {
                         try {
                             val discovered = fetchModelsFor(code, base, key)
                             totalSeen += discovered.size
-                            // Reconcile, don't just append: the free flags and
-                            // the membership both come from the live list, so a
-                            // model that vanished upstream or whose flag
-                            // changed must not linger with stale metadata.
-                            // append-only merging is what left dead models
-                            // selectable (and 404ing) after they were removed.
-                            val curated = modelCatalog[code] ?: emptyList()
-                            val fresh = discovered.sortedBy { it.id }
-                                .filter { d -> curated.none { it.name == d.id } }
-                                .map { ModelOption(it.id, it.free) }
+                            // One reconcile rule for both refresh paths (see
+                            // ModelDiscovery.reconcileModels): fresh membership
+                            // and flags from the live list, curated entries
+                            // excluded, empty discovery keeps what is there.
+                            val curated = (modelCatalog[code] ?: emptyList()).map { it.name }
+                            val knownModels = (extraModels[code] ?: emptyList())
+                                .map { ModelDiscovery.DiscoveredModel(it.name, it.free) }
+                            val (freshModels, added) = ModelDiscovery.reconcileModels(
+                                curated, knownModels, discovered,
+                            )
+                            totalAdded += added
                             val known = extraModels.getOrPut(code) { mutableListOf() }
-                            val had = known.map { it.name }.toSet()
-                            totalAdded += fresh.count { it.name !in had }
                             known.clear()
-                            known.addAll(fresh)
+                            known.addAll(freshModels.map { ModelOption(it.id, it.free) })
                             persistExtraModels()
                         } catch (e: Exception) {
                             failures.add("$code: ${e.message}")
