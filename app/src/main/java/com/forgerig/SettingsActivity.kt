@@ -181,8 +181,13 @@ class SettingsActivity : AppCompatActivity() {
         }
         root.addView(providerCountView)
 
-        root.addView(label("Model (leave blank for provider default)"))
-        val modelEdit = editText(current.model, "e.g. mistral-small-latest or llama-3.3-70b-versatile")
+        // Model choice is dropdown-only: the entries come from the live NVIDIA
+        // fetch (blank catalog until it lands), so a hand-typed slug can never
+        // go stale and 404 at chat time. The first row keeps the old blank
+        // semantics (provider default / same-as-chat).
+        root.addView(label("Model"))
+        var pendingModel = current.model
+        var pendingEval = current.evalModel
         val freeOnlyBox = CheckBox(this).apply {
             text = "Show free models only"
             isChecked = true
@@ -195,19 +200,23 @@ class SettingsActivity : AppCompatActivity() {
             adapter = spinnerAdapter()
         }
         root.addView(modelSpinner)
-        root.addView(modelEdit)
         val evalSpinner = Spinner(this).apply {
             adapter = spinnerAdapter()
         }
         var refreshingModels = false
-        fun fillSpinner(view: Spinner, names: List<String>, selected: String) {
+        fun fillSpinner(view: Spinner, names: List<String>, defaultItem: String, selected: String) {
             @Suppress("UNCHECKED_CAST")
             val adapter = view.adapter as ArrayAdapter<String>
             adapter.clear()
+            adapter.add(defaultItem)
             adapter.addAll(names)
             adapter.notifyDataSetChanged()
-            val idx = names.indexOfFirst { it.removeSuffix(FREE_SUFFIX) == selected }
-            if (idx >= 0) view.setSelection(idx)
+            val all = listOf(defaultItem) + names
+            val idx = all.indexOfFirst { it.removeSuffix(FREE_SUFFIX) == selected }
+            // Never invent a selection: an unknown saved value falls back to
+            // the default row visually, while the pending value below decides
+            // what is actually saved.
+            view.setSelection(if (idx >= 0) idx else 0)
         }
         fun providerLabel(code: String): String {
             val base = providerOptions.firstOrNull { it.second == code }?.first ?: code
@@ -244,11 +253,19 @@ class SettingsActivity : AppCompatActivity() {
                     .filter { (!freeOnlyBox.isChecked || it.free) && (query.isEmpty() || it.name.lowercase().contains(query)) }
                     .map { if (it.free) "${it.name}$FREE_SUFFIX" else it.name }
                     .sorted()
-                fillSpinner(modelSpinner, names, current.model)
-                fillSpinner(evalSpinner, names, current.evalModel)
+                fillSpinner(modelSpinner, names, "(provider default)", pendingModel)
+                fillSpinner(evalSpinner, names, "(same as chat)", pendingEval)
             } finally {
                 refreshingModels = false
             }
+        }
+        // Position 0 is always the default row (blank model id); anything
+        // else is a fetched model id with the display suffix stripped.
+        fun spinnerModelId(view: Spinner): String {
+            @Suppress("UNCHECKED_CAST")
+            val adapter = view.adapter as ArrayAdapter<String>
+            if (adapter.isEmpty || view.selectedItemPosition <= 0) return ""
+            return (adapter.getItem(view.selectedItemPosition) ?: "").removeSuffix(FREE_SUFFIX)
         }
         spinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: android.view.View?, position: Int, id: Long) = refreshModels()
@@ -257,8 +274,7 @@ class SettingsActivity : AppCompatActivity() {
         modelSpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: android.view.View?, position: Int, id: Long) {
                 if (refreshingModels) return
-                val item = parent?.getItemAtPosition(position) as? String ?: return
-                modelEdit.setText(item.removeSuffix(FREE_SUFFIX))
+                pendingModel = spinnerModelId(modelSpinner)
             }
             override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
         }
@@ -268,10 +284,8 @@ class SettingsActivity : AppCompatActivity() {
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, after: Int) = refreshModels()
             override fun afterTextChanged(s: android.text.Editable?) {}
         })
-        root.addView(label("Evaluation model (blank = same as chat)"))
+        root.addView(label("Evaluation model"))
         root.addView(evalSpinner)
-        val evalEdit = editText(current.evalModel, "cheap model for background memory evaluation")
-        root.addView(evalEdit)
         root.addView(label("Base URL (blank = provider default; required for custom)"))
         val urlEdit = editText(current.baseUrl, "https://host/api (OpenAI-compatible)")
         root.addView(urlEdit)
@@ -293,8 +307,7 @@ class SettingsActivity : AppCompatActivity() {
         evalSpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: android.view.View?, position: Int, id: Long) {
                 if (refreshingModels) return
-                val item = parent?.getItemAtPosition(position) as? String ?: return
-                evalEdit.setText(item.removeSuffix(FREE_SUFFIX))
+                pendingEval = spinnerModelId(evalSpinner)
             }
             override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
         }
@@ -462,8 +475,8 @@ class SettingsActivity : AppCompatActivity() {
                         this@SettingsActivity,
                         Settings(
                             provider = selectedProvider,
-                            model = modelEdit.text.toString(),
-                            evalModel = evalEdit.text.toString(),
+                            model = pendingModel,
+                            evalModel = pendingEval,
                             baseUrl = urlEdit.text.toString(),
                             apiKey = keyEdit.text.toString(),
                             maxTokens = maxTokensEdit.text.toString(),
