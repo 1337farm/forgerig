@@ -125,14 +125,31 @@ object ModelDiscovery {
         return out.toString()
     }
 
-    fun mergeDiscovered(
+    /**
+     * Reconcile the persisted model list against a fresh fetch — pure function
+     * of its inputs: no I/O, no Android, fully headless-testable.
+     *
+     * Membership AND flags both come from the live list. Entries that vanished
+     * upstream are dropped and flags are re-taken from discovery, so a model
+     * that was removed (or un-freed) can never linger with stale metadata and
+     * 404 at chat time. Curated entries are excluded: they live in the
+     * catalog, not in the persisted extras.
+     *
+     * Returns the fresh extras list plus how many ids are new since `known`.
+     *
+     * An empty discovery keeps `known` untouched: wiping the list on an empty
+     * response would strand the user with no selectable model at all, and an
+     * empty catalog response says nothing reliable about what still serves.
+     */
+    fun reconcileModels(
         curated: List<String>,
-        discovered: List<String>,
-    ): List<String> {
-        val merged = curated.toMutableList()
-        for (id in discovered.sorted()) {
-            if (!merged.contains(id)) merged.add(id)
-        }
-        return merged
+        known: List<DiscoveredModel>,
+        discovered: List<DiscoveredModel>,
+    ): Pair<List<DiscoveredModel>, Int> {
+        if (discovered.isEmpty()) return known to 0
+        val fresh = discovered.sortedBy { it.id }
+            .filter { d -> curated.none { it == d.id } }
+        val had = known.map { it.id }.toSet()
+        return fresh to fresh.count { it.id !in had }
     }
 }
